@@ -1,2 +1,2 @@
 #!/usr/bin/bash
-toolforge build start https://github.com/magnusmanske/mixnmatch_rs/
+toolforge build start https://github.com/magnusmanske/baglama2_rs/

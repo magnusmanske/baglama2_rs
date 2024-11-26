@@ -1,9 +1,7 @@
-use std::{fmt::Display, str::Utf8Error};
-use rusqlite::Result;
-use mysql_async::prelude::*;
 use crate::baglama2::*;
-
-
+use mysql_async::prelude::*;
+use rusqlite::Result;
+use std::{fmt::Display, str::Utf8Error};
 
 #[derive(Debug)]
 pub enum Error {
@@ -48,7 +46,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ViewCount {
     pub view_id: usize,
@@ -82,13 +79,13 @@ pub struct YearMonth {
 
 impl YearMonth {
     pub fn new(year: i32, month: u32) -> Self {
-        if month ==0 || month > 12 {
+        if month == 0 || month > 12 {
             panic!("Bad month: {month}");
         }
-        if year < 2000 || year > 2030 {
+        if !(2000..=2030).contains(&year) {
             panic!("Bad year: {year}");
         }
-        Self{year,month}
+        Self { year, month }
     }
 
     pub fn year(&self) -> i32 {
@@ -99,27 +96,28 @@ impl YearMonth {
         self.month
     }
 
-    pub fn make_production_directory(&self, baglama: &Baglama2) -> Result<String,Error> {
+    pub fn make_production_directory(&self, baglama: &Baglama2) -> Result<String, Error> {
         let subdir = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .ok_or(Error::Date(format!("{}/{}",self.year,self.month)))?
-            .format("%Y%m").to_string();
-        let dir = format!("{}/{}",baglama.sqlite_data_root_path(),&subdir);
+            .ok_or(Error::Date(format!("{}/{}", self.year, self.month)))?
+            .format("%Y%m")
+            .to_string();
+        let dir = format!("{}/{}", baglama.sqlite_data_root_path(), &subdir);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
 
     // TESTED
-    pub fn first_day(&self) -> Result<String,Error> {
-        let first_day =  chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .ok_or(Error::Date(format!("{}/{}",self.year,self.month)))?;
+    pub fn first_day(&self) -> Result<String, Error> {
+        let first_day = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
+            .ok_or(Error::Date(format!("{}/{}", self.year, self.month)))?;
         Ok(first_day.format("%Y%m%d").to_string())
     }
 
     // TESTED
-    pub fn last_day(&self) -> Result<String,Error> {
-        let last_day =  chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .ok_or(Error::Date(format!("{}/{}",self.year,self.month)))? 
-            + chronoutil::RelativeDuration::months(1) 
+    pub fn last_day(&self) -> Result<String, Error> {
+        let last_day = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
+            .ok_or(Error::Date(format!("{}/{}", self.year, self.month)))?
+            + chronoutil::RelativeDuration::months(1)
             + chronoutil::RelativeDuration::days(-1);
         Ok(last_day.format("%Y%m%d").to_string())
     }
@@ -127,7 +125,10 @@ impl YearMonth {
 
 impl std::fmt::Display for YearMonth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tmp = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1).unwrap().format("%Y-%m").to_string();
+        let tmp = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
+            .unwrap()
+            .format("%Y-%m")
+            .to_string();
         f.write_str(&tmp)
     }
 }
@@ -139,12 +140,10 @@ pub struct BaglamaGroup {
 
 impl BaglamaGroup {
     pub fn new(id: usize) -> Self {
-        if id==0 {
+        if id == 0 {
             panic!("Bad group ID: {id}");
         }
-        Self {
-            id,
-        }
+        Self { id }
     }
 
     pub fn id(&self) -> usize {
@@ -165,41 +164,43 @@ pub struct RowGroupStatus {
 }
 
 impl FromRow for RowGroupStatus {
-    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError> where Self:Sized {
+    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    where
+        Self: Sized,
+    {
         Ok(Self {
-            id: row.get(0).unwrap(), 
-            group_id: row.get(1).unwrap(), 
-            year: row.get(2).unwrap(), 
-            month: row.get(3).unwrap(), 
-            status: row.get(4).unwrap(), 
-            total_views: row.get(5).unwrap(), 
-            file: row.get(6).unwrap(), 
-            sqlite3: row.get(7).unwrap(), 
+            id: row.get(0).unwrap(),
+            group_id: row.get(1).unwrap(),
+            year: row.get(2).unwrap(),
+            month: row.get(3).unwrap(),
+            status: row.get(4).unwrap(),
+            total_views: row.get(5).unwrap(),
+            file: row.get(6).unwrap(),
+            sqlite3: row.get(7).unwrap(),
         })
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Site {
     id: usize,
-    pub grok_code:Option<String>,
-    pub server:Option<String>,
-    pub giu_code:Option<String>,
-    project:Option<String>,
-    language:Option<String>,
-    pub name:Option<String>,
+    pub grok_code: Option<String>,
+    pub server: Option<String>,
+    pub giu_code: Option<String>,
+    project: Option<String>,
+    language: Option<String>,
+    pub name: Option<String>,
 }
 
 impl Site {
     pub fn from_sqlite_row(row: &rusqlite::Row) -> Result<Self> {
-        Ok(Self { 
-            id: row.get(0)?, 
-            grok_code: row.get(1)?, 
-            server: row.get(2)?, 
-            giu_code: row.get(3)?, 
-            project: row.get(4)?, 
-            language: row.get(5)?, 
+        Ok(Self {
+            id: row.get(0)?,
+            grok_code: row.get(1)?,
+            server: row.get(2)?,
+            giu_code: row.get(3)?,
+            project: row.get(4)?,
+            language: row.get(5)?,
             name: row.get(6)?,
         })
     }
@@ -217,21 +218,22 @@ impl Site {
     }
 }
 
-
 impl FromRow for Site {
-    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError> where Self:Sized {
+    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    where
+        Self: Sized,
+    {
         Ok(Self {
-            id: row.get(0).unwrap(), 
-            grok_code: row.get(1).unwrap(), 
-            server: row.get(2).unwrap(), 
-            giu_code: row.get(3).unwrap(), 
-            project: row.get(4).unwrap(), 
-            language: row.get(5).unwrap(), 
+            id: row.get(0).unwrap(),
+            grok_code: row.get(1).unwrap(),
+            server: row.get(2).unwrap(),
+            giu_code: row.get(3).unwrap(),
+            project: row.get(4).unwrap(),
+            language: row.get(5).unwrap(),
             name: Baglama2::value2opt_string(row.as_ref(6).unwrap()),
         })
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct RowGroup {
@@ -243,13 +245,16 @@ pub struct RowGroup {
 }
 
 impl FromRow for RowGroup {
-    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError> where Self:Sized {
+    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    where
+        Self: Sized,
+    {
         Ok(Self {
-            id: row.get(0).unwrap(), 
+            id: row.get(0).unwrap(),
             category: Baglama2::value2opt_string(row.as_ref(1).unwrap()).unwrap(),
-            depth: row.get(2).unwrap(), 
+            depth: row.get(2).unwrap(),
             added_by: Baglama2::value2opt_string(row.as_ref(3).unwrap()).unwrap(),
-            just_added: row.get(4).unwrap(), 
+            just_added: row.get(4).unwrap(),
         })
     }
 }
@@ -265,12 +270,15 @@ pub struct GlobalImageLinks {
 }
 
 impl FromRow for GlobalImageLinks {
-    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError> where Self:Sized {
+    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    where
+        Self: Sized,
+    {
         Ok(Self {
-            wiki: row.get(0).unwrap(), 
-            page: row.get(1).unwrap(), 
-            page_namespace_id: row.get(2).unwrap(), 
-            //page_namespace: row.get(3).unwrap(), 
+            wiki: row.get(0).unwrap(),
+            page: row.get(1).unwrap(),
+            page_namespace_id: row.get(2).unwrap(),
+            //page_namespace: row.get(3).unwrap(),
             page_title: Baglama2::value2opt_string(row.as_ref(4).unwrap()).unwrap(),
             to: Baglama2::value2opt_string(row.as_ref(5).unwrap()).unwrap(),
         })
@@ -284,8 +292,8 @@ mod tests {
 
     #[test]
     fn test_first_last_day() {
-        let ym = YearMonth::new(2020,2);
-        assert_eq!(ym.first_day().unwrap().as_str(),"20200201");
-        assert_eq!(ym.last_day().unwrap().as_str(),"20200229");
+        let ym = YearMonth::new(2020, 2);
+        assert_eq!(ym.first_day().unwrap().as_str(), "20200201");
+        assert_eq!(ym.last_day().unwrap().as_str(), "20200229");
     }
 }
