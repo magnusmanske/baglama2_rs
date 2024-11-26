@@ -1,50 +1,6 @@
-use crate::baglama2::*;
+use crate::{baglama2::*, GroupId};
+use anyhow::{anyhow, Result};
 use mysql_async::prelude::*;
-use rusqlite::Result;
-use std::{fmt::Display, str::Utf8Error};
-
-#[derive(Debug)]
-pub enum Error {
-    MySql(mysql_async::Error),
-    Sqlite(rusqlite::Error),
-    StdIo(std::io::Error),
-    NoGroupForStatus,
-    Sql(String),
-    Date(String),
-    Utf8Error(String),
-}
-
-impl std::error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl From<mysql_async::Error> for Error {
-    fn from(err: mysql_async::Error) -> Self {
-        Error::MySql(err)
-    }
-}
-
-impl From<Utf8Error> for Error {
-    fn from(err: Utf8Error) -> Self {
-        Error::Utf8Error(err.to_string())
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(err: rusqlite::Error) -> Self {
-        Error::Sqlite(err)
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::StdIo(err)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ViewCount {
@@ -58,7 +14,7 @@ pub struct ViewCount {
 }
 
 impl ViewCount {
-    pub fn from_row(row: &rusqlite::Row) -> Result<Self> {
+    pub fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
         Ok(Self {
             view_id: row.get(0)?,
             title: row.get(1)?,
@@ -96,9 +52,9 @@ impl YearMonth {
         self.month
     }
 
-    pub fn make_production_directory(&self, baglama: &Baglama2) -> Result<String, Error> {
+    pub fn make_production_directory(&self, baglama: &Baglama2) -> Result<String> {
         let subdir = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .ok_or(Error::Date(format!("{}/{}", self.year, self.month)))?
+            .ok_or(anyhow!(format!("{}/{}", self.year, self.month)))?
             .format("%Y%m")
             .to_string();
         let dir = format!("{}/{}", baglama.sqlite_data_root_path(), &subdir);
@@ -107,16 +63,16 @@ impl YearMonth {
     }
 
     // TESTED
-    pub fn first_day(&self) -> Result<String, Error> {
+    pub fn first_day(&self) -> Result<String> {
         let first_day = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .ok_or(Error::Date(format!("{}/{}", self.year, self.month)))?;
+            .ok_or(anyhow!(format!("{}/{}", self.year, self.month)))?;
         Ok(first_day.format("%Y%m%d").to_string())
     }
 
     // TESTED
-    pub fn last_day(&self) -> Result<String, Error> {
+    pub fn last_day(&self) -> Result<String> {
         let last_day = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .ok_or(Error::Date(format!("{}/{}", self.year, self.month)))?
+            .ok_or(anyhow!(format!("{}/{}", self.year, self.month)))?
             + chronoutil::RelativeDuration::months(1)
             + chronoutil::RelativeDuration::days(-1);
         Ok(last_day.format("%Y%m%d").to_string())
@@ -135,18 +91,18 @@ impl std::fmt::Display for YearMonth {
 
 #[derive(Debug, Clone)]
 pub struct BaglamaGroup {
-    id: usize,
+    id: GroupId,
 }
 
 impl BaglamaGroup {
-    pub fn new(id: usize) -> Self {
-        if id == 0 {
+    pub fn new(id: GroupId) -> Self {
+        if id.is_valid() {
             panic!("Bad group ID: {id}");
         }
         Self { id }
     }
 
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> GroupId {
         self.id
     }
 }
@@ -193,7 +149,7 @@ pub struct Site {
 }
 
 impl Site {
-    pub fn from_sqlite_row(row: &rusqlite::Row) -> Result<Self> {
+    pub fn from_sqlite_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
         Ok(Self {
             id: row.get(0)?,
             grok_code: row.get(1)?,

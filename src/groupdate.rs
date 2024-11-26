@@ -1,9 +1,11 @@
 use crate::auxiliary::*;
 use crate::baglama2::*;
+use crate::GroupId;
+use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use mysql_async::from_row;
 use mysql_async::prelude::*;
-use rusqlite::{params_from_iter, Connection, Result};
+use rusqlite::{params_from_iter, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -19,7 +21,7 @@ pub struct GroupDate {
 }
 
 impl GroupDate {
-    pub fn new(id: usize, ym: YearMonth) -> Self {
+    pub fn new(id: GroupId, ym: YearMonth) -> Self {
         Self {
             group: BaglamaGroup::new(id),
             ym,
@@ -28,13 +30,13 @@ impl GroupDate {
         }
     }
 
-    pub fn construct_sqlite3_filename(&self, baglama: &Baglama2) -> Result<String, Error> {
+    pub fn construct_sqlite3_filename(&self, baglama: &Baglama2) -> Result<String> {
         let dir = self.ym.make_production_directory(baglama)?;
         let file_name = format!("{dir}/{}.sqlite", self.group.id());
         Ok(file_name)
     }
 
-    pub fn construct_sqlite3_temporary_filename(&self) -> Result<String, Error> {
+    pub fn construct_sqlite3_temporary_filename(&self) -> Result<String> {
         std::fs::create_dir_all(SQLITE_DATA_TMP_PATH)?;
         Ok(format!(
             "{}/{}.{}.sqlite3",
@@ -44,7 +46,7 @@ impl GroupDate {
         ))
     }
 
-    async fn load_sites_from_sqlite(&mut self, conn: &mut Connection) -> Result<(), Error> {
+    async fn load_sites_from_sqlite(&mut self, conn: &mut Connection) -> Result<()> {
         let sql = "SELECT id,grok_code,server,giu_code,project,language,name FROM `sites`";
         let mut stmt = conn.prepare(sql)?;
         let sites = stmt.query_map([], Site::from_sqlite_row)?;
@@ -57,16 +59,29 @@ impl GroupDate {
         Ok(())
     }
 
-    async fn group_status_id(&self, conn: &mut Connection) -> Result<usize, Error> {
+    async fn get_view_counts(
+        &self,
+        conn: &mut Connection,
+        batch_size: usize,
+    ) -> Result<Vec<ViewCount>, rusqlite::Error> {
+        let sql = format!("SELECT DISTINCT `views`.`id` AS id,title,namespace_id,grok_code,server,done,`views`.`site` AS site_id FROM `views`,`sites` WHERE `done`=0 AND `sites`.`id`=`views`.`site` LIMIT {batch_size}");
+        let conn2 = conn;
+        let mut stmt = conn2.prepare(&sql)?;
+        let rows = stmt.query_map([], ViewCount::from_row)?;
+        let ret: Vec<ViewCount> = rows.into_iter().filter_map(|row| row.ok()).collect();
+        Ok(ret)
+    }
+
+    async fn group_status_id(&self, conn: &mut Connection) -> Result<usize> {
         let group_id = self.group.id();
         let year = self.ym.year();
         let month = self.ym.month();
         let sql = "SELECT `id` FROM `group_status` WHERE `group_id`=? AND `year`=? AND `month`=?";
         let group_status_id: usize = conn
             .prepare(sql)?
-            .query_map((group_id, year, month), |row| row.get(0))?
+            .query_map((group_id.as_usize(), year, month), |row| row.get(0))?
             .next()
-            .ok_or(Error::NoGroupForStatus)??;
+            .ok_or(anyhow!("No group_status for group {group_id}"))??;
         Ok(group_status_id)
     }
 
@@ -81,7 +96,7 @@ impl GroupDate {
         &self,
         files: &[String],
         baglama: &Baglama2,
-    ) -> Result<Vec<GlobalImageLinks>, Error> {
+    ) -> Result<Vec<GlobalImageLinks>> {
         if files.is_empty() {
             return Ok(vec![]);
         }
@@ -127,7 +142,7 @@ impl GroupDate {
         conn: &mut Connection,
         all_files: &[String],
         baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if all_files.is_empty() {
             return Ok(());
         }
@@ -229,15 +244,11 @@ impl GroupDate {
         category: &str,
         depth: usize,
         baglama: &Baglama2,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<String>> {
         baglama.get_pages_in_category(category, depth, 6).await
     }
 
-    pub async fn seed_sqlite_file(
-        &self,
-        conn: &mut Connection,
-        baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    pub async fn seed_sqlite_file(&self, conn: &mut Connection, baglama: &Baglama2) -> Result<()> {
         let sql = std::fs::read_to_string(baglama.sqlite_schema_file())?;
         conn.execute_batch(&sql)?;
 
@@ -300,7 +311,7 @@ impl GroupDate {
             let sql = "INSERT INTO `group_status` (group_id,year,month) VALUES (?,?,?)";
             conn.execute(
                 sql,
-                rusqlite::params![self.group.id(), self.ym.year(), self.ym.month()],
+                rusqlite::params![self.group.id().as_usize(), self.ym.year(), self.ym.month()],
             )?;
         }
 
@@ -315,13 +326,15 @@ impl GroupDate {
         &self,
         conn: &mut Connection,
         baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let sql = "SELECT `category`,`depth` FROM `groups` WHERE `id`=?";
         let (category, depth): (String, usize) = conn
             .prepare(sql)?
-            .query_map([self.group.id()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([self.group.id().as_usize()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .next()
-            .ok_or(Error::Sql(sql.to_string()))??;
+            .ok_or(anyhow!(sql))??;
         conn.execute("DELETE FROM `files`", ())?;
 
         // Get files in category tree from Commons
@@ -357,7 +370,7 @@ impl GroupDate {
         &mut self,
         conn: &mut Connection,
         baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         self.load_sites_from_sqlite(conn).await?;
         conn.execute("DELETE FROM `views`", ())?;
         conn.execute("DELETE FROM `group2view`", ())?;
@@ -424,17 +437,12 @@ impl GroupDate {
         }
     }
 
-    async fn view_done(
-        &self,
-        view_id: usize,
-        done: u8,
-        conn: &mut Connection,
-    ) -> Result<usize, Error> {
+    async fn view_done(&self, view_id: usize, done: u8, conn: &mut Connection) -> Result<usize> {
         conn.execute(
             "UPDATE `views` SET `done`=?1,`views`=0 WHERE `id`=?2",
             rusqlite::params![done, view_id],
         )
-        .map_err(Error::from)
+        .map_err(|e| anyhow!(e))
     }
 
     async fn update_view_count(
@@ -442,32 +450,19 @@ impl GroupDate {
         view_id: usize,
         view_count: u64,
         conn: &mut Connection,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize> {
         conn.execute(
             "UPDATE `views` SET `done`=1,`views`=?1 WHERE `id`=?2",
             rusqlite::params![view_count, view_id],
         )
-        .map_err(Error::from)
-    }
-
-    async fn get_view_counts(
-        &self,
-        conn: &mut Connection,
-        batch_size: usize,
-    ) -> Result<Vec<ViewCount>, Error> {
-        let sql = format!("SELECT DISTINCT `views`.`id` AS id,title,namespace_id,grok_code,server,done,`views`.`site` AS site_id FROM `views`,`sites` WHERE `done`=0 AND `sites`.`id`=`views`.`site` LIMIT {batch_size}");
-        let conn2 = conn;
-        let mut stmt = conn2.prepare(&sql)?;
-        let rows = stmt.query_map([], ViewCount::from_row)?;
-        let ret: Vec<ViewCount> = rows.into_iter().filter_map(|row| row.ok()).collect();
-        Ok(ret)
+        .map_err(|e| anyhow!(e))
     }
 
     pub async fn add_view_counts_to_sqlite(
         &mut self,
         conn: &mut Connection,
         baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         println!("add_view_counts_to_sqlite: loading sites");
         self.load_sites_from_sqlite(conn).await?;
         println!("add_view_counts_to_sqlite: sites loaded");
@@ -557,7 +552,7 @@ impl GroupDate {
         Ok(())
     }
 
-    async fn add_summary_statistics_to_sqlite3(&self, conn: &mut Connection) -> Result<(), Error> {
+    async fn add_summary_statistics_to_sqlite3(&self, conn: &mut Connection) -> Result<()> {
         let group_status_id = self.group_status_id(conn).await?;
         conn.execute("CREATE INDEX `views_site` ON `views` (site)", ())?;
         conn.execute("DELETE FROM `gs2site`", ())?;
@@ -571,13 +566,13 @@ impl GroupDate {
         conn: &mut Connection,
         sqlite_filename: &str,
         baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let sql = "SELECT id FROM group_status WHERE `group_id`=?";
         let group_status_id: usize = conn
             .prepare(sql)?
-            .query_map([self.group.id()], |row| row.get(0))?
+            .query_map([self.group.id().as_usize()], |row| row.get(0))?
             .next()
-            .ok_or(Error::Sql(sql.to_string()))??;
+            .ok_or(anyhow!(sql))??;
 
         let sql = "SELECT ifnull(total_views,0) FROM group_status WHERE id=?";
         let total_views: usize = conn
@@ -602,9 +597,9 @@ impl GroupDate {
         total_views: usize,
         sqlite_filename: &str,
         baglama: &Baglama2,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if let Ok(mut conn) = baglama.get_tooldb_conn().await {
-            let group_id = self.group.id();
+            let group_id = self.group.id().as_usize();
             let year = self.ym.year();
             let month = self.ym.month();
             let sql = "REPLACE INTO `group_status` (group_id,year,month,status,total_views,sqlite3) VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)";
@@ -618,7 +613,7 @@ impl GroupDate {
         Ok(())
     }
 
-    pub async fn create_sqlite(&mut self, baglama: &Baglama2) -> Result<(), Error> {
+    pub async fn create_sqlite(&mut self, baglama: &Baglama2) -> Result<()> {
         let fn_final = self.construct_sqlite3_filename(baglama)?;
         let mut fn_work = self.construct_sqlite3_temporary_filename()?;
         if std::path::Path::new(&fn_final).exists() && !std::path::Path::new(&fn_work).exists() {
@@ -661,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_total_monthly_page_views() {
-        let gd = GroupDate::new(1, YearMonth::new(2022, 10));
+        let gd = GroupDate::new(1.into(), YearMonth::new(2022, 10));
         let total = gd
             .get_total_monthly_page_views(
                 "en.wikipedia.org",

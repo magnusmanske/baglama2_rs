@@ -1,11 +1,12 @@
 use crate::auxiliary::*;
+use crate::GroupId;
+use anyhow::Result;
 use core::time::Duration;
 use lazy_static::lazy_static;
 use mysql_async::from_row;
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts};
 use regex::Regex;
-use rusqlite::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
@@ -33,7 +34,7 @@ pub struct Baglama2 {
 }
 
 impl Baglama2 {
-    pub async fn new() -> Result<Self, Error> {
+    pub async fn new() -> Result<Self> {
         let config = Self::get_config_from_file("config.json")?;
         let mut ret = Self {
             config: config.clone(),
@@ -68,7 +69,7 @@ impl Baglama2 {
             .to_string()
     }
 
-    fn create_pool(config: &Value) -> Result<mysql_async::Pool, Error> {
+    fn create_pool(config: &Value) -> Result<mysql_async::Pool> {
         let min_connections = config["min_connections"].as_u64().unwrap_or(0) as usize;
         let max_connections = config["max_connections"].as_u64().unwrap_or(5) as usize;
         let keep_sec = config["keep_sec"].as_u64().unwrap_or(0);
@@ -99,7 +100,7 @@ impl Baglama2 {
         self.commons_pool.get_conn().await
     }
 
-    async fn populate_sites(&mut self) -> Result<(), Error> {
+    async fn populate_sites(&mut self) -> Result<()> {
         let sql = "SELECT id,grok_code,server,giu_code,project,language,name FROM `sites`";
         self.sites_cache = self
             .get_tooldb_conn()
@@ -112,7 +113,7 @@ impl Baglama2 {
     }
 
     // TESTED
-    pub async fn get_sites(&self) -> Result<Vec<Site>, Error> {
+    pub async fn get_sites(&self) -> Result<Vec<Site>> {
         Ok(self.sites_cache.clone())
     }
 
@@ -125,12 +126,12 @@ impl Baglama2 {
     }
 
     // TESTED
-    pub async fn get_group(&self, group_id: usize) -> Result<Option<RowGroup>, Error> {
+    pub async fn get_group(&self, group_id: GroupId) -> Result<Option<RowGroup>> {
         let sql = "SELECT id,category,depth,added_by,just_added FROM `groups` WHERE id=?";
         let groups = self
             .get_tooldb_conn()
             .await?
-            .exec_iter(sql, (group_id,))
+            .exec_iter(sql, (group_id.as_usize(),))
             .await?
             .map_and_drop(from_row::<RowGroup>)
             .await?;
@@ -140,14 +141,14 @@ impl Baglama2 {
     // TESTED
     pub async fn get_group_status(
         &self,
-        group_id: usize,
+        group_id: GroupId,
         ym: &YearMonth,
-    ) -> Result<Option<RowGroupStatus>, Error> {
+    ) -> Result<Option<RowGroupStatus>> {
         let sql = "SELECT id,group_id,year,month,status,total_views,file,sqlite3 FROM `group_status` WHERE group_id=? AND year=? AND month=?" ;
         let sites: Vec<RowGroupStatus> = self
             .get_tooldb_conn()
             .await?
-            .exec_iter(sql, (group_id, ym.year(), ym.month()))
+            .exec_iter(sql, (group_id.as_usize(), ym.year(), ym.month()))
             .await?
             .map_and_drop(from_row::<RowGroupStatus>)
             .await?;
@@ -280,7 +281,7 @@ impl Baglama2 {
         placeholders.join(",")
     }
 
-    async fn query_commons_repeat(&self, sql: &str, todo: &[String]) -> Result<Vec<String>, Error> {
+    async fn query_commons_repeat(&self, sql: &str, todo: &[String]) -> Result<Vec<String>> {
         let mut attempts_left = 5;
         let mut ret = vec![];
         loop {
@@ -325,7 +326,7 @@ impl Baglama2 {
     }
 
     // TESTED
-    async fn find_subcats(&self, root: &Vec<String>, depth: usize) -> Result<Vec<String>, Error> {
+    async fn find_subcats(&self, root: &Vec<String>, depth: usize) -> Result<Vec<String>> {
         let mut depth = depth;
         let mut check = root.to_owned();
         let mut subcats: Vec<String> = vec![];
@@ -362,7 +363,7 @@ impl Baglama2 {
         category: &str,
         depth: usize,
         namespace: isize,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<String>> {
         let category = category.replace(" ", "_");
         let categories = self.find_subcats(&vec![category.clone()], depth).await?;
         if namespace == 14 {
@@ -394,7 +395,7 @@ impl Baglama2 {
         results.first().map(|id| id.to_owned())
     }
 
-    pub async fn clear_incomplete_group_status(&self, year: i32, month: u32) -> Result<(), Error> {
+    pub async fn clear_incomplete_group_status(&self, year: i32, month: u32) -> Result<()> {
         let sql = "DELETE FROM group_status WHERE year=:year AND month=:month AND status!='VIEW DATA COMPLETE'" ;
         self.get_tooldb_conn()
             .await?
@@ -433,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_group() {
         let baglama = Baglama2::new().await.unwrap();
-        let group = baglama.get_group(1255).await.unwrap().unwrap();
+        let group = baglama.get_group(1255.into()).await.unwrap().unwrap();
         assert_eq!(
             group.category,
             "Images from Archives of Ontario – RG 14-100 Official Road Maps of Ontario"
@@ -507,7 +508,7 @@ mod tests {
             sqlite3: Some("/data/project/glamtools/viewdata/202210/782.sqlite3".to_string()),
         });
         let gs = baglama
-            .get_group_status(782, &YearMonth::new(2022, 10))
+            .get_group_status(782.into(), &YearMonth::new(2022, 10))
             .await
             .unwrap();
         assert_eq!(gs, expected);
