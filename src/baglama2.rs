@@ -101,8 +101,8 @@ impl Baglama2 {
             path.push(filename);
             path
         };
-        let file = File::open(&path).expect("Can't open file '{filename}'");
-        Ok(serde_json::from_reader(file).expect("Invalid JSON in '{filename}'"))
+        let file = File::open(&path)?;
+        Ok(serde_json::from_reader(file)?)
     }
 
     pub async fn get_tooldb_conn(&self) -> Result<Conn, mysql_async::Error> {
