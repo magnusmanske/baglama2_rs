@@ -6,13 +6,17 @@ use std::sync::{Arc, Mutex};
 
 pub mod auxiliary;
 pub mod baglama2;
+pub mod global_image_links;
 pub mod group_id;
 pub mod groupdate;
+pub mod site;
+pub mod year_month;
 
-use auxiliary::*;
 use baglama2::*;
 pub use group_id::GroupId;
 use groupdate::*;
+pub use site::Site;
+pub use year_month::YearMonth;
 
 /*
 ssh magnus@tools-login.wmflabs.org -L 3307:commonswiki.web.db.svc.eqiad.wmflabs:3306 -N &

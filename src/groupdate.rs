@@ -1,6 +1,9 @@
 use crate::auxiliary::*;
 use crate::baglama2::*;
+use crate::global_image_links::GlobalImageLinks;
 use crate::GroupId;
+use crate::Site;
+use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use mysql_async::from_row;
