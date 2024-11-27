@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GroupId(usize);
 
@@ -7,12 +9,14 @@ impl GroupId {
     }
 }
 
-impl From<usize> for GroupId {
-    fn from(num: usize) -> Self {
+impl TryFrom<usize> for GroupId {
+    type Error = anyhow::Error;
+
+    fn try_from(num: usize) -> Result<Self, Self::Error> {
         if num == 0 {
-            panic!("Group ID 0 is not valid");
+            return Err(anyhow!("Group ID 0 is not valid"));
         }
-        Self(num)
+        Ok(Self(num))
     }
 }
 
@@ -29,13 +33,13 @@ mod tests {
 
     #[test]
     fn test_group_id() {
-        let gid = GroupId::from(1);
+        let gid = GroupId::try_from(1).unwrap();
         assert_eq!(gid.as_usize(), 1);
         assert_eq!(gid.to_string(), "1");
     }
 
     #[test]
     fn test_group_id_zero() {
-        assert!(std::panic::catch_unwind(|| GroupId::from(0)).is_err());
+        assert!(GroupId::try_from(0).is_err());
     }
 }

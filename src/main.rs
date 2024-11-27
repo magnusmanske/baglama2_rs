@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
             let year = year(argv.get(3));
             let month = month(argv.get(4));
             let mut gd = GroupDate::new(
-                group_id.into(),
+                group_id.try_into()?,
                 YearMonth::new(year, month).unwrap(),
                 baglama.clone(),
             );
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
             let month = month(argv.get(3));
             if let Some(group_id) = baglama.get_next_group_id(year, month).await {
                 GroupDate::new(
-                    group_id.into(),
+                    group_id.try_into()?,
                     YearMonth::new(year, month).unwrap(),
                     baglama.clone(),
                 )
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
             loop {
                 if let Some(group_id) = baglama.get_next_group_id(year, month).await {
                     let mut gd = GroupDate::new(
-                        group_id.into(),
+                        group_id.try_into()?,
                         YearMonth::new(year, month).unwrap(),
                         baglama.clone(),
                     );
@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
                     *concurrent.lock().unwrap() += 1;
                     println!("Now {} jobs running", concurrent.lock().unwrap());
                     let mut gd = GroupDate::new(
-                        group_id.into(),
+                        group_id.try_into()?,
                         YearMonth::new(year, month).unwrap(),
                         baglama.clone(),
                     );

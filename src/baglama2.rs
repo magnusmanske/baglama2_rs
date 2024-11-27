@@ -84,8 +84,7 @@ impl Baglama2 {
             .with_constraints(PoolConstraints::new(min_connections, max_connections).unwrap())
             .with_inactive_connection_ttl(Duration::from_secs(keep_sec));
         let wd_url = url;
-        let wd_opts = Opts::from_url(wd_url)
-            .unwrap_or_else(|_| panic!("Can not build options from db_wd URL {}", wd_url));
+        let wd_opts = Opts::from_url(wd_url)?;
         Ok(mysql_async::Pool::new(
             OptsBuilder::from_opts(wd_opts).pool_opts(pool_opts.clone()),
         ))
@@ -468,7 +467,11 @@ mod tests {
     #[tokio::test]
     async fn test_get_group() {
         let baglama = Baglama2::new().await.unwrap();
-        let group = baglama.get_group(&1255.into()).await.unwrap().unwrap();
+        let group = baglama
+            .get_group(&1255.try_into().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             group.category,
             "Images from Archives of Ontario – RG 14-100 Official Road Maps of Ontario"
@@ -542,7 +545,7 @@ mod tests {
             sqlite3: Some("/data/project/glamtools/viewdata/202210/782.sqlite3".to_string()),
         });
         let gs = baglama
-            .get_group_status(&782.into(), &YearMonth::new(2022, 10).unwrap())
+            .get_group_status(&782.try_into().unwrap(), &YearMonth::new(2022, 10).unwrap())
             .await
             .unwrap();
         assert_eq!(gs, expected);

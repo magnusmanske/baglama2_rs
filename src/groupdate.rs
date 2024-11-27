@@ -70,7 +70,7 @@ impl GroupDate {
         self.baglama.get_pages_in_category(category, depth, 6).await
     }
 
-    pub async fn add_files_to_sqlite(&self, db: &DatabaseType) -> Result<()> {
+    pub async fn add_files(&self, db: &DatabaseType) -> Result<()> {
         let (category, depth) = db.get_category_and_depth(self.group_id())?;
         db.delete_all_files()?;
 
@@ -87,7 +87,7 @@ impl GroupDate {
         Ok(())
     }
 
-    pub async fn add_pages_to_sqlite(&mut self, db: &DatabaseType) -> Result<()> {
+    pub async fn add_pages(&mut self, db: &DatabaseType) -> Result<()> {
         self.load_sites(db).await?;
         db.delete_views()?;
         db.delete_group2view()?;
@@ -202,7 +202,7 @@ impl GroupDate {
         }
 
         println!("add_view_counts: adding summary statistics");
-        self.add_summary_statistics_to_sqlite3(db).await?;
+        self.add_summary_statistics(db).await?;
         Ok(())
     }
 
@@ -255,7 +255,7 @@ impl GroupDate {
         }
     }
 
-    async fn add_summary_statistics_to_sqlite3(&self, db: &DatabaseType) -> Result<()> {
+    async fn add_summary_statistics(&self, db: &DatabaseType) -> Result<()> {
         let group_status_id = db.get_group_status_id(self)?;
         db.add_summary_statistics(group_status_id).await
     }
@@ -291,10 +291,10 @@ impl GroupDate {
         let db = DatabaseType::new(self, self.baglama.clone())?;
         println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
         db.initialize(self.group_id(), self.ym().to_owned()).await?;
-        println!("{}-{}: add_files_to_sqlite", self.group_id, self.ym);
-        self.add_files_to_sqlite(&db).await?;
-        println!("{}-{}: add_pages_to_sqlite", self.group_id, self.ym);
-        self.add_pages_to_sqlite(&db).await?;
+        println!("{}-{}: add_files", self.group_id, self.ym);
+        self.add_files(&db).await?;
+        println!("{}-{}: add_pages", self.group_id, self.ym);
+        self.add_pages(&db).await?;
         println!("{}-{}: add_view_counts", self.group_id, self.ym);
         self.add_view_counts(&db).await?;
         println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
