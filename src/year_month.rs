@@ -74,4 +74,29 @@ mod tests {
         assert_eq!(ym.first_day().unwrap().as_str(), "20200201");
         assert_eq!(ym.last_day().unwrap().as_str(), "20200229");
     }
+
+    #[test]
+    fn test_display() {
+        let ym = YearMonth::new(2020, 2);
+        assert_eq!(ym.to_string().as_str(), "2020-02");
+    }
+
+    #[test]
+    fn test_new() {
+        let ym = YearMonth::new(2020, 2);
+        assert_eq!(ym.year(), 2020);
+        assert_eq!(ym.month(), 2);
+    }
+
+    #[test]
+    fn test_bad_month() {
+        assert!(std::panic::catch_unwind(|| YearMonth::new(2020, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| YearMonth::new(2020, 13)).is_err());
+    }
+
+    #[test]
+    fn test_bad_year() {
+        assert!(std::panic::catch_unwind(|| YearMonth::new(1999, 1)).is_err());
+        assert!(std::panic::catch_unwind(|| YearMonth::new(2031, 1)).is_err());
+    }
 }

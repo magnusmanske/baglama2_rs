@@ -1,0 +1,65 @@
+CREATE TABLE `groups` (
+  `id` INTEGER PRIMARY KEY,
+  `category` VARCHAR NOT NULL DEFAULT '',
+  `depth` INTEGER NOT NULL,
+  `added_by` VARCHAR NOT NULL DEFAULT '',
+  `just_added` INTEGER NOT NULL
+);
+
+CREATE TABLE `group_status` (
+  `id` INTEGER PRIMARY KEY,
+  `group_id` INTEGER NOT NULL,
+  `year` INTEGER NOT NULL,
+  `month` INTEGER NOT NULL,
+  `status` VARCHAR NOT NULL DEFAULT '',
+  `total_views` INTEGER DEFAULT NULL,
+  `file` VARCHAR DEFAULT NULL,
+  `sqlite3` VARCHAR DEFAULT NULL
+);
+
+
+CREATE TABLE `group2view` (
+  `id` INTEGER PRIMARY KEY,
+  `group_status_id` INTEGER NOT NULL,
+  `view_id` INTEGER NOT NULL,
+  `image` VARCHAR NOT NULL DEFAULT ''
+);
+
+CREATE TABLE `gs2site` (
+  `id` INTEGER PRIMARY KEY,
+  `group_status_id` INTEGER NOT NULL,
+  `site_id` INTEGER NOT NULL,
+  `pages` INTEGER NOT NULL,
+  `views` INTEGER NOT NULL
+);
+
+CREATE TABLE `sites` (
+  `id` INTEGER PRIMARY KEY,
+  `grok_code` VARCHAR DEFAULT NULL,
+  `server` VARCHAR DEFAULT NULL,
+  `giu_code` VARCHAR DEFAULT NULL,
+  `project` VARCHAR DEFAULT NULL,
+  `language` VARCHAR DEFAULT NULL,
+  `name` VARCHAR DEFAULT NULL
+);
+
+CREATE TABLE `views` (
+  `id` INTEGER PRIMARY KEY,
+  `site` INTEGER NOT NULL,
+  `title` VARCHAR NOT NULL DEFAULT '',
+  `month` INTEGER NOT NULL,
+  `year` INTEGER NOT NULL,
+  `done` INTEGER NOT NULL DEFAULT '0',
+  `namespace_id` INTEGER NOT NULL,
+  `page_id` INTEGER NOT NULL,
+  `views` INTEGER NOT NULL DEFAULT '0'
+);
+
+CREATE UNIQUE INDEX `views_site_title` ON `views` (`site`,`title`);
+CREATE INDEX `views_site_done` ON `views` (`site`,`done`);
+CREATE INDEX `sites_server` ON `sites` (`server`);
+
+CREATE TABLE `files` (
+  `id` INTEGER PRIMARY KEY,
+  `filename` VARCHAR DEFAULT ''
+) ;

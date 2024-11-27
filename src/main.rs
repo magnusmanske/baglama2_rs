@@ -1,8 +1,13 @@
 use anyhow::Result;
-use chrono::Datelike;
-use chrono::{DateTime, Months, Utc};
+use baglama2::*;
+use chrono::{DateTime, Datelike, Months, Utc};
+pub use group_id::GroupId;
+use groupdate::*;
+pub use site::Site;
 use std::env;
 use std::sync::{Arc, Mutex};
+pub use view_count::ViewCount;
+pub use year_month::YearMonth;
 
 pub mod baglama2;
 pub mod global_image_links;
@@ -13,13 +18,6 @@ pub mod row_group_status;
 pub mod site;
 pub mod view_count;
 pub mod year_month;
-
-use baglama2::*;
-pub use group_id::GroupId;
-use groupdate::*;
-pub use site::Site;
-pub use view_count::ViewCount;
-pub use year_month::YearMonth;
 
 /*
 ssh magnus@tools-login.wmflabs.org -L 3307:commonswiki.web.db.svc.eqiad.wmflabs:3306 -N &
@@ -118,7 +116,7 @@ async fn main() -> Result<()> {
             let concurrent: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
             loop {
                 if *concurrent.lock().unwrap() >= max_concurrent {
-                    baglama.hold_on();
+                    baglama.hold_on().await;
                     continue;
                 }
                 let group_id_opt = baglama.get_next_group_id(year, month).await;
@@ -144,9 +142,9 @@ async fn main() -> Result<()> {
                     });
                 } else {
                     // Wait for thrads to finish
-                    if *concurrent.lock().unwrap() > 0 {
-                        baglama.hold_on();
-                        continue;
+                    while *concurrent.lock().unwrap() > 0 {
+                        baglama.hold_on().await;
+                        // continue;
                     }
                     println!("Complete");
                     break;

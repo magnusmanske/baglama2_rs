@@ -6,9 +6,9 @@ use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
-use mysql_async::from_row;
 use mysql_async::prelude::*;
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::params_from_iter;
+use rusqlite::Connection as SqliteConnection;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -47,7 +47,7 @@ impl GroupDate {
         ))
     }
 
-    async fn load_sites_from_sqlite(&mut self, conn: &mut Connection) -> Result<()> {
+    async fn load_sites_from_sqlite(&mut self, conn: &mut SqliteConnection) -> Result<()> {
         let sql = "SELECT id,grok_code,server,giu_code,project,language,name FROM `sites`";
         let mut stmt = conn.prepare(sql)?;
         let sites = stmt.query_map([], Site::from_sqlite_row)?;
@@ -62,7 +62,7 @@ impl GroupDate {
 
     fn get_view_counts(
         &self,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
         batch_size: usize,
     ) -> Result<Vec<ViewCount>, rusqlite::Error> {
         let sql = format!("SELECT DISTINCT `views`.`id` AS id,title,namespace_id,grok_code,server,done,`views`.`site` AS site_id FROM `views`,`sites` WHERE `done`=0 AND `sites`.`id`=`views`.`site` LIMIT {batch_size}");
@@ -73,7 +73,7 @@ impl GroupDate {
         Ok(ret)
     }
 
-    async fn group_status_id(&self, conn: &mut Connection) -> Result<usize> {
+    async fn group_status_id(&self, conn: &mut SqliteConnection) -> Result<usize> {
         let group_id = self.group_id;
         let year = self.ym.year();
         let month = self.ym.month();
@@ -93,54 +93,9 @@ impl GroupDate {
         }
     }
 
-    async fn get_globalimagelinks(
-        &self,
-        files: &[String],
-        baglama: &Baglama2,
-    ) -> Result<Vec<GlobalImageLinks>> {
-        if files.is_empty() {
-            return Ok(vec![]);
-        }
-        let placeholders = Baglama2::sql_placeholders(files.len());
-        let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,gil_page_namespace,gil_page_title,gil_to FROM `globalimagelinks` WHERE `gil_to` IN ({})",&placeholders);
-
-        let max_attempts = 5;
-        let mut current_attempt = 0;
-        let mut ret = vec![];
-        loop {
-            if current_attempt >= max_attempts {
-                break; // TODO error?
-            }
-            if current_attempt > 0 {
-                baglama.hold_on();
-            }
-            current_attempt += 1;
-            let mut conn = match baglama.get_commons_conn().await {
-                Ok(conn) => conn,
-                _ => continue,
-            };
-            let res = match conn.exec_iter(&sql, files.to_owned()).await {
-                Ok(res) => res,
-                _ => {
-                    drop(conn);
-                    continue;
-                }
-            };
-            ret = match res.map_and_drop(from_row::<GlobalImageLinks>).await {
-                Ok(ret) => ret,
-                _ => {
-                    drop(conn);
-                    continue;
-                }
-            };
-            break;
-        }
-        Ok(ret)
-    }
-
     async fn add_views_for_files_to_sqlite(
         &self,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
         all_files: &[String],
         baglama: &Baglama2,
     ) -> Result<()> {
@@ -153,7 +108,7 @@ impl GroupDate {
         for files in all_files.chunks(CHUNK_SIZE) {
             chunk_num += 1;
             println!("add_views_for_files_to_sqlite: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",all_files.len());
-            let globalimagelinks = self.get_globalimagelinks(files, baglama).await?;
+            let globalimagelinks = GlobalImageLinks::load(files, baglama).await?;
             println!("add_views_for_files_to_sqlite: globalimagelinks done");
             let mut sql_values = vec![];
             let mut parts = vec![];
@@ -183,54 +138,12 @@ impl GroupDate {
             }
 
             if !parts.is_empty() {
-                let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
-                let titles = parts.iter().map(|p| p.1.to_owned());
-                // println!("{sql}\n");
-                conn.execute(&sql, params_from_iter(titles))?;
-
-                let site_titles: Vec<String> = parts.iter().map(|part| part.1.to_owned()).collect();
-                let placeholders: Vec<String> = parts
-                    .iter()
-                    .map(|part| format!("(`site`={} AND `title`=?)", part.0))
-                    .collect();
-                let sql = "SELECT id,site,title FROM `views` WHERE ".to_string()
-                    + &placeholders.join(" OR ").to_string();
-                // println!("{sql}\n{site_titles:?}");
-                // conn.execute(&sql, params_from_iter(site_titles))?;
-                let viewid_site_id_title: Vec<(usize, usize, String)> = conn
-                    .prepare(&sql)?
-                    .query_map(params_from_iter(site_titles), |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })?
-                    .filter_map(|x| x.ok())
-                    .collect();
-                let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
-                    .into_iter()
-                    .map(|(view_id, site_id, title)| ((site_id, title.to_owned()), view_id))
-                    .collect();
-                // println!("{:?}",&siteid_title_viewid);
-
-                let mut values = vec![];
-                let mut images = vec![];
-                for (site_id, title, image) in &parts {
-                    let view_id = match siteid_title_viewid.get(&(*site_id, title.to_owned())) {
-                        Some(id) => id,
-                        None => {
-                            println!("{site_id}/{title} not found, odd");
-                            continue;
-                        }
-                    };
-                    values.push(format!("({group_status_id},{view_id},?)"));
-                    images.push(image.to_owned());
-                }
-
-                if !values.is_empty() {
-                    let sql =
-                        "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
-                            .to_string() + &values.join(",").to_string();
-                    // println!("{sql}\n{images:?}\n");
-                    conn.execute(&sql, params_from_iter(images))?;
-                }
+                Self::add_views_batch_for_files_to_sqlite(
+                    sql_values,
+                    parts,
+                    group_status_id,
+                    conn,
+                )?;
             }
 
             println!("add_views_for_files_to_sqlite: batch done");
@@ -249,48 +162,26 @@ impl GroupDate {
         baglama.get_pages_in_category(category, depth, 6).await
     }
 
-    pub async fn seed_sqlite_file(&self, conn: &mut Connection, baglama: &Baglama2) -> Result<()> {
+    pub async fn seed_sqlite_file(
+        &self,
+        conn: &mut SqliteConnection,
+        baglama: &Baglama2,
+    ) -> Result<()> {
         let sql = std::fs::read_to_string(baglama.sqlite_schema_file())?;
         conn.execute_batch(&sql)?;
 
-        // sites
-        conn.execute("DELETE FROM `sites`", ())?;
-        let sites = baglama.get_sites().await?;
-        for site in &sites {
-            let sql = "INSERT INTO `sites` (id,grok_code,server,giu_code,project,language,name) VALUES (?,?,?,?,?,?,?)" ;
-            conn.execute(
-                sql,
-                rusqlite::params![
-                    site.id(),
-                    site.grok_code,
-                    site.server,
-                    site.giu_code,
-                    site.project(),
-                    site.language(),
-                    site.name
-                ],
-            )?;
-        }
+        Self::seed_sqlite_file_sites(conn, baglama).await?;
+        self.seed_sqlite_file_groups(conn, baglama).await?;
+        self.group_status(conn, baglama).await?;
 
-        // groups
-        conn.execute("DELETE FROM `groups`", ())?;
-        let groups = baglama.get_group(self.group_id).await?;
-        if let Some(group) = groups {
-            let sql =
-                "INSERT INTO `groups` (id,category,depth,added_by,just_added) VALUES (?,?,?,?,?)";
-            conn.execute(
-                sql,
-                rusqlite::params![
-                    group.id,
-                    group.category,
-                    group.depth,
-                    group.added_by,
-                    group.just_added
-                ],
-            )?;
-        }
+        conn.execute(
+            "UPDATE `group_status` SET `status`='',`total_views`=null,`file`=null,`sqlite3`=null",
+            (),
+        )?;
+        Ok(())
+    }
 
-        // group_status
+    async fn group_status(&self, conn: &mut SqliteConnection, baglama: &Baglama2) -> Result<()> {
         conn.execute("DELETE FROM `group_status`", ())?;
         let group_status = baglama.get_group_status(self.group_id, &self.ym).await?;
         if let Some(gs) = group_status {
@@ -315,17 +206,36 @@ impl GroupDate {
                 rusqlite::params![self.group_id.as_usize(), self.ym.year(), self.ym.month()],
             )?;
         }
+        Ok(())
+    }
 
-        conn.execute(
-            "UPDATE `group_status` SET `status`='',`total_views`=null,`file`=null,`sqlite3`=null",
-            (),
-        )?;
+    async fn seed_sqlite_file_groups(
+        &self,
+        conn: &mut SqliteConnection,
+        baglama: &Baglama2,
+    ) -> Result<()> {
+        conn.execute("DELETE FROM `groups`", ())?;
+        let groups = baglama.get_group(self.group_id).await?;
+        if let Some(group) = groups {
+            let sql =
+                "INSERT INTO `groups` (id,category,depth,added_by,just_added) VALUES (?,?,?,?,?)";
+            conn.execute(
+                sql,
+                rusqlite::params![
+                    group.id,
+                    group.category,
+                    group.depth,
+                    group.added_by,
+                    group.just_added
+                ],
+            )?;
+        }
         Ok(())
     }
 
     pub async fn add_files_to_sqlite(
         &self,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
         baglama: &Baglama2,
     ) -> Result<()> {
         let sql = "SELECT `category`,`depth` FROM `groups` WHERE `id`=?";
@@ -369,7 +279,7 @@ impl GroupDate {
 
     pub async fn add_pages_to_sqlite(
         &mut self,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
         baglama: &Baglama2,
     ) -> Result<()> {
         self.load_sites_from_sqlite(conn).await?;
@@ -438,7 +348,12 @@ impl GroupDate {
         }
     }
 
-    async fn view_done(&self, view_id: usize, done: u8, conn: &mut Connection) -> Result<usize> {
+    async fn view_done(
+        &self,
+        view_id: usize,
+        done: u8,
+        conn: &mut SqliteConnection,
+    ) -> Result<usize> {
         conn.execute(
             "UPDATE `views` SET `done`=?1,`views`=0 WHERE `id`=?2",
             rusqlite::params![done, view_id],
@@ -450,7 +365,7 @@ impl GroupDate {
         &self,
         view_id: usize,
         view_count: u64,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
     ) -> Result<usize> {
         conn.execute(
             "UPDATE `views` SET `done`=1,`views`=?1 WHERE `id`=?2",
@@ -461,7 +376,7 @@ impl GroupDate {
 
     pub async fn add_view_counts_to_sqlite(
         &mut self,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
         baglama: &Baglama2,
     ) -> Result<()> {
         println!("add_view_counts_to_sqlite: loading sites");
@@ -484,44 +399,16 @@ impl GroupDate {
             let rows = self.get_view_counts(conn, batch_size)?;
             println!("add_view_counts_to_sqlite: view counts retrieved");
             for vc in rows {
-                let server = match vc.server {
-                    Some(server) => server,
-                    None => {
-                        let _ = self.view_done(vc.view_id, 2, conn).await;
-                        continue;
-                    }
-                };
-                found = true;
-                let site = match self.sites.get(&vc.site_id) {
-                    Some(site) => site,
-                    None => continue,
-                };
-                let wiki = match self.site2wiki(site) {
-                    Some(wiki) => wiki,
-                    None => {
-                        let _ = self.view_done(vc.view_id, 3, conn).await;
-                        continue;
-                    }
-                };
-                match baglama
-                    .prefix_with_namespace(&vc.title, vc.namespace_id, &wiki)
-                    .await
-                {
-                    Some(title) => {
-                        views_todo.push((
-                            server.to_string(),
-                            title.to_string(),
-                            first_day.to_string(),
-                            last_day.to_string(),
-                            vc.view_id,
-                        ));
-                        // let view_count = self.get_total_monthly_page_views(&server, &title, &first_day, &last_day).await.unwrap_or(0);
-                        // let _ = self.update_view_count(vc.view_id, view_count, &conn).await;
-                    }
-                    None => {
-                        let _ = self.view_done(vc.view_id, 4, conn).await;
-                    }
-                }
+                self.add_view_counts_to_sqlite_process_row(
+                    vc,
+                    conn,
+                    &mut found,
+                    baglama,
+                    &mut views_todo,
+                    &first_day,
+                    &last_day,
+                )
+                .await;
             }
             if !views_todo.is_empty() {
                 // println!("Preparing {} futures",views_todo.len());
@@ -553,7 +440,58 @@ impl GroupDate {
         Ok(())
     }
 
-    async fn add_summary_statistics_to_sqlite3(&self, conn: &mut Connection) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    async fn add_view_counts_to_sqlite_process_row(
+        &mut self,
+        vc: ViewCount,
+        conn: &mut SqliteConnection,
+        found: &mut bool,
+        baglama: &Baglama2,
+        views_todo: &mut Vec<(String, String, String, String, usize)>,
+        first_day: &String,
+        last_day: &String,
+    ) {
+        let server = match vc.server {
+            Some(server) => server,
+            None => {
+                let _ = self.view_done(vc.view_id, 2, conn).await;
+                return;
+            }
+        };
+        *found = true;
+        let site = match self.sites.get(&vc.site_id) {
+            Some(site) => site,
+            None => return,
+        };
+        let wiki = match self.site2wiki(site) {
+            Some(wiki) => wiki,
+            None => {
+                let _ = self.view_done(vc.view_id, 3, conn).await;
+                return;
+            }
+        };
+        match baglama
+            .prefix_with_namespace(&vc.title, vc.namespace_id, &wiki)
+            .await
+        {
+            Some(title) => {
+                views_todo.push((
+                    server.to_string(),
+                    title.to_string(),
+                    first_day.to_string(),
+                    last_day.to_string(),
+                    vc.view_id,
+                ));
+                // let view_count = self.get_total_monthly_page_views(&server, &title, &first_day, &last_day).await.unwrap_or(0);
+                // let _ = self.update_view_count(vc.view_id, view_count, &conn).await;
+            }
+            None => {
+                let _ = self.view_done(vc.view_id, 4, conn).await;
+            }
+        }
+    }
+
+    async fn add_summary_statistics_to_sqlite3(&self, conn: &mut SqliteConnection) -> Result<()> {
         let group_status_id = self.group_status_id(conn).await?;
         conn.execute("CREATE INDEX `views_site` ON `views` (site)", ())?;
         conn.execute("DELETE FROM `gs2site`", ())?;
@@ -564,7 +502,7 @@ impl GroupDate {
 
     async fn finalize_sqlite(
         &self,
-        conn: &mut Connection,
+        conn: &mut SqliteConnection,
         sqlite_filename: &str,
         baglama: &Baglama2,
     ) -> Result<()> {
@@ -627,7 +565,7 @@ impl GroupDate {
         if std::path::Path::new(&fn_work).exists() {
             let _ = std::fs::remove_file(&fn_work);
         }
-        let mut conn = Connection::open(&fn_work)?;
+        let mut conn = SqliteConnection::open(&fn_work)?;
         println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
         self.seed_sqlite_file(&mut conn, baglama).await?;
         println!("{}-{}: add_files_to_sqlite", self.group_id, self.ym);
@@ -644,6 +582,77 @@ impl GroupDate {
             let _ = self.ym.make_production_directory(baglama);
             std::fs::copy(&fn_work, &fn_final)?;
             let _ = std::fs::remove_file(&fn_work);
+        }
+        Ok(())
+    }
+
+    fn add_views_batch_for_files_to_sqlite(
+        sql_values: Vec<String>,
+        parts: Vec<(usize, String, String)>,
+        group_status_id: usize,
+        conn: &mut SqliteConnection,
+    ) -> Result<()> {
+        let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
+        let titles = parts.iter().map(|p| p.1.to_owned());
+        conn.execute(&sql, params_from_iter(titles))?;
+        let site_titles: Vec<String> = parts.iter().map(|part| part.1.to_owned()).collect();
+        let placeholders: Vec<String> = parts
+            .iter()
+            .map(|part| format!("(`site`={} AND `title`=?)", part.0))
+            .collect();
+        let sql = "SELECT id,site,title FROM `views` WHERE ".to_string()
+            + &placeholders.join(" OR ").to_string();
+        let viewid_site_id_title: Vec<(usize, usize, String)> = conn
+            .prepare(&sql)?
+            .query_map(params_from_iter(site_titles), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(|x| x.ok())
+            .collect();
+        let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
+            .into_iter()
+            .map(|(view_id, site_id, title)| ((site_id, title.to_owned()), view_id))
+            .collect();
+        let mut values = vec![];
+        let mut images = vec![];
+        for (site_id, title, image) in &parts {
+            let view_id = match siteid_title_viewid.get(&(*site_id, title.to_owned())) {
+                Some(id) => id,
+                None => {
+                    println!("{site_id}/{title} not found, odd");
+                    continue;
+                }
+            };
+            values.push(format!("({group_status_id},{view_id},?)"));
+            images.push(image.to_owned());
+        }
+        if !values.is_empty() {
+            let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
+                .to_string()
+                + &values.join(",").to_string();
+            // println!("{sql}\n{images:?}\n");
+            conn.execute(&sql, params_from_iter(images))?;
+        }
+        Ok(())
+    }
+
+    async fn seed_sqlite_file_sites(conn: &mut SqliteConnection, baglama: &Baglama2) -> Result<()> {
+        conn.execute("DELETE FROM `sites`", ())?;
+        let sites = baglama.get_sites().await?;
+        for site in &sites {
+            let sql = "INSERT INTO `sites` (id,grok_code,server,giu_code,project,language,name) VALUES (?,?,?,?,?,?,?)" ;
+            conn.execute(
+                sql,
+                rusqlite::params![
+                    site.id(),
+                    site.grok_code,
+                    site.server,
+                    site.giu_code,
+                    site.project(),
+                    site.language(),
+                    site.name
+                ],
+            )?;
         }
         Ok(())
     }

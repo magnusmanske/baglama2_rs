@@ -1,7 +1,6 @@
+use crate::Baglama2;
 use anyhow::Result;
 use mysql_async::prelude::*;
-
-use crate::Baglama2;
 
 #[derive(Debug, Clone)]
 pub struct Site {

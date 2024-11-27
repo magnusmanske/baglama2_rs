@@ -21,3 +21,21 @@ impl std::fmt::Display for GroupId {
         write!(f, "{}", self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_group_id() {
+        let gid = GroupId::from(1);
+        assert_eq!(gid.as_usize(), 1);
+        assert_eq!(gid.to_string(), "1");
+    }
+
+    #[test]
+    fn test_group_id_zero() {
+        assert!(std::panic::catch_unwind(|| GroupId::from(0)).is_err());
+    }
+}

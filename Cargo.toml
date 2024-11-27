@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rusqlite = "*"
+rusqlite = { version = "*", features = ["bundled"] }
 mysql_async = "^0.32.2"
 tokio = { version = "^1", features = ["full", "rt-multi-thread"] }
 futures = "*"

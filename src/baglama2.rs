@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::sync::Arc;
-use std::{thread, time};
 use tokio::sync::Mutex;
 
 const USER_AGENT: &str =
@@ -407,9 +406,10 @@ impl Baglama2 {
         Ok(())
     }
 
-    pub fn hold_on(&self) {
+    pub async fn hold_on(&self) {
         let secs = self.config["hold_on"].as_u64().unwrap_or(5);
-        thread::sleep(time::Duration::from_secs(secs));
+        // thread::sleep(time::Duration::from_secs(secs));
+        tokio::time::sleep(Duration::from_secs(secs)).await;
     }
 }
 
