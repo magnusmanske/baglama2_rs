@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
             let month = month(argv.get(4));
             let mut gd = GroupDate::new(
                 group_id.into(),
-                YearMonth::new(year, month),
+                YearMonth::new(year, month).unwrap(),
                 baglama.clone(),
             );
             let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
             if let Some(group_id) = baglama.get_next_group_id(year, month).await {
                 GroupDate::new(
                     group_id.into(),
-                    YearMonth::new(year, month),
+                    YearMonth::new(year, month).unwrap(),
                     baglama.clone(),
                 )
                 .create_sqlite()
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
                 if let Some(group_id) = baglama.get_next_group_id(year, month).await {
                     let mut gd = GroupDate::new(
                         group_id.into(),
-                        YearMonth::new(year, month),
+                        YearMonth::new(year, month).unwrap(),
                         baglama.clone(),
                     );
                     let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                     println!("Now {} jobs running", concurrent.lock().unwrap());
                     let mut gd = GroupDate::new(
                         group_id.into(),
-                        YearMonth::new(year, month),
+                        YearMonth::new(year, month).unwrap(),
                         baglama.clone(),
                     );
                     let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;

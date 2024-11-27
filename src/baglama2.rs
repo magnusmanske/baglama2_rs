@@ -522,7 +522,7 @@ mod tests {
             sqlite3: Some("/data/project/glamtools/viewdata/202210/782.sqlite3".to_string()),
         });
         let gs = baglama
-            .get_group_status(&782.into(), &YearMonth::new(2022, 10))
+            .get_group_status(&782.into(), &YearMonth::new(2022, 10).unwrap())
             .await
             .unwrap();
         assert_eq!(gs, expected);

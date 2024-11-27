@@ -8,14 +8,14 @@ pub struct YearMonth {
 }
 
 impl YearMonth {
-    pub fn new(year: i32, month: u32) -> Self {
+    pub fn new(year: i32, month: u32) -> Result<Self> {
         if month == 0 || month > 12 {
-            panic!("Bad month: {month}");
+            return Err(anyhow!("Bad month: {month}"));
         }
         if !(2000..=2030).contains(&year) {
-            panic!("Bad year: {year}");
+            return Err(anyhow!("Bad year: {year}"));
         }
-        Self { year, month }
+        Ok(Self { year, month })
     }
 
     pub fn year(&self) -> i32 {
@@ -70,20 +70,20 @@ mod tests {
 
     #[test]
     fn test_first_last_day() {
-        let ym = YearMonth::new(2020, 2);
+        let ym = YearMonth::new(2020, 2).unwrap();
         assert_eq!(ym.first_day().unwrap().as_str(), "20200201");
         assert_eq!(ym.last_day().unwrap().as_str(), "20200229");
     }
 
     #[test]
     fn test_display() {
-        let ym = YearMonth::new(2020, 2);
+        let ym = YearMonth::new(2020, 2).unwrap();
         assert_eq!(ym.to_string().as_str(), "2020-02");
     }
 
     #[test]
     fn test_new() {
-        let ym = YearMonth::new(2020, 2);
+        let ym = YearMonth::new(2020, 2).unwrap();
         assert_eq!(ym.year(), 2020);
         assert_eq!(ym.month(), 2);
     }
