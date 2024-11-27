@@ -4,18 +4,21 @@ use chrono::{DateTime, Months, Utc};
 use std::env;
 use std::sync::{Arc, Mutex};
 
-pub mod auxiliary;
 pub mod baglama2;
 pub mod global_image_links;
 pub mod group_id;
 pub mod groupdate;
+pub mod row_group;
+pub mod row_group_status;
 pub mod site;
+pub mod view_count;
 pub mod year_month;
 
 use baglama2::*;
 pub use group_id::GroupId;
 use groupdate::*;
 pub use site::Site;
+pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
 /*

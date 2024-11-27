@@ -1,8 +1,8 @@
-use crate::auxiliary::*;
 use crate::baglama2::*;
 use crate::global_image_links::GlobalImageLinks;
 use crate::GroupId;
 use crate::Site;
+use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
@@ -17,7 +17,7 @@ const ADD_VIEW_COUNTS_BATCH_SIZE: usize = 3000;
 
 #[derive(Debug, Clone)]
 pub struct GroupDate {
-    group: BaglamaGroup,
+    group_id: GroupId,
     ym: YearMonth,
     sites: HashMap<usize, Site>,
     wiki2site_id: HashMap<String, usize>,
@@ -26,7 +26,7 @@ pub struct GroupDate {
 impl GroupDate {
     pub fn new(id: GroupId, ym: YearMonth) -> Self {
         Self {
-            group: BaglamaGroup::new(id),
+            group_id: id,
             ym,
             sites: HashMap::new(),
             wiki2site_id: HashMap::new(),
@@ -35,7 +35,7 @@ impl GroupDate {
 
     pub fn construct_sqlite3_filename(&self, baglama: &Baglama2) -> Result<String> {
         let dir = self.ym.make_production_directory(baglama)?;
-        let file_name = format!("{dir}/{}.sqlite", self.group.id());
+        let file_name = format!("{dir}/{}.sqlite", self.group_id);
         Ok(file_name)
     }
 
@@ -43,9 +43,7 @@ impl GroupDate {
         std::fs::create_dir_all(SQLITE_DATA_TMP_PATH)?;
         Ok(format!(
             "{}/{}.{}.sqlite3",
-            SQLITE_DATA_TMP_PATH,
-            &self.ym,
-            self.group.id()
+            SQLITE_DATA_TMP_PATH, &self.ym, self.group_id
         ))
     }
 
@@ -62,7 +60,7 @@ impl GroupDate {
         Ok(())
     }
 
-    async fn get_view_counts(
+    fn get_view_counts(
         &self,
         conn: &mut Connection,
         batch_size: usize,
@@ -76,7 +74,7 @@ impl GroupDate {
     }
 
     async fn group_status_id(&self, conn: &mut Connection) -> Result<usize> {
-        let group_id = self.group.id();
+        let group_id = self.group_id;
         let year = self.ym.year();
         let month = self.ym.month();
         let sql = "SELECT `id` FROM `group_status` WHERE `group_id`=? AND `year`=? AND `month`=?";
@@ -276,7 +274,7 @@ impl GroupDate {
 
         // groups
         conn.execute("DELETE FROM `groups`", ())?;
-        let groups = baglama.get_group(self.group.id()).await?;
+        let groups = baglama.get_group(self.group_id).await?;
         if let Some(group) = groups {
             let sql =
                 "INSERT INTO `groups` (id,category,depth,added_by,just_added) VALUES (?,?,?,?,?)";
@@ -294,7 +292,7 @@ impl GroupDate {
 
         // group_status
         conn.execute("DELETE FROM `group_status`", ())?;
-        let group_status = baglama.get_group_status(self.group.id(), &self.ym).await?;
+        let group_status = baglama.get_group_status(self.group_id, &self.ym).await?;
         if let Some(gs) = group_status {
             let sql = "INSERT INTO `group_status` (id,group_id,year,month,status,total_views,file,sqlite3) VALUES (?,?,?,?,?,?,?,?)" ;
             conn.execute(
@@ -314,7 +312,7 @@ impl GroupDate {
             let sql = "INSERT INTO `group_status` (group_id,year,month) VALUES (?,?,?)";
             conn.execute(
                 sql,
-                rusqlite::params![self.group.id().as_usize(), self.ym.year(), self.ym.month()],
+                rusqlite::params![self.group_id.as_usize(), self.ym.year(), self.ym.month()],
             )?;
         }
 
@@ -333,7 +331,7 @@ impl GroupDate {
         let sql = "SELECT `category`,`depth` FROM `groups` WHERE `id`=?";
         let (category, depth): (String, usize) = conn
             .prepare(sql)?
-            .query_map([self.group.id().as_usize()], |row| {
+            .query_map([self.group_id.as_usize()], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?
             .next()
@@ -483,7 +481,7 @@ impl GroupDate {
         while found {
             found = false;
             println!("add_view_counts_to_sqlite: getting {batch_size} view counts");
-            let rows = self.get_view_counts(conn, batch_size).await?;
+            let rows = self.get_view_counts(conn, batch_size)?;
             println!("add_view_counts_to_sqlite: view counts retrieved");
             for vc in rows {
                 let server = match vc.server {
@@ -573,7 +571,7 @@ impl GroupDate {
         let sql = "SELECT id FROM group_status WHERE `group_id`=?";
         let group_status_id: usize = conn
             .prepare(sql)?
-            .query_map([self.group.id().as_usize()], |row| row.get(0))?
+            .query_map([self.group_id.as_usize()], |row| row.get(0))?
             .next()
             .ok_or(anyhow!(sql))??;
 
@@ -602,7 +600,7 @@ impl GroupDate {
         baglama: &Baglama2,
     ) -> Result<()> {
         if let Ok(mut conn) = baglama.get_tooldb_conn().await {
-            let group_id = self.group.id().as_usize();
+            let group_id = self.group_id.as_usize();
             let year = self.ym.year();
             let month = self.ym.month();
             let sql = "REPLACE INTO `group_status` (group_id,year,month,status,total_views,sqlite3) VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)";
@@ -624,24 +622,23 @@ impl GroupDate {
         }
         println!(
             "{}: {} [ {fn_work} => {fn_final} ]",
-            &self.ym,
-            self.group.id()
+            &self.ym, self.group_id
         );
         if std::path::Path::new(&fn_work).exists() {
             let _ = std::fs::remove_file(&fn_work);
         }
         let mut conn = Connection::open(&fn_work)?;
-        println!("{}-{}: seed_sqlite_file", self.group.id(), self.ym);
+        println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
         self.seed_sqlite_file(&mut conn, baglama).await?;
-        println!("{}-{}: add_files_to_sqlite", self.group.id(), self.ym);
+        println!("{}-{}: add_files_to_sqlite", self.group_id, self.ym);
         self.add_files_to_sqlite(&mut conn, baglama).await?;
-        println!("{}-{}: add_pages_to_sqlite", self.group.id(), self.ym);
+        println!("{}-{}: add_pages_to_sqlite", self.group_id, self.ym);
         self.add_pages_to_sqlite(&mut conn, baglama).await?;
-        println!("{}-{}: add_view_counts_to_sqlite", self.group.id(), self.ym);
+        println!("{}-{}: add_view_counts_to_sqlite", self.group_id, self.ym);
         self.add_view_counts_to_sqlite(&mut conn, baglama).await?;
-        println!("{}-{}: finalize_sqlite", self.group.id(), self.ym);
+        println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
         self.finalize_sqlite(&mut conn, &fn_final, baglama).await?;
-        println!("{}-{}: done!", self.group.id(), self.ym);
+        println!("{}-{}: done!", self.group_id, self.ym);
         drop(conn);
         if fn_work != fn_final {
             let _ = self.ym.make_production_directory(baglama);

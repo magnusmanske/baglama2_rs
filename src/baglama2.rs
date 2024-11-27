@@ -1,4 +1,5 @@
-use crate::auxiliary::*;
+use crate::row_group::RowGroup;
+use crate::row_group_status::RowGroupStatus;
 use crate::GroupId;
 use crate::Site;
 use crate::YearMonth;
