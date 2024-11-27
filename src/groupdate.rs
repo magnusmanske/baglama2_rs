@@ -1,12 +1,11 @@
 use crate::baglama2::*;
-use crate::db_sqlite::DbSqlite;
+use crate::db_sqlite::DbSqlite as DatabaseType;
 use crate::GroupId;
 use crate::Site;
 use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::Result;
 use futures::future::join_all;
-use mysql_async::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +40,7 @@ impl GroupDate {
         &self.ym
     }
 
-    async fn load_sites(&mut self, db: &DbSqlite) -> Result<()> {
+    async fn load_sites(&mut self, db: &DatabaseType) -> Result<()> {
         for site in db.load_sites()? {
             if let Some(wiki) = self.site2wiki(&site) {
                 self.wiki2site_id.insert(wiki, site.id());
@@ -51,7 +50,7 @@ impl GroupDate {
         Ok(())
     }
 
-    fn get_view_counts(&self, db: &DbSqlite, batch_size: usize) -> Result<Vec<ViewCount>> {
+    fn get_view_counts(&self, db: &DatabaseType, batch_size: usize) -> Result<Vec<ViewCount>> {
         let ret = db.get_view_counts(batch_size)?;
         Ok(ret)
     }
@@ -71,7 +70,7 @@ impl GroupDate {
         self.baglama.get_pages_in_category(category, depth, 6).await
     }
 
-    pub async fn add_files_to_sqlite(&self, db: &DbSqlite) -> Result<()> {
+    pub async fn add_files_to_sqlite(&self, db: &DatabaseType) -> Result<()> {
         let (category, depth) = db.get_category_and_depth(self.group_id())?;
         db.delete_all_files()?;
 
@@ -88,7 +87,7 @@ impl GroupDate {
         Ok(())
     }
 
-    pub async fn add_pages_to_sqlite(&mut self, db: &DbSqlite) -> Result<()> {
+    pub async fn add_pages_to_sqlite(&mut self, db: &DatabaseType) -> Result<()> {
         self.load_sites(db).await?;
         db.delete_views()?;
         db.delete_group2view()?;
@@ -148,7 +147,7 @@ impl GroupDate {
         }
     }
 
-    pub async fn add_view_counts(&mut self, db: &DbSqlite) -> Result<()> {
+    pub async fn add_view_counts(&mut self, db: &DatabaseType) -> Result<()> {
         println!("add_view_counts: loading sites");
         self.load_sites(db).await?;
         println!("add_view_counts: sites loaded");
@@ -211,7 +210,7 @@ impl GroupDate {
     async fn add_view_counts_process_row(
         &mut self,
         vc: ViewCount,
-        db: &DbSqlite,
+        db: &DatabaseType,
         found: &mut bool,
         views_todo: &mut Vec<(String, String, String, String, usize)>,
         first_day: &String,
@@ -256,44 +255,40 @@ impl GroupDate {
         }
     }
 
-    async fn add_summary_statistics_to_sqlite3(&self, db: &DbSqlite) -> Result<()> {
+    async fn add_summary_statistics_to_sqlite3(&self, db: &DatabaseType) -> Result<()> {
         let group_status_id = db.get_group_status_id(self)?;
         db.add_summary_statistics(group_status_id).await
     }
 
-    async fn finalize_sqlite(&self, db: &DbSqlite) -> Result<()> {
+    async fn finalize(&self, db: &DatabaseType) -> Result<()> {
         let group_status_id = db.get_group_status_id(self)?;
         let total_views = db.get_total_views(group_status_id)?;
         db.create_final_indices()?;
         let sqlite_filename = db.path_final();
         self.set_group_status("VIEW DATA COMPLETE", total_views, sqlite_filename)
-            .await?;
-        Ok(())
+            .await
     }
 
+    /// Convenience wrapper around Baglama2.set_group_status
     pub async fn set_group_status(
         &self,
         status: &str,
         total_views: usize,
         sqlite_filename: &str,
     ) -> Result<()> {
-        if let Ok(mut mysql_connection) = self.baglama.get_tooldb_conn().await {
-            let group_id = self.group_id.as_usize();
-            let year = self.ym.year();
-            let month = self.ym.month();
-            let sql = "REPLACE INTO `group_status` (group_id,year,month,status,total_views,sqlite3) VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)";
-            let _ = mysql_connection
-                .exec_drop(
-                    sql,
-                    mysql_async::params! {group_id,year,month,status,total_views,sqlite_filename},
-                )
-                .await;
-        }
-        Ok(())
+        self.baglama
+            .set_group_status(
+                self.group_id(),
+                self.ym(),
+                status,
+                total_views,
+                sqlite_filename,
+            )
+            .await
     }
 
     pub async fn create_sqlite(&mut self) -> Result<()> {
-        let db = DbSqlite::new(self, self.baglama.clone())?;
+        let db = DatabaseType::new(self, self.baglama.clone())?;
         println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
         db.initialize(self.group_id(), self.ym().to_owned()).await?;
         println!("{}-{}: add_files_to_sqlite", self.group_id, self.ym);
@@ -303,7 +298,7 @@ impl GroupDate {
         println!("{}-{}: add_view_counts", self.group_id, self.ym);
         self.add_view_counts(&db).await?;
         println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
-        self.finalize_sqlite(&db).await?;
+        self.finalize(&db).await?;
         println!("{}-{}: done!", self.group_id, self.ym);
         db.finalize(&self.ym)?;
         Ok(())

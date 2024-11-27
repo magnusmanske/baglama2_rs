@@ -6,9 +6,7 @@ use crate::YearMonth;
 use anyhow::Result;
 use core::time::Duration;
 use lazy_static::lazy_static;
-use mysql_async::from_row;
-use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts};
+use mysql_async::{from_row, prelude::*, Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -421,6 +419,28 @@ impl Baglama2 {
         let secs = self.config["hold_on"].as_u64().unwrap_or(5);
         // thread::sleep(time::Duration::from_secs(secs));
         tokio::time::sleep(Duration::from_secs(secs)).await;
+    }
+
+    pub async fn set_group_status(
+        &self,
+        group_id: GroupId,
+        ym: &YearMonth,
+        status: &str,
+        total_views: usize,
+        sqlite_filename: &str,
+    ) -> Result<()> {
+        let mut mysql_connection = self.get_tooldb_conn().await?;
+        let group_id = group_id.as_usize();
+        let year = ym.year();
+        let month = ym.month();
+        let sql = "REPLACE INTO `group_status` (group_id,year,month,status,total_views,sqlite3) VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)";
+        let _ = mysql_connection
+            .exec_drop(
+                sql,
+                mysql_async::params! {group_id,year,month,status,total_views,sqlite_filename},
+            )
+            .await;
+        Ok(())
     }
 }
 
