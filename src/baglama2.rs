@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -37,7 +38,12 @@ pub struct Baglama2 {
 
 impl Baglama2 {
     pub async fn new() -> Result<Self> {
-        let config = Self::get_config_from_file("config.json")?;
+        let config = match Self::get_config_from_file("config.json") {
+            Ok(config) => config,
+            Err(_) => {
+                Self::get_config_from_file("/data/project/glamtools/baglama2_rs/config.json")?
+            }
+        };
         let mut ret = Self {
             config: config.clone(),
             tool_db_pool: Self::create_pool(config.get("tooldb").expect("Baglama2::new"))?,
@@ -88,8 +94,13 @@ impl Baglama2 {
     }
 
     pub fn get_config_from_file(filename: &str) -> Result<serde_json::Value> {
-        let mut path = env::current_dir().expect("Can't get CWD");
-        path.push(filename);
+        let path = if filename.starts_with('/') {
+            Path::new(filename).to_path_buf()
+        } else {
+            let mut path = env::current_dir().expect("Can't get CWD");
+            path.push(filename);
+            path
+        };
         let file = File::open(&path).expect("Can't open file '{filename}'");
         Ok(serde_json::from_reader(file).expect("Invalid JSON in '{filename}'"))
     }
