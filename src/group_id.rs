@@ -2,10 +2,6 @@
 pub struct GroupId(usize);
 
 impl GroupId {
-    pub fn is_valid(&self) -> bool {
-        self.0 > 0
-    }
-
     pub fn as_usize(&self) -> usize {
         self.0
     }
@@ -13,6 +9,9 @@ impl GroupId {
 
 impl From<usize> for GroupId {
     fn from(num: usize) -> Self {
+        if num == 0 {
+            panic!("Group ID 0 is not valid");
+        }
         Self(num)
     }
 }
