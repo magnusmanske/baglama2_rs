@@ -256,12 +256,12 @@ impl GroupDate {
     }
 
     async fn add_summary_statistics(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id(self)?;
+        let group_status_id = db.get_group_status_id()?;
         db.add_summary_statistics(group_status_id).await
     }
 
     async fn finalize(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id(self)?;
+        let group_status_id = db.get_group_status_id()?;
         let total_views = db.get_total_views(group_status_id)?;
         db.create_final_indices()?;
         let sqlite_filename = db.path_final();

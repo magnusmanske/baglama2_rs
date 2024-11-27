@@ -12,32 +12,41 @@ const SQLITE_DATA_TMP_PATH: &str = "/tmp";
 pub struct DbSqlite {
     path_final: String,
     path_tmp: String,
-    conn: Arc<Mutex<Connection>>,
+    connection: Arc<Mutex<Connection>>,
     baglama: Arc<Baglama2>,
+    ym: YearMonth,
+    group_id: GroupId,
 }
 
 impl DbSqlite {
     pub fn new(gd: &GroupDate, baglama: Arc<Baglama2>) -> Result<Self> {
-        let fn_final = Self::construct_sqlite3_filename(gd, &baglama)?;
-        let mut fn_work = Self::construct_sqlite3_temporary_filename(gd)?;
-        if std::path::Path::new(&fn_final).exists() && !std::path::Path::new(&fn_work).exists() {
-            fn_work = fn_final.clone();
+        let path_final = Self::construct_sqlite3_filename(gd, &baglama)?;
+        let mut path_tmp = Self::construct_sqlite3_temporary_filename(gd)?;
+        if std::path::Path::new(&path_final).exists() && !std::path::Path::new(&path_tmp).exists() {
+            path_tmp = path_final.clone();
         }
         println!(
-            "{}: {} [ {fn_work} => {fn_final} ]",
+            "{}: {} [ {path_tmp} => {path_final} ]",
             &gd.ym(),
             gd.group_id()
         );
-        if std::path::Path::new(&fn_work).exists() {
-            let _ = std::fs::remove_file(&fn_work);
+        if std::path::Path::new(&path_tmp).exists() {
+            let _ = std::fs::remove_file(&path_tmp);
         }
-        let conn = Arc::new(Mutex::new(Connection::open(&fn_work)?));
+        let connection = Arc::new(Mutex::new(Connection::open(&path_tmp)?));
         Ok(Self {
-            path_final: fn_final,
-            path_tmp: fn_work,
-            conn,
+            path_final,
+            path_tmp,
+            connection,
             baglama,
+            ym: gd.ym().to_owned(),
+            group_id: gd.group_id(),
         })
+    }
+
+    /// Returns a mutex lock on the sqlite connection
+    fn conn(&self) -> std::sync::MutexGuard<Connection> {
+        self.connection.lock().unwrap()
     }
 
     pub fn path_final(&self) -> &str {
@@ -56,9 +65,7 @@ impl DbSqlite {
     pub fn load_sites(&self) -> Result<Vec<Site>> {
         let sql = "SELECT id,grok_code,server,giu_code,project,language,name FROM `sites`";
         let sites = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(sql)?
             .query_map([], Site::from_sqlite_row)?
             .flatten()
@@ -69,9 +76,7 @@ impl DbSqlite {
     pub fn get_view_counts(&self, batch_size: usize) -> Result<Vec<ViewCount>, rusqlite::Error> {
         let sql = format!("SELECT DISTINCT `views`.`id` AS id,title,namespace_id,grok_code,server,done,`views`.`site` AS site_id FROM `views`,`sites` WHERE `done`=0 AND `sites`.`id`=`views`.`site` LIMIT {batch_size}");
         let ret: Vec<ViewCount> = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(&sql)?
             .query_map([], ViewCount::from_row)?
             .filter_map(|row| row.ok())
@@ -79,15 +84,13 @@ impl DbSqlite {
         Ok(ret)
     }
 
-    pub fn get_group_status_id(&self, gd: &GroupDate) -> Result<usize> {
-        let group_id = gd.group_id();
-        let year = gd.ym().year();
-        let month = gd.ym().month();
+    pub fn get_group_status_id(&self) -> Result<usize> {
+        let group_id = self.group_id.to_owned();
+        let year = self.ym.year();
+        let month = self.ym.month();
         let sql = "SELECT `id` FROM `group_status` WHERE `group_id`=? AND `year`=? AND `month`=?";
         let group_status_id: usize = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(sql)?
             .query_map((group_id.as_usize(), year, month), |row| row.get(0))?
             .next()
@@ -98,9 +101,7 @@ impl DbSqlite {
     pub fn get_total_views(&self, group_status_id: usize) -> Result<usize> {
         let sql = "SELECT ifnull(total_views,0) FROM group_status WHERE id=?";
         let total_views: usize = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(sql)?
             .query_map([group_status_id], |row| row.get(0))?
             .next()
@@ -109,50 +110,37 @@ impl DbSqlite {
     }
 
     pub fn create_final_indices(&self) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "CREATE INDEX `views_views_site_done` ON `views` (`site`,`done`,`views`)",
             (),
         )?;
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute("CREATE INDEX `g2v_view_id` ON `group2view` (`view_id`)", ())?;
         Ok(())
     }
 
     pub fn delete_all_files(&self) -> Result<()> {
         // DO NOT IMPLEMENT THIS FOR MYSQL!!
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `files`", ())?;
+        self.conn().execute("DELETE FROM `files`", ())?;
         Ok(())
     }
 
     pub fn delete_views(&self) -> Result<()> {
         // DO NOT IMPLEMENT THIS FOR MYSQL!!
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `views`", ())?;
+        self.conn().execute("DELETE FROM `views`", ())?;
         Ok(())
     }
 
     pub fn delete_group2view(&self) -> Result<()> {
         // DO NOT IMPLEMENT THIS FOR MYSQL!!
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `group2view`", ())?;
+        self.conn().execute("DELETE FROM `group2view`", ())?;
         Ok(())
     }
 
     pub fn load_files_batch(&self, offset: usize, batch_size: usize) -> Result<Vec<String>> {
         let sql = format!("SELECT `filename` FROM `files` LIMIT {batch_size} OFFSET {offset}");
         let files: Vec<String> = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(&sql)?
             .query_map([], |row| row.get(0))?
             .filter_map(|x| x.ok()) // TODO something more elegant?
@@ -165,8 +153,7 @@ impl DbSqlite {
             return Ok(());
         }
 
-        let group_status_id = self.get_group_status_id(gd)?;
-        let ym = gd.ym();
+        let group_status_id = self.get_group_status_id()?;
 
         const CHUNK_SIZE: usize = 3000;
         let mut chunk_num = 0;
@@ -188,8 +175,8 @@ impl DbSqlite {
 
                 let site_id = site.id();
                 let title = &gil.page_title;
-                let month = ym.month();
-                let year = ym.year();
+                let month = self.ym.month();
+                let year = self.ym.year();
                 let done = 0;
                 let namespace_id = gil.page_namespace_id;
                 let page_id = gil.page;
@@ -216,28 +203,21 @@ impl DbSqlite {
     pub fn reset_main_page_view_count(&self) -> Result<()> {
         // TODO for all wikis?
         let sql = "UPDATE views SET views=0 WHERE title='Main_Page'";
-        self.conn.lock().unwrap().execute(sql, ())?;
+        self.conn().execute(sql, ())?;
         Ok(())
     }
 
     pub async fn add_summary_statistics(&self, group_status_id: usize) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute("CREATE INDEX `views_site` ON `views` (site)", ())?;
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `gs2site`", ())?;
-        self.conn.lock().unwrap().execute("INSERT INTO `gs2site` SELECT sites.id,?1,sites.id,COUNT(DISTINCT page_id),SUM(views) FROM `views`,`sites` WHERE views.site=sites.id GROUP BY sites.id",rusqlite::params![group_status_id])?;
-        self.conn.lock().unwrap().execute("UPDATE group_status SET status='VIEW DATA COMPLETE',total_views=(SELECT sum(views) FROM gs2site) WHERE id=?1",rusqlite::params![group_status_id])?;
+        self.conn().execute("DELETE FROM `gs2site`", ())?;
+        self.conn().execute("INSERT INTO `gs2site` SELECT sites.id,?1,sites.id,COUNT(DISTINCT page_id),SUM(views) FROM `views`,`sites` WHERE views.site=sites.id GROUP BY sites.id",rusqlite::params![group_status_id])?;
+        self.conn().execute("UPDATE group_status SET status='VIEW DATA COMPLETE',total_views=(SELECT sum(views) FROM gs2site) WHERE id=?1",rusqlite::params![group_status_id])?;
         Ok(())
     }
 
     pub async fn update_view_count(&self, view_id: usize, view_count: u64) -> Result<usize> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute(
                 "UPDATE `views` SET `done`=1,`views`=?1 WHERE `id`=?2",
                 rusqlite::params![view_count, view_id],
@@ -246,9 +226,7 @@ impl DbSqlite {
     }
 
     pub async fn view_done(&self, view_id: usize, done: u8) -> Result<usize> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute(
                 "UPDATE `views` SET `done`=?1,`views`=0 WHERE `id`=?2",
                 rusqlite::params![done, view_id],
@@ -264,10 +242,7 @@ impl DbSqlite {
     ) -> Result<()> {
         let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
         let titles = parts.iter().map(|p| p.1.to_owned());
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(&sql, params_from_iter(titles))?;
+        self.conn().execute(&sql, params_from_iter(titles))?;
         let site_titles: Vec<String> = parts.iter().map(|part| part.1.to_owned()).collect();
         let placeholders: Vec<String> = parts
             .iter()
@@ -276,9 +251,7 @@ impl DbSqlite {
         let sql = "SELECT id,site,title FROM `views` WHERE ".to_string()
             + &placeholders.join(" OR ").to_string();
         let viewid_site_id_title: Vec<(usize, usize, String)> = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(&sql)?
             .query_map(params_from_iter(site_titles), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -307,10 +280,7 @@ impl DbSqlite {
                 .to_string()
                 + &values.join(",").to_string();
             // println!("{sql}\n{images:?}\n");
-            self.conn
-                .lock()
-                .unwrap()
-                .execute(&sql, params_from_iter(images))?;
+            self.conn().execute(&sql, params_from_iter(images))?;
         }
         Ok(())
     }
@@ -318,9 +288,7 @@ impl DbSqlite {
     pub fn get_category_and_depth(&self, group_id: GroupId) -> Result<(String, usize)> {
         let sql = "SELECT `category`,`depth` FROM `groups` WHERE `id`=?";
         let (category, depth): (String, usize) = self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .prepare(sql)?
             .query_map([group_id.as_usize()], |row| Ok((row.get(0)?, row.get(1)?)))?
             .next()
@@ -335,9 +303,7 @@ impl DbSqlite {
     pub fn insert_files_batch(&self, batch: &[String]) -> Result<()> {
         let questionmarks = ["(?)"].repeat(batch.len()).join(",");
         let sql = format!("INSERT INTO `files` (`filename`) VALUES {questionmarks}");
-        self.conn
-            .lock()
-            .unwrap()
+        self.conn()
             .execute(&sql, rusqlite::params_from_iter(batch.iter()))?;
         Ok(())
     }
@@ -348,7 +314,7 @@ impl DbSqlite {
         self.seed_file_sites().await?;
         self.seed_file_groups(&group_id).await?;
         self.group_status(&group_id, &ym).await?;
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "UPDATE `group_status` SET `status`='',`total_views`=null,`file`=null,`sqlite3`=null",
             (),
         )?;
@@ -356,14 +322,12 @@ impl DbSqlite {
     }
 
     pub async fn seed_file_sites(&self) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `sites`", ())?;
+        // DO NOT IMPLEMENT THIS FOR MYSQL
+        self.conn().execute("DELETE FROM `sites`", ())?;
         let sites = self.baglama.get_sites().await?;
         for site in &sites {
             let sql = "INSERT INTO `sites` (id,grok_code,server,giu_code,project,language,name) VALUES (?,?,?,?,?,?,?)" ;
-            self.conn.lock().unwrap().execute(
+            self.conn().execute(
                 sql,
                 rusqlite::params![
                     site.id(),
@@ -380,15 +344,13 @@ impl DbSqlite {
     }
 
     pub async fn seed_file_groups(&self, group_id: &GroupId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `groups`", ())?;
+        // DO NOT IMPLEMENT THIS FOR MYSQL
+        self.conn().execute("DELETE FROM `groups`", ())?;
         let groups = self.baglama.get_group(group_id).await?;
         if let Some(group) = groups {
             let sql =
                 "INSERT INTO `groups` (id,category,depth,added_by,just_added) VALUES (?,?,?,?,?)";
-            self.conn.lock().unwrap().execute(
+            self.conn().execute(
                 sql,
                 rusqlite::params![
                     group.id,
@@ -403,14 +365,11 @@ impl DbSqlite {
     }
 
     pub async fn group_status(&self, group_id: &GroupId, ym: &YearMonth) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM `group_status`", ())?;
+        self.conn().execute("DELETE FROM `group_status`", ())?;
         let group_status = self.baglama.get_group_status(group_id, ym).await?;
         if let Some(gs) = group_status {
             let sql = "INSERT INTO `group_status` (id,group_id,year,month,status,total_views,file,sqlite3) VALUES (?,?,?,?,?,?,?,?)" ;
-            self.conn.lock().unwrap().execute(
+            self.conn().execute(
                 sql,
                 rusqlite::params![
                     gs.id,
@@ -425,7 +384,7 @@ impl DbSqlite {
             )?;
         } else {
             let sql = "INSERT INTO `group_status` (group_id,year,month) VALUES (?,?,?)";
-            self.conn.lock().unwrap().execute(
+            self.conn().execute(
                 sql,
                 rusqlite::params![group_id.as_usize(), ym.year(), ym.month()],
             )?;
@@ -434,12 +393,12 @@ impl DbSqlite {
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(sql, [])?;
+        self.conn().execute(sql, [])?;
         Ok(())
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute_batch(sql)?;
+        self.conn().execute_batch(sql)?;
         Ok(())
     }
 
