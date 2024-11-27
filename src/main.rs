@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
                         *concurrent.lock().unwrap() -= 1;
                     });
                 } else {
-                    // Wait for thrads to finish
+                    // Wait for threads to finish
                     if *concurrent.lock().unwrap() > 0 {
                         baglama.hold_on().await;
                         continue;
