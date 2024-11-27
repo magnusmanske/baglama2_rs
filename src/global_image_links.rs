@@ -61,13 +61,29 @@ impl FromRow for GlobalImageLinks {
     where
         Self: Sized,
     {
-        Ok(Self {
-            wiki: row.get(0).unwrap(),
-            page: row.get(1).unwrap(),
-            page_namespace_id: row.get(2).unwrap(),
-            //page_namespace: row.get(3).unwrap(),
-            page_title: Baglama2::value2opt_string(row.as_ref(4).unwrap()).unwrap(),
-            to: Baglama2::value2opt_string(row.as_ref(5).unwrap()).unwrap(),
-        })
+        // let e = mysql_async::FromRowError(row.clone());
+        let ret = Self {
+            wiki: row
+                .get(0)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            page: row
+                .get(1)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            page_namespace_id: row
+                .get(2)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            //page_namespace: row.get(3).ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            page_title: Baglama2::value2opt_string(
+                row.as_ref(4)
+                    .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            )
+            .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            to: Baglama2::value2opt_string(
+                row.as_ref(5)
+                    .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            )
+            .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+        };
+        Ok(ret)
     }
 }
