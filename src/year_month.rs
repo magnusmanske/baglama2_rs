@@ -90,13 +90,13 @@ mod tests {
 
     #[test]
     fn test_bad_month() {
-        assert!(std::panic::catch_unwind(|| YearMonth::new(2020, 0)).is_err());
-        assert!(std::panic::catch_unwind(|| YearMonth::new(2020, 13)).is_err());
+        assert!(YearMonth::new(2020, 0).is_err());
+        assert!(YearMonth::new(2020, 13).is_err());
     }
 
     #[test]
     fn test_bad_year() {
-        assert!(std::panic::catch_unwind(|| YearMonth::new(1999, 1)).is_err());
-        assert!(std::panic::catch_unwind(|| YearMonth::new(2031, 1)).is_err());
+        assert!(YearMonth::new(1999, 1).is_err());
+        assert!(YearMonth::new(2031, 1).is_err());
     }
 }
