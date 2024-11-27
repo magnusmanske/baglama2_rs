@@ -10,6 +10,7 @@ pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
 pub mod baglama2;
+pub mod db_sqlite;
 pub mod global_image_links;
 pub mod group_id;
 pub mod groupdate;
@@ -62,19 +63,25 @@ async fn main() -> Result<()> {
                 .expect("Group ID expected");
             let year = year(argv.get(3));
             let month = month(argv.get(4));
-            let mut gd = GroupDate::new(group_id.into(), YearMonth::new(year, month));
-            let _ = gd
-                .set_group_status("GENERATING PAGE LIST", 0, "", &baglama)
-                .await;
-            gd.create_sqlite(&baglama).await?;
+            let mut gd = GroupDate::new(
+                group_id.into(),
+                YearMonth::new(year, month),
+                baglama.clone(),
+            );
+            let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
+            gd.create_sqlite().await?;
         }
         Some("next") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
             if let Some(group_id) = baglama.get_next_group_id(year, month).await {
-                GroupDate::new(group_id.into(), YearMonth::new(year, month))
-                    .create_sqlite(&baglama)
-                    .await?;
+                GroupDate::new(
+                    group_id.into(),
+                    YearMonth::new(year, month),
+                    baglama.clone(),
+                )
+                .create_sqlite()
+                .await?;
             } else {
                 println!("No more groups for {year}/{month}");
             }
@@ -88,14 +95,16 @@ async fn main() -> Result<()> {
             }
             loop {
                 if let Some(group_id) = baglama.get_next_group_id(year, month).await {
-                    let mut gd = GroupDate::new(group_id.into(), YearMonth::new(year, month));
-                    let _ = gd
-                        .set_group_status("GENERATING PAGE LIST", 0, "", &baglama)
-                        .await;
-                    match gd.create_sqlite(&baglama).await {
+                    let mut gd = GroupDate::new(
+                        group_id.into(),
+                        YearMonth::new(year, month),
+                        baglama.clone(),
+                    );
+                    let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
+                    match gd.create_sqlite().await {
                         Ok(_) => {}
                         Err(err) => {
-                            let _ = gd.set_group_status("FAILED", 0, "", &baglama).await;
+                            let _ = gd.set_group_status("FAILED", 0, "").await;
                             println!("{group_id} failed: {:?}", &err);
                         }
                     }
@@ -125,15 +134,17 @@ async fn main() -> Result<()> {
                     let baglama = baglama.clone();
                     *concurrent.lock().unwrap() += 1;
                     println!("Now {} jobs running", concurrent.lock().unwrap());
-                    let mut gd = GroupDate::new(group_id.into(), YearMonth::new(year, month));
-                    let _ = gd
-                        .set_group_status("GENERATING PAGE LIST", 0, "", &baglama)
-                        .await;
+                    let mut gd = GroupDate::new(
+                        group_id.into(),
+                        YearMonth::new(year, month),
+                        baglama.clone(),
+                    );
+                    let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
                     tokio::spawn(async move {
-                        match gd.create_sqlite(&baglama).await {
+                        match gd.create_sqlite().await {
                             Ok(_) => {}
                             Err(err) => {
-                                let _ = gd.set_group_status("FAILED", 0, "", &baglama).await;
+                                let _ = gd.set_group_status("FAILED", 0, "").await;
                                 println!("{group_id} failed: {:?}", &err);
                             }
                         }
@@ -142,9 +153,9 @@ async fn main() -> Result<()> {
                     });
                 } else {
                     // Wait for thrads to finish
-                    while *concurrent.lock().unwrap() > 0 {
+                    if *concurrent.lock().unwrap() > 0 {
                         baglama.hold_on().await;
-                        // continue;
+                        continue;
                     }
                     println!("Complete");
                     break;

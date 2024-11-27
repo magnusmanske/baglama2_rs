@@ -139,7 +139,7 @@ impl Baglama2 {
     }
 
     // TESTED
-    pub async fn get_group(&self, group_id: GroupId) -> Result<Option<RowGroup>> {
+    pub async fn get_group(&self, group_id: &GroupId) -> Result<Option<RowGroup>> {
         let sql = "SELECT id,category,depth,added_by,just_added FROM `groups` WHERE id=?";
         let groups = self
             .get_tooldb_conn()
@@ -154,7 +154,7 @@ impl Baglama2 {
     // TESTED
     pub async fn get_group_status(
         &self,
-        group_id: GroupId,
+        group_id: &GroupId,
         ym: &YearMonth,
     ) -> Result<Option<RowGroupStatus>> {
         let sql = "SELECT id,group_id,year,month,status,total_views,file,sqlite3 FROM `group_status` WHERE group_id=? AND year=? AND month=?" ;
@@ -448,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_group() {
         let baglama = Baglama2::new().await.unwrap();
-        let group = baglama.get_group(1255.into()).await.unwrap().unwrap();
+        let group = baglama.get_group(&1255.into()).await.unwrap().unwrap();
         assert_eq!(
             group.category,
             "Images from Archives of Ontario – RG 14-100 Official Road Maps of Ontario"
@@ -522,7 +522,7 @@ mod tests {
             sqlite3: Some("/data/project/glamtools/viewdata/202210/782.sqlite3".to_string()),
         });
         let gs = baglama
-            .get_group_status(782.into(), &YearMonth::new(2022, 10))
+            .get_group_status(&782.into(), &YearMonth::new(2022, 10))
             .await
             .unwrap();
         assert_eq!(gs, expected);
