@@ -8,6 +8,7 @@ pub struct RowGroup {
     depth: usize,
     added_by: String,
     just_added: u8,
+    is_active: u8,
 }
 
 impl RowGroup {
@@ -46,6 +47,7 @@ impl FromRow for RowGroup {
             depth: row.get(2).unwrap(),
             added_by: Baglama2::value2opt_string(row.as_ref(3).unwrap()).unwrap(),
             just_added: row.get(4).unwrap(),
+            is_active: row.get(5).unwrap(),
         })
     }
 }

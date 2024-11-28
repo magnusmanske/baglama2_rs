@@ -396,7 +396,7 @@ impl Baglama2 {
     // TESTED
     pub async fn get_next_group_id(&self, year: i32, month: u32) -> Option<usize> {
         let mut conn = self.get_tooldb_conn().await.ok()?;
-        let sql = "SELECT id FROM groups WHERE NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month) ORDER BY rand() LIMIT 1";
+        let sql = "SELECT id FROM groups WHERE is_active=1 AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month) ORDER BY rand() LIMIT 1";
         let results = conn
             .exec_iter(sql, mysql_async::params!(year, month))
             .await
