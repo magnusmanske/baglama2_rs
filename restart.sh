@@ -5,7 +5,7 @@ toolforge jobs run \
 	--mem 4000Mi \
 	--cpu 3 \
 	--mount=all \
-	--image glamtools/glamtools:latest \
+	--image tool-glamtools/tool-glamtools:latest \
 	--command "sh -c 'target/release/baglama2 next_all'" \
 	--schedule "17 3 2 * *" \
 	--filelog -o /data/project/glamtools/rustbot.out -e /data/project/glamtools/rustbot.err \
