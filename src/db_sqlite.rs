@@ -285,17 +285,6 @@ impl DbSqlite {
         Ok(())
     }
 
-    pub fn get_category_and_depth(&self, group_id: GroupId) -> Result<(String, usize)> {
-        let sql = "SELECT `category`,`depth` FROM `groups` WHERE `id`=?";
-        let (category, depth): (String, usize) = self
-            .conn()
-            .prepare(sql)?
-            .query_map([group_id.as_usize()], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .next()
-            .ok_or(anyhow!(sql))??;
-        Ok((category, depth))
-    }
-
     pub fn file_insert_batch_size(&self) -> usize {
         450 // sqlite3 limit is 500
     }
@@ -331,12 +320,12 @@ impl DbSqlite {
                 sql,
                 rusqlite::params![
                     site.id(),
-                    site.grok_code,
-                    site.server,
-                    site.giu_code,
+                    site.grok_code(),
+                    site.server(),
+                    site.giu_code(),
                     site.project(),
                     site.language(),
-                    site.name
+                    site.name()
                 ],
             )?;
         }
@@ -353,11 +342,11 @@ impl DbSqlite {
             self.conn().execute(
                 sql,
                 rusqlite::params![
-                    group.id,
-                    group.category,
-                    group.depth,
-                    group.added_by,
-                    group.just_added
+                    group.id(),
+                    group.category(),
+                    group.depth(),
+                    group.added_by(),
+                    group.just_added(),
                 ],
             )?;
         }

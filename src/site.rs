@@ -5,12 +5,12 @@ use mysql_async::prelude::*;
 #[derive(Debug, Clone)]
 pub struct Site {
     id: usize,
-    pub grok_code: Option<String>,
-    pub server: Option<String>,
-    pub giu_code: Option<String>,
+    grok_code: Option<String>,
+    server: Option<String>,
+    giu_code: Option<String>,
     project: Option<String>,
     language: Option<String>,
-    pub name: Option<String>,
+    name: Option<String>,
 }
 
 impl Site {
@@ -28,6 +28,22 @@ impl Site {
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub fn grok_code(&self) -> &Option<String> {
+        &self.grok_code
+    }
+
+    pub fn server(&self) -> &Option<String> {
+        &self.server
+    }
+
+    pub fn giu_code(&self) -> &Option<String> {
+        &self.giu_code
+    }
+
+    pub fn name(&self) -> &Option<String> {
+        &self.name
     }
 
     pub fn project(&self) -> &Option<String> {

@@ -3,11 +3,33 @@ use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct RowGroup {
-    pub id: usize,
-    pub category: String,
-    pub depth: usize,
-    pub added_by: String,
-    pub just_added: u8,
+    id: usize,
+    category: String,
+    depth: usize,
+    added_by: String,
+    just_added: u8,
+}
+
+impl RowGroup {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn category(&self) -> &String {
+        &self.category
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn added_by(&self) -> &String {
+        &self.added_by
+    }
+
+    pub fn just_added(&self) -> u8 {
+        self.just_added
+    }
 }
 
 impl FromRow for RowGroup {

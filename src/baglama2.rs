@@ -87,11 +87,13 @@ impl Baglama2 {
         let pool_opts = PoolOpts::default()
             .with_constraints(PoolConstraints::new(min_connections, max_connections).unwrap())
             .with_inactive_connection_ttl(Duration::from_secs(keep_sec));
-        let wd_url = url;
-        let wd_opts = Opts::from_url(wd_url)?;
-        Ok(mysql_async::Pool::new(
-            OptsBuilder::from_opts(wd_opts).pool_opts(pool_opts.clone()),
-        ))
+        let opts = Opts::from_url(url)?;
+        let opts = OptsBuilder::from_opts(opts).pool_opts(pool_opts);
+        // .init(vec![
+        //     "SET NAMES 'utf8mb4'".to_string(),
+        //     "SET CHARACTER SET 'utf8mb4'".to_string(),
+        // ]);
+        Ok(mysql_async::Pool::new(opts))
     }
 
     pub fn get_config_from_file(filename: &str) -> Result<serde_json::Value> {
@@ -131,17 +133,24 @@ impl Baglama2 {
         Ok(self.sites_cache.clone())
     }
 
+    // pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
+    //     match value {
+    //         mysql_async::Value::Bytes(s) => Some(std::str::from_utf8(s).ok()?.to_owned()),
+    //         _ => None,
+    //     }
+    // }
+
     // UNTESTED
     pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
         match value {
-            mysql_async::Value::Bytes(s) => Some(String::from_utf8_lossy(s).to_string()),
+            mysql_async::Value::Bytes(bytes) => String::from_utf8(bytes.to_owned()).ok(),
             _ => None,
         }
     }
 
     // TESTED
     pub async fn get_group(&self, group_id: &GroupId) -> Result<Option<RowGroup>> {
-        let sql = "SELECT id,category,depth,added_by,just_added FROM `groups` WHERE id=?";
+        let sql = "SELECT id,from_base64(TO_BASE64(category)),depth,from_base64(TO_BASE64(added_by)),just_added FROM `groups` WHERE id=?";
         let groups = self
             .get_tooldb_conn()
             .await?
@@ -465,7 +474,7 @@ mod tests {
         assert_eq!(sites1.len(), sites2.len());
         assert!(sites1
             .iter()
-            .any(|site| site.server == Some("zh-min-nan.wiktionary.org".to_string())));
+            .any(|site| *site.server() == Some("zh-min-nan.wiktionary.org".to_string())));
     }
 
     #[tokio::test]
@@ -477,7 +486,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            group.category,
+            group.category(),
             "Images from Archives of Ontario – RG 14-100 Official Road Maps of Ontario"
         );
     }
@@ -568,6 +577,20 @@ mod tests {
         assert_eq!(
             Baglama2::fix_server_name_for_page_view_api("wikidata.wikipedia.org"),
             "wikidata.org"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_group_utf8() {
+        let baglama = Baglama2::new().await.unwrap();
+        let group = baglama
+            .get_group(&292.try_into().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            group.category(),
+            "Files of Museum für Kunst und Gewerbe Hamburg uploaded by RKBot"
         );
     }
 }

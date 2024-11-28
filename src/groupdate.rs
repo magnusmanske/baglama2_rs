@@ -4,7 +4,7 @@ use crate::GroupId;
 use crate::Site;
 use crate::ViewCount;
 use crate::YearMonth;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -71,12 +71,22 @@ impl GroupDate {
     }
 
     pub async fn add_files(&self, db: &DatabaseType) -> Result<()> {
-        let (category, depth) = db.get_category_and_depth(self.group_id())?;
+        let group = self
+            .baglama
+            .get_group(&self.group_id)
+            .await?
+            .ok_or_else(|| anyhow!("Could not find group {} in MySQL database", self.group_id))?;
+        println!("{group:?}");
         db.delete_all_files()?;
 
         // Get files in category tree from Commons
+        println!(
+            "Getting files from {}, depth {}",
+            group.category(),
+            group.depth()
+        );
         let files = self
-            .get_files_from_commons_category_tree(&category, depth)
+            .get_files_from_commons_category_tree(group.category(), group.depth())
             .await?;
 
         let batch_size = db.file_insert_batch_size();
