@@ -9,6 +9,22 @@ use std::sync::{Arc, Mutex};
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
+/* TODO
+2023-09
+2023-10
+2023-11
+2023-12
+2024-01
+2024-02
+2024-03
+2024-04
+2024-05
+2024-06
+2024-07
+2024-08
+2024-09
+*/
+
 pub mod baglama2;
 pub mod db_mysql;
 pub mod db_sqlite;
