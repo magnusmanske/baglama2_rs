@@ -139,7 +139,7 @@ impl Baglama2 {
 
     // TESTED
     pub async fn get_group(&self, group_id: &GroupId) -> Result<Option<RowGroup>> {
-        let sql = "SELECT id,from_base64(TO_BASE64(category)),depth,from_base64(TO_BASE64(added_by)),just_added FROM `groups` WHERE id=?";
+        let sql = "SELECT id,FROM_BASE64(TO_BASE64(category)),depth,FROM_BASE64(TO_BASE64(added_by)),just_added FROM `groups` WHERE id=?";
         let groups = self
             .get_tooldb_conn()
             .await?
@@ -356,7 +356,7 @@ impl Baglama2 {
             }
             subcats.extend_from_slice(&todo);
             let placeholders = Baglama2::sql_placeholders(todo.len());
-            let sql = format!("SELECT DISTINCT page_title FROM page,categorylinks WHERE page_id=cl_from AND cl_to IN ({}) AND cl_type='subcat'",placeholders);
+            let sql = format!("SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title)) FROM page,categorylinks WHERE page_id=cl_from AND cl_to IN ({}) AND cl_type='subcat'",placeholders);
             check = self.query_commons_repeat(&sql, &todo).await?;
             if check.is_empty() {
                 break;
@@ -384,7 +384,7 @@ impl Baglama2 {
         let mut ret = vec![];
         for cats in categories.chunks(1000) {
             let placeholders = Baglama2::sql_placeholders(cats.len());
-            let sql = format!("SELECT DISTINCT page_title FROM page,categorylinks WHERE cl_from=page_id AND page_namespace={namespace} AND cl_to IN ({}) AND page_is_redirect=0",placeholders);
+            let sql = format!("SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title)) FROM page,categorylinks WHERE cl_from=page_id AND page_namespace={namespace} AND cl_to IN ({}) AND page_is_redirect=0",placeholders);
             let mut result = self.query_commons_repeat(&sql, cats).await?;
             ret.append(&mut result);
         }

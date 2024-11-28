@@ -39,7 +39,10 @@ impl FromRow for RowGroup {
     {
         Ok(Self {
             id: row.get(0).unwrap(),
-            category: Baglama2::value2opt_string(row.as_ref(1).unwrap()).unwrap(),
+            category: Baglama2::value2opt_string(row.as_ref(1).unwrap())
+                .unwrap()
+                .trim()
+                .to_string(),
             depth: row.get(2).unwrap(),
             added_by: Baglama2::value2opt_string(row.as_ref(3).unwrap()).unwrap(),
             just_added: row.get(4).unwrap(),
