@@ -139,7 +139,7 @@ impl Baglama2 {
 
     // TESTED
     pub async fn get_group(&self, group_id: &GroupId) -> Result<Option<RowGroup>> {
-        let sql = "SELECT id,FROM_BASE64(TO_BASE64(category)),depth,FROM_BASE64(TO_BASE64(added_by)),just_added FROM `groups` WHERE id=?";
+        let sql = "SELECT id,FROM_BASE64(TO_BASE64(category)),depth,FROM_BASE64(TO_BASE64(added_by)),just_added,is_active FROM `groups` WHERE id=?";
         let groups = self
             .get_tooldb_conn()
             .await?
