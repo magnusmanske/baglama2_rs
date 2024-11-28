@@ -89,6 +89,14 @@ impl GroupDate {
         let files = self
             .get_files_from_commons_category_tree(group.category(), group.depth())
             .await?;
+        if files.len() < 5 {
+            eprintln!(
+                "{} / {} has {} files",
+                group.category(),
+                group.depth(),
+                files.len()
+            );
+        }
 
         let batch_size = db.file_insert_batch_size();
         for batch in files.chunks(batch_size) {
