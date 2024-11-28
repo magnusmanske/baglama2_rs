@@ -31,6 +31,10 @@ impl RowGroup {
     pub fn just_added(&self) -> u8 {
         self.just_added
     }
+
+    pub fn is_active(&self) -> u8 {
+        self.is_active
+    }
 }
 
 impl FromRow for RowGroup {
