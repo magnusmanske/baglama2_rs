@@ -89,10 +89,6 @@ impl Baglama2 {
             .with_inactive_connection_ttl(Duration::from_secs(keep_sec));
         let opts = Opts::from_url(url)?;
         let opts = OptsBuilder::from_opts(opts).pool_opts(pool_opts);
-        // .init(vec![
-        //     "SET NAMES 'utf8mb4'".to_string(),
-        //     "SET CHARACTER SET 'utf8mb4'".to_string(),
-        // ]);
         Ok(mysql_async::Pool::new(opts))
     }
 
@@ -129,16 +125,9 @@ impl Baglama2 {
     }
 
     // TESTED
-    pub async fn get_sites(&self) -> Result<Vec<Site>> {
+    pub fn get_sites(&self) -> Result<Vec<Site>> {
         Ok(self.sites_cache.clone())
     }
-
-    // pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
-    //     match value {
-    //         mysql_async::Value::Bytes(s) => Some(std::str::from_utf8(s).ok()?.to_owned()),
-    //         _ => None,
-    //     }
-    // }
 
     // UNTESTED
     pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
@@ -469,8 +458,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_sites() {
         let baglama = Baglama2::new().await.unwrap();
-        let sites1 = baglama.get_sites().await.unwrap(); // Raw
-        let sites2 = baglama.get_sites().await.unwrap(); // From cache
+        let sites1 = baglama.get_sites().unwrap(); // Raw
+        let sites2 = baglama.get_sites().unwrap(); // From cache
         assert_eq!(sites1.len(), sites2.len());
         assert!(sites1
             .iter()

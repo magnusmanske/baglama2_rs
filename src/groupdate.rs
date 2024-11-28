@@ -1,5 +1,6 @@
 use crate::baglama2::*;
 use crate::db_sqlite::DbSqlite as DatabaseType;
+// use crate::db_mysql::DbMySql as DatabaseType;
 use crate::GroupId;
 use crate::Site;
 use crate::ViewCount;
@@ -300,7 +301,7 @@ impl GroupDate {
     pub async fn create_sqlite(&mut self) -> Result<()> {
         let db = DatabaseType::new(self, self.baglama.clone())?;
         println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
-        db.initialize(self.group_id(), self.ym().to_owned()).await?;
+        db.initialize().await?;
         println!("{}-{}: add_files", self.group_id, self.ym);
         self.add_files(&db).await?;
         println!("{}-{}: add_pages", self.group_id, self.ym);
@@ -310,7 +311,7 @@ impl GroupDate {
         println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
         self.finalize(&db).await?;
         println!("{}-{}: done!", self.group_id, self.ym);
-        db.finalize(&self.ym)?;
+        db.finalize()?;
         Ok(())
     }
 }

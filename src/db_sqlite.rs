@@ -53,9 +53,9 @@ impl DbSqlite {
         &self.path_final
     }
 
-    pub fn finalize(&self, ym: &YearMonth) -> Result<()> {
+    pub fn finalize(&self) -> Result<()> {
         if self.path_tmp != self.path_final {
-            let _ = ym.make_production_directory(&self.baglama);
+            let _ = self.ym.make_production_directory(&self.baglama);
             std::fs::copy(&self.path_tmp, &self.path_final)?;
             let _ = std::fs::remove_file(&self.path_tmp);
         }
@@ -190,7 +190,7 @@ impl DbSqlite {
             }
 
             if !parts.is_empty() {
-                self.add_views_batch_for_files_to_sqlite(sql_values, parts, group_status_id)?;
+                self.add_views_batch_for_files(sql_values, parts, group_status_id)?;
             }
 
             println!("add_views_for_files_to_sqlite: batch done");
@@ -234,7 +234,7 @@ impl DbSqlite {
             .map_err(|e| anyhow!(e))
     }
 
-    fn add_views_batch_for_files_to_sqlite(
+    fn add_views_batch_for_files(
         &self,
         sql_values: Vec<String>,
         parts: Vec<(usize, String, String)>,
@@ -297,12 +297,12 @@ impl DbSqlite {
         Ok(())
     }
 
-    pub async fn initialize(&self, group_id: GroupId, ym: YearMonth) -> Result<()> {
+    pub async fn initialize(&self) -> Result<()> {
         let sql = std::fs::read_to_string(self.baglama.sqlite_schema_file())?;
-        self.execute_batch(&sql)?;
+        self.conn().execute_batch(&sql)?;
         self.seed_file_sites().await?;
-        self.seed_file_groups(&group_id).await?;
-        self.group_status(&group_id, &ym).await?;
+        self.seed_file_groups(&self.group_id).await?;
+        self.set_group_status(&self.group_id, &self.ym).await?;
         self.conn().execute(
             "UPDATE `group_status` SET `status`='',`total_views`=null,`file`=null,`sqlite3`=null",
             (),
@@ -310,10 +310,10 @@ impl DbSqlite {
         Ok(())
     }
 
-    pub async fn seed_file_sites(&self) -> Result<()> {
+    async fn seed_file_sites(&self) -> Result<()> {
         // DO NOT IMPLEMENT THIS FOR MYSQL
         self.conn().execute("DELETE FROM `sites`", ())?;
-        let sites = self.baglama.get_sites().await?;
+        let sites = self.baglama.get_sites()?;
         for site in &sites {
             let sql = "INSERT INTO `sites` (id,grok_code,server,giu_code,project,language,name) VALUES (?,?,?,?,?,?,?)" ;
             self.conn().execute(
@@ -332,7 +332,7 @@ impl DbSqlite {
         Ok(())
     }
 
-    pub async fn seed_file_groups(&self, group_id: &GroupId) -> Result<()> {
+    async fn seed_file_groups(&self, group_id: &GroupId) -> Result<()> {
         // DO NOT IMPLEMENT THIS FOR MYSQL
         self.conn().execute("DELETE FROM `groups`", ())?;
         let groups = self.baglama.get_group(group_id).await?;
@@ -353,7 +353,7 @@ impl DbSqlite {
         Ok(())
     }
 
-    pub async fn group_status(&self, group_id: &GroupId, ym: &YearMonth) -> Result<()> {
+    async fn set_group_status(&self, group_id: &GroupId, ym: &YearMonth) -> Result<()> {
         self.conn().execute("DELETE FROM `group_status`", ())?;
         let group_status = self.baglama.get_group_status(group_id, ym).await?;
         if let Some(gs) = group_status {
@@ -378,16 +378,6 @@ impl DbSqlite {
                 rusqlite::params![group_id.as_usize(), ym.year(), ym.month()],
             )?;
         }
-        Ok(())
-    }
-
-    pub fn execute(&self, sql: &str) -> Result<()> {
-        self.conn().execute(sql, [])?;
-        Ok(())
-    }
-
-    pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.conn().execute_batch(sql)?;
         Ok(())
     }
 

@@ -10,6 +10,7 @@ pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
 pub mod baglama2;
+pub mod db_mysql;
 pub mod db_sqlite;
 pub mod global_image_links;
 pub mod group_id;
