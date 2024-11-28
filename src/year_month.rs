@@ -1,5 +1,6 @@
 use crate::Baglama2;
 use anyhow::{anyhow, Result};
+use chrono::Datelike;
 
 #[derive(Debug, Clone)]
 pub struct YearMonth {
@@ -12,7 +13,8 @@ impl YearMonth {
         if month == 0 || month > 12 {
             return Err(anyhow!("Bad month: {month}"));
         }
-        if !(2000..=2030).contains(&year) {
+        let current_year = chrono::Utc::now().year(); // Get the current year
+        if !(2000..=current_year).contains(&year) {
             return Err(anyhow!("Bad year: {year}"));
         }
         Ok(Self { year, month })
