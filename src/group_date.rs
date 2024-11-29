@@ -63,6 +63,10 @@ impl GroupDate {
         }
     }
 
+    async fn get_files_from_user_name(&self, user_name: &str) -> Result<Vec<String>> {
+        self.baglama.get_files_from_user_name(user_name).await
+    }
+
     async fn get_files_from_commons_category_tree(
         &self,
         category: &str,
@@ -86,9 +90,12 @@ impl GroupDate {
             group.category(),
             group.depth()
         );
-        let files = self
-            .get_files_from_commons_category_tree(group.category(), group.depth())
-            .await?;
+        let files = if group.is_user_name() {
+            self.get_files_from_user_name(group.category()).await?
+        } else {
+            self.get_files_from_commons_category_tree(group.category(), group.depth())
+                .await?
+        };
         if files.len() < 5 {
             eprintln!(
                 "{} / {} has {} files",

@@ -41,8 +41,8 @@ impl RowGroup {
         self.is_active
     }
 
-    pub fn is_user_name(&self) -> u8 {
-        self.is_user_name
+    pub fn is_user_name(&self) -> bool {
+        self.is_user_name == 1
     }
 }
 

@@ -124,7 +124,7 @@ async fn process_all_groups(
 async fn main() -> Result<()> {
     let argv: Vec<String> = env::args_os().map(|s| s.into_string().unwrap()).collect();
     let baglama = Arc::new(Baglama2::new().await?);
-    baglama.deactivate_nonexistent_groups().await?;
+    baglama.deactivate_nonexistent_categories().await?;
     match argv.get(1).map(|s| s.as_str()) {
         Some("run") => {
             let group_id = argv

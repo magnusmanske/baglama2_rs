@@ -79,7 +79,7 @@ impl Baglama2 {
             .to_string()
     }
 
-    pub async fn deactivate_nonexistent_groups(&self) -> Result<()> {
+    pub async fn deactivate_nonexistent_categories(&self) -> Result<()> {
         let sql = format!(
             "{} WHERE is_user_name=0 AND is_active=1",
             RowGroup::sql_select()
@@ -461,6 +461,18 @@ impl Baglama2 {
         Ok(ret)
     }
 
+    /// Gets all images uploaded by a user
+    pub async fn get_files_from_user_name(&self, user_name: &str) -> Result<Vec<String>> {
+        let sql = "SELECT DISTINCT FROM_BASE64(TO_BASE64(img_name)) FROM image,actor,user WHERE img_actor=actor_id AND user_name=:user_name AND user_id=actor_user";
+        let mut conn = self.get_commons_conn().await?;
+        let results = conn
+            .exec_iter(sql, mysql_async::params! {user_name})
+            .await?
+            .map_and_drop(from_row::<String>)
+            .await?;
+        Ok(results)
+    }
+
     // TESTED
     pub async fn get_next_group_id(
         &self,
@@ -469,26 +481,13 @@ impl Baglama2 {
         requires_previous_date: bool,
     ) -> Option<usize> {
         let mut conn = self.get_tooldb_conn().await.ok()?;
-        let mut sql = "SELECT id FROM groups WHERE is_active=1 AND is_user_name=0".to_string();
+        let mut sql = "SELECT id FROM groups WHERE is_active=1".to_string();
         sql += " AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month)";
-        // Backfilling?
+        // Backfilling
         if requires_previous_date {
             sql += " AND EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND (year<:year OR (year=:year AND month<:month)))";
         }
         sql += " ORDER BY rand() LIMIT 1";
-        let results = conn
-            .exec_iter(sql, mysql_async::params!(year, month))
-            .await
-            .ok()?
-            .map_and_drop(from_row::<usize>)
-            .await
-            .ok()?;
-        results.first().map(|id| id.to_owned())
-    }
-
-    pub async fn get_next_group_id_backfill(&self, year: i32, month: u32) -> Option<usize> {
-        let mut conn = self.get_tooldb_conn().await.ok()?;
-        let sql = "SELECT id FROM groups WHERE is_active=1 AND is_user_name=0 AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month) ORDER BY rand() LIMIT 1";
         let results = conn
             .exec_iter(sql, mysql_async::params!(year, month))
             .await
@@ -594,6 +593,16 @@ mod tests {
             .await
             .unwrap();
         assert!(images.contains(&"2013-06-07_Kindergartenfest_Berlin-Karow_03.jpg".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_files_from_user_name() {
+        let baglama = Baglama2::new().await.unwrap();
+        let files = baglama
+            .get_files_from_user_name("Magnus Manske")
+            .await
+            .unwrap();
+        assert!(files.contains(&"2002-07_Sylt_-_Westerland_(panorama).jpg".to_string()));
     }
 
     #[tokio::test]
