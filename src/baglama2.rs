@@ -79,6 +79,74 @@ impl Baglama2 {
             .to_string()
     }
 
+    pub async fn deactivate_nonexistent_groups(&self) -> Result<()> {
+        let sql = format!(
+            "{} WHERE is_user_name=0 AND is_active=1",
+            RowGroup::sql_select()
+        );
+        let groups = self
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, ())
+            .await?
+            .map_and_drop(from_row::<RowGroup>)
+            .await?;
+        let active_categories = groups
+            .iter()
+            .map(|group| group.category().to_owned())
+            .collect::<Vec<String>>();
+        let existing_categories = self.get_existing_categories(&active_categories).await?;
+        let non_existing_categories = active_categories
+            .iter()
+            .filter(|category| !existing_categories.contains(*category))
+            .cloned()
+            .collect::<Vec<String>>();
+        let groups_to_deactivate = groups
+            .iter()
+            .filter(|group| non_existing_categories.contains(group.category()))
+            .map(|group| group.id())
+            .collect::<Vec<usize>>();
+        if groups_to_deactivate.is_empty() {
+            return Ok(());
+        }
+        self.deactivate_groups(&groups_to_deactivate).await?;
+        Ok(())
+    }
+
+    async fn deactivate_groups(&self, group_ids: &[usize]) -> Result<()> {
+        let placeholders = Baglama2::sql_placeholders(group_ids.len());
+        let sql = format!("UPDATE `groups` SET is_active=0 WHERE id IN ({placeholders})");
+        self.get_tooldb_conn()
+            .await?
+            .exec_drop(sql, group_ids.to_owned())
+            .await?;
+        Ok(())
+    }
+
+    async fn get_existing_categories(&self, categories: &[String]) -> Result<Vec<String>> {
+        if categories.is_empty() {
+            return Ok(vec![]);
+        }
+        let categories = categories
+            .iter()
+            .map(|category| category.replace(" ", "_"))
+            .collect::<Vec<String>>();
+        let placeholders = Baglama2::sql_placeholders(categories.len());
+        let sql = format!("SELECT `page_title` FROM `page` WHERE `page_namespace`=14 AND `page_title` IN ({placeholders})");
+        let results = self
+            .get_commons_conn()
+            .await?
+            .exec_iter(sql, categories.to_owned())
+            .await?
+            .map_and_drop(from_row::<String>)
+            .await?;
+        let results = results
+            .iter()
+            .map(|category| category.replace("_", " "))
+            .collect::<Vec<String>>();
+        Ok(results)
+    }
+
     fn create_pool(config: &Value) -> Result<mysql_async::Pool> {
         let min_connections = config["min_connections"].as_u64().unwrap_or(0) as usize;
         let max_connections = config["max_connections"].as_u64().unwrap_or(5) as usize;
@@ -139,11 +207,11 @@ impl Baglama2 {
 
     // TESTED
     pub async fn get_group(&self, group_id: &GroupId) -> Result<Option<RowGroup>> {
-        let sql = "SELECT id,FROM_BASE64(TO_BASE64(category)),depth,FROM_BASE64(TO_BASE64(added_by)),just_added,is_active FROM `groups` WHERE id=?";
+        let sql = format!("{} WHERE id={group_id}", RowGroup::sql_select());
         let groups = self
             .get_tooldb_conn()
             .await?
-            .exec_iter(sql, (group_id.as_usize(),))
+            .exec_iter(sql, ())
             .await?
             .map_and_drop(from_row::<RowGroup>)
             .await?;
@@ -394,9 +462,33 @@ impl Baglama2 {
     }
 
     // TESTED
-    pub async fn get_next_group_id(&self, year: i32, month: u32) -> Option<usize> {
+    pub async fn get_next_group_id(
+        &self,
+        year: i32,
+        month: u32,
+        requires_previous_date: bool,
+    ) -> Option<usize> {
         let mut conn = self.get_tooldb_conn().await.ok()?;
-        let sql = "SELECT id FROM groups WHERE is_active=1 AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month) ORDER BY rand() LIMIT 1";
+        let mut sql = "SELECT id FROM groups WHERE is_active=1 AND is_user_name=0".to_string();
+        sql += " AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month)";
+        // Backfilling?
+        if requires_previous_date {
+            sql += " AND EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND (year<:year OR (year=:year AND month<:month)))";
+        }
+        sql += " ORDER BY rand() LIMIT 1";
+        let results = conn
+            .exec_iter(sql, mysql_async::params!(year, month))
+            .await
+            .ok()?
+            .map_and_drop(from_row::<usize>)
+            .await
+            .ok()?;
+        results.first().map(|id| id.to_owned())
+    }
+
+    pub async fn get_next_group_id_backfill(&self, year: i32, month: u32) -> Option<usize> {
+        let mut conn = self.get_tooldb_conn().await.ok()?;
+        let sql = "SELECT id FROM groups WHERE is_active=1 AND is_user_name=0 AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month) ORDER BY rand() LIMIT 1";
         let results = conn
             .exec_iter(sql, mysql_async::params!(year, month))
             .await
@@ -490,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_next_group_id() {
         let baglama = Baglama2::new().await.unwrap();
-        let ng = baglama.get_next_group_id(2014, 1).await;
+        let ng = baglama.get_next_group_id(2014, 1, false).await;
         assert!(ng.is_some());
     }
 

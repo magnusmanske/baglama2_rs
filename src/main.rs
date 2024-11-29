@@ -68,10 +68,63 @@ fn year(year: Option<&String>) -> i32 {
     }
 }
 
+async fn process_all_groups(
+    year: i32,
+    month: u32,
+    baglama: Arc<Baglama2>,
+    requires_previous_date: bool,
+) -> Result<()> {
+    baglama.clear_incomplete_group_status(year, month).await?;
+    let max_concurrent = baglama.config()["max_concurrent_jobs"].as_u64().unwrap();
+    let concurrent: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    loop {
+        if *concurrent.lock().unwrap() >= max_concurrent {
+            baglama.hold_on().await;
+            continue;
+        }
+        let group_id_opt = baglama
+            .get_next_group_id(year, month, requires_previous_date)
+            .await;
+        if let Some(group_id) = group_id_opt {
+            let concurrent = concurrent.clone();
+            let baglama = baglama.clone();
+            *concurrent.lock().unwrap() += 1;
+            println!("Now {} jobs running", concurrent.lock().unwrap());
+            let mut gd = GroupDate::new(
+                group_id.try_into()?,
+                YearMonth::new(year, month).unwrap(),
+                baglama.clone(),
+            );
+            let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
+            tokio::spawn(async move {
+                match gd.create_sqlite().await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = gd.set_group_status("FAILED", 0, "").await;
+                        println!("{group_id} failed: {:?}", &err);
+                    }
+                }
+                drop(gd);
+                *concurrent.lock().unwrap() -= 1;
+            });
+        } else {
+            // Wait for threads to finish
+            if *concurrent.lock().unwrap() > 0 {
+                baglama.hold_on().await;
+                continue;
+            }
+            println!("Complete");
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let argv: Vec<String> = env::args_os().map(|s| s.into_string().unwrap()).collect();
     let baglama = Arc::new(Baglama2::new().await?);
+    baglama.deactivate_nonexistent_groups().await?;
     match argv.get(1).map(|s| s.as_str()) {
         Some("run") => {
             let group_id = argv
@@ -91,7 +144,7 @@ async fn main() -> Result<()> {
         Some("next") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
-            if let Some(group_id) = baglama.get_next_group_id(year, month).await {
+            if let Some(group_id) = baglama.get_next_group_id(year, month, false).await {
                 GroupDate::new(
                     group_id.try_into()?,
                     YearMonth::new(year, month).unwrap(),
@@ -111,7 +164,7 @@ async fn main() -> Result<()> {
                 baglama.clear_incomplete_group_status(year, month).await?;
             }
             loop {
-                if let Some(group_id) = baglama.get_next_group_id(year, month).await {
+                if let Some(group_id) = baglama.get_next_group_id(year, month, false).await {
                     let mut gd = GroupDate::new(
                         group_id.try_into()?,
                         YearMonth::new(year, month).unwrap(),
@@ -134,50 +187,29 @@ async fn main() -> Result<()> {
         Some("next_all") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
-            if argv.get(4).is_none() {
-                // Any third parameter will do this
-                baglama.clear_incomplete_group_status(year, month).await?;
-            }
-            let max_concurrent = baglama.config()["max_concurrent_jobs"].as_u64().unwrap();
-            let concurrent: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+            process_all_groups(year, month, baglama.clone(), false).await?;
+        }
+        Some("backfill") => {
+            let mut year = year(argv.get(2));
+            let mut month = month(argv.get(3));
+            let current_year = chrono::Utc::now().year();
+            let current_month = chrono::Utc::now().month();
             loop {
-                if *concurrent.lock().unwrap() >= max_concurrent {
-                    baglama.hold_on().await;
-                    continue;
+                println!("BACKFILLING {year}-{month}");
+                process_all_groups(year, month, baglama.clone(), true).await?;
+                month += 1;
+                if month > 12 {
+                    month = 1;
+                    year += 1;
                 }
-                let group_id_opt = baglama.get_next_group_id(year, month).await;
-                if let Some(group_id) = group_id_opt {
-                    let concurrent = concurrent.clone();
-                    let baglama = baglama.clone();
-                    *concurrent.lock().unwrap() += 1;
-                    println!("Now {} jobs running", concurrent.lock().unwrap());
-                    let mut gd = GroupDate::new(
-                        group_id.try_into()?,
-                        YearMonth::new(year, month).unwrap(),
-                        baglama.clone(),
-                    );
-                    let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
-                    tokio::spawn(async move {
-                        match gd.create_sqlite().await {
-                            Ok(_) => {}
-                            Err(err) => {
-                                let _ = gd.set_group_status("FAILED", 0, "").await;
-                                println!("{group_id} failed: {:?}", &err);
-                            }
-                        }
-                        drop(gd);
-                        *concurrent.lock().unwrap() -= 1;
-                    });
-                } else {
-                    // Wait for threads to finish
-                    if *concurrent.lock().unwrap() > 0 {
-                        baglama.hold_on().await;
-                        continue;
-                    }
-                    println!("Complete");
+                if year > current_year || (year == current_year && month >= current_month) {
                     break;
                 }
             }
+        }
+        Some("test") => {
+            let current_month = chrono::Utc::now().month();
+            println!("{current_month}");
         }
         other => panic!("Action required (not {:?}", other),
     }
