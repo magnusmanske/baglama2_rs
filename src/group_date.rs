@@ -1,5 +1,6 @@
 use crate::baglama2::*;
 use crate::db_sqlite::DbSqlite as DatabaseType;
+use lazy_static::lazy_static;
 // use crate::db_mysql::DbMySql as DatabaseType;
 use crate::GroupId;
 use crate::Site;
@@ -143,19 +144,8 @@ impl GroupDate {
     ) -> Option<u64> {
         let server = Self::fix_server_name_for_page_view_api(server);
         let url = format!("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{server}/all-access/user/{title}/daily/{first_day}/{last_day}");
-        let mut wd = Wikidata::new();
-        wd.set_user_agent(USER_AGENT);
-        wd.set_timeout(Duration::from_secs(URL_LOAD_TIMEOUT_SEC));
-        let json_text = wd
-            .reqwest_client()
-            .ok()?
-            .get(url)
-            .send()
-            .await
-            .ok()?
-            .text()
-            .await
-            .ok()?;
+        let client = Self::get_reqwest_client();
+        let json_text = client.get(url).send().await.ok()?.text().await.ok()?;
         let json: Value = serde_json::from_str(&json_text).ok()?;
         let items = json.get("items")?.as_array()?;
         Some(
@@ -345,6 +335,21 @@ impl GroupDate {
         println!("{}-{}: done!", self.group_id, self.ym);
         db.finalize()?;
         Ok(())
+    }
+
+    fn get_reqwest_client() -> Arc<reqwest::Client> {
+        lazy_static! {
+            static ref CLIENT: Arc<reqwest::Client> = {
+                let mut wd = Wikidata::new();
+                wd.set_user_agent(USER_AGENT);
+                wd.set_timeout(Duration::from_secs(URL_LOAD_TIMEOUT_SEC));
+                let client = wd
+                    .reqwest_client()
+                    .expect("Could not create reqwest client");
+                Arc::new(client)
+            };
+        }
+        CLIENT.clone()
     }
 }
 
