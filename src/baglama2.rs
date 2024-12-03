@@ -6,19 +6,19 @@ use crate::YearMonth;
 use anyhow::Result;
 use core::time::Duration;
 use lazy_static::lazy_static;
-use mysql_async::{from_row, prelude::*, Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts};
+use mysql_async::{from_row, prelude::*, Conn};
 use regex::Regex;
 use serde_json::Value;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:56.0) Gecko/20100101 Firefox/56.0";
-const URL_LOAD_TIMEOUT_SEC: u64 = 60;
+use wikimisc::mediawiki::Api;
+use wikimisc::site_matrix::SiteMatrix;
+use wikimisc::toolforge_db::ToolforgeDB;
 
 lazy_static! {
     static ref RE_WEBSERVER_WIKIPEDIA: Regex = Regex::new(r"^(.+)wiki$").expect("Regex error");
@@ -28,10 +28,10 @@ lazy_static! {
 #[derive(Debug)]
 pub struct Baglama2 {
     config: Value,
-    tool_db_pool: mysql_async::Pool,
-    commons_pool: mysql_async::Pool,
-    namespace_cache: Arc<Mutex<HashMap<String, HashMap<i32, String>>>>,
+    tfdb: ToolforgeDB,
+    apis: Arc<Mutex<HashMap<String, Api>>>,
     sites_cache: Vec<Site>,
+    site_matrix: SiteMatrix,
 }
 
 impl Baglama2 {
@@ -42,19 +42,39 @@ impl Baglama2 {
                 Self::get_config_from_file("/data/project/glamtools/baglama2_rs/config.json")?
             }
         };
+        let wikidata_api = Api::new("https://www.wikidata.org/w/api.php").await?;
         let mut ret = Self {
             config: config.clone(),
-            tool_db_pool: Self::create_pool(
-                config.get("tooldb").expect("No conenction to tool DB"),
-            )?,
-            commons_pool: Self::create_pool(
-                config.get("commons").expect("No conenction to Commons DB"),
-            )?,
-            namespace_cache: Arc::new(Mutex::new(HashMap::new())),
+            tfdb: ToolforgeDB::default(),
+            apis: Arc::new(Mutex::new(HashMap::new())),
             sites_cache: vec![],
+            site_matrix: SiteMatrix::new(&wikidata_api).await?,
         };
+        ret.tfdb.add_mysql_pool("tooldb", &config["tooldb"])?;
+        ret.tfdb.add_mysql_pool("commons", &config["commons"])?;
         ret.populate_sites().await?;
         Ok(ret)
+    }
+
+    async fn api(&self, wiki: &str) -> Option<Api> {
+        match self.apis.lock().await.entry(wiki.to_string()) {
+            Entry::Occupied(e) => {
+                let api: &Api = e.get();
+                Some(api.clone())
+            }
+            Entry::Vacant(entry) => {
+                let namespaces = self.add_api(wiki).await?;
+                let api = entry.insert(namespaces);
+                Some(api.clone())
+            }
+        }
+    }
+
+    async fn add_api(&self, wiki: &str) -> Option<Api> {
+        let server = self.site_matrix.get_server_url_for_wiki(wiki).ok()?;
+        let url = format!("{server}/w/api.php");
+        let api = Api::new(&url).await.ok()?;
+        Some(api)
     }
 
     pub fn config(&self) -> &Value {
@@ -147,19 +167,6 @@ impl Baglama2 {
         Ok(results)
     }
 
-    fn create_pool(config: &Value) -> Result<mysql_async::Pool> {
-        let min_connections = config["min_connections"].as_u64().unwrap_or(0) as usize;
-        let max_connections = config["max_connections"].as_u64().unwrap_or(5) as usize;
-        let keep_sec = config["keep_sec"].as_u64().unwrap_or(0);
-        let url = config["url"].as_str().expect("No url value");
-        let pool_opts = PoolOpts::default()
-            .with_constraints(PoolConstraints::new(min_connections, max_connections).unwrap())
-            .with_inactive_connection_ttl(Duration::from_secs(keep_sec));
-        let opts = Opts::from_url(url)?;
-        let opts = OptsBuilder::from_opts(opts).pool_opts(pool_opts);
-        Ok(mysql_async::Pool::new(opts))
-    }
-
     pub fn get_config_from_file(filename: &str) -> Result<serde_json::Value> {
         let path = if filename.starts_with('/') {
             Path::new(filename).to_path_buf()
@@ -172,12 +179,12 @@ impl Baglama2 {
         Ok(serde_json::from_reader(file)?)
     }
 
-    pub async fn get_tooldb_conn(&self) -> Result<Conn, mysql_async::Error> {
-        self.tool_db_pool.get_conn().await
+    pub async fn get_tooldb_conn(&self) -> Result<Conn> {
+        self.tfdb.get_connection("tooldb").await
     }
 
-    pub async fn get_commons_conn(&self) -> Result<Conn, mysql_async::Error> {
-        self.commons_pool.get_conn().await
+    pub async fn get_commons_conn(&self) -> Result<Conn> {
+        self.tfdb.get_connection("commons").await
     }
 
     async fn populate_sites(&mut self) -> Result<()> {
@@ -236,98 +243,11 @@ impl Baglama2 {
         Ok(ret)
     }
 
-    // TESTED
-    pub fn fix_server_name_for_page_view_api(server: &str) -> String {
-        match server {
-            "wikidata.wikipedia.org" => "wikidata.org".to_string(),
-            "species.wikipedia.org" => "species.wikimedia.org".to_string(),
-            _ => server.to_string(),
-        }
-    }
-
-    // TESTED
-    pub fn get_webserver_for_wiki(wiki: &str) -> Option<String> {
-        match wiki {
-            "commonswiki" => Some("commons.wikimedia.org".to_string()),
-            "wikidatawiki" => Some("www.wikidata.org".to_string()),
-            "specieswiki" => Some("species.wikimedia.org".to_string()),
-            "metawiki" => Some("meta.wikimedia.org".to_string()),
-            wiki => {
-                let wiki = wiki.replace("_", "-");
-                if let Some(cap1) = RE_WEBSERVER_WIKIPEDIA.captures(&wiki) {
-                    if let Some(name) = cap1.get(1) {
-                        return Some(format!("{}.wikipedia.org", name.as_str()));
-                    }
-                }
-                if let Some(cap2) = RE_WEBSERVER_WIKI.captures(&wiki) {
-                    if let (Some(name), Some(domain)) = (cap2.get(1), cap2.get(2)) {
-                        return Some(format!("{}.{}.org", name.as_str(), domain.as_str()));
-                    }
-                }
-                None
-            }
-        }
-    }
-
-    pub fn reqwest_client_external() -> Option<reqwest::Client> {
-        reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(core::time::Duration::from_secs(URL_LOAD_TIMEOUT_SEC))
-            .connection_verbose(true)
-            .gzip(true)
-            .deflate(true)
-            .brotli(true)
-            .build()
-            .ok()
-    }
-
-    pub async fn load_json_from_url(url: &str) -> Option<Value> {
-        let json_text = Self::reqwest_client_external()?
-            .get(url)
-            .send()
-            .await
-            .ok()?
-            .text()
-            .await
-            .ok()?;
-        let json: Value = serde_json::from_str(&json_text).ok()?;
-        Some(json)
-    }
-
-    // TESTED
-    pub async fn load_namespaces_for_wiki(&self, wiki: &str) -> Result<bool> {
-        if self.namespace_cache.lock().await.contains_key(wiki) {
-            return Ok(true);
-        }
-        let server = match Self::get_webserver_for_wiki(wiki) {
-            Some(server) => server,
-            None => return Ok(false),
-        };
-        let url = format!(
-            "https://{server}/w/api.php?action=query&meta=siteinfo&siprop=namespaces&format=json"
-        );
-        let json = match Self::load_json_from_url(&url).await {
-            Some(json) => json,
-            None => return Ok(false),
-        };
-
-        let mut m = HashMap::new();
-        if let Some(namespaces) = json["query"]["namespaces"].as_object() {
-            for (namespace_id, data) in namespaces {
-                if let Ok(namespace_id) = namespace_id.parse::<i32>() {
-                    if let Some(canonical_name) = data["*"].as_str() {
-                        m.insert(namespace_id, canonical_name.to_string());
-                    }
-                };
-            }
-        }
-
-        let mut namespace_cache = self.namespace_cache.lock().await;
-        if !namespace_cache.contains_key(wiki) {
-            namespace_cache.insert(wiki.to_owned(), m);
-        }
-
-        Ok(true)
+    async fn get_namespace_prefix(&self, wiki: &str, namespace_id: i32) -> Option<String> {
+        self.api(wiki)
+            .await?
+            .get_canonical_namespace_name(namespace_id.into())
+            .map(|s| s.to_string())
     }
 
     // TESTED
@@ -337,16 +257,7 @@ impl Baglama2 {
         namespace_id: i32,
         wiki: &str,
     ) -> Option<String> {
-        if !self.load_namespaces_for_wiki(wiki).await.ok()? {
-            return None;
-        }
-        let prefix = self
-            .namespace_cache
-            .lock()
-            .await
-            .get(wiki)?
-            .get(&namespace_id)?
-            .to_owned();
+        let prefix = self.get_namespace_prefix(wiki, namespace_id).await?;
         if prefix.is_empty() {
             Some(title.to_string())
         } else {
@@ -373,7 +284,7 @@ impl Baglama2 {
                 Ok(conn) => conn,
                 Err(e) => {
                     if attempts_left == 0 {
-                        return Err(e.into());
+                        return Err(e);
                     } else {
                         continue;
                     }
@@ -572,13 +483,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_namespaces_for_wiki() {
-        let baglama = Baglama2::new().await.unwrap();
-        assert!(baglama.load_namespaces_for_wiki("enwiki").await.unwrap());
-        assert_eq!(baglama.namespace_cache.lock().await["enwiki"][&1], "Talk");
-    }
-
-    #[tokio::test]
     async fn test_get_next_group_id() {
         let baglama = Baglama2::new().await.unwrap();
         let ng = baglama.get_next_group_id(2014, 1, false).await;
@@ -603,23 +507,6 @@ mod tests {
             .await
             .unwrap();
         assert!(files.contains(&"2002-07_Sylt_-_Westerland_(panorama).jpg".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_get_webserver_for_wiki() {
-        assert_eq!(
-            Baglama2::get_webserver_for_wiki("wikidatawiki"),
-            Some("www.wikidata.org".to_string())
-        );
-        assert_eq!(
-            Baglama2::get_webserver_for_wiki("enwiki"),
-            Some("en.wikipedia.org".to_string())
-        );
-        assert_eq!(
-            Baglama2::get_webserver_for_wiki("enwikisource"),
-            Some("en.wikisource.org".to_string())
-        );
-        assert_eq!(Baglama2::get_webserver_for_wiki("shcswirk8d7g"), None);
     }
 
     #[tokio::test]
@@ -652,22 +539,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gs, expected);
-    }
-
-    #[test]
-    fn test_fix_server_name_for_page_view_api() {
-        assert_eq!(
-            Baglama2::fix_server_name_for_page_view_api("en.wikipedia.org"),
-            "en.wikipedia.org"
-        );
-        assert_eq!(
-            Baglama2::fix_server_name_for_page_view_api("species.wikipedia.org"),
-            "species.wikimedia.org"
-        );
-        assert_eq!(
-            Baglama2::fix_server_name_for_page_view_api("wikidata.wikipedia.org"),
-            "wikidata.org"
-        );
     }
 
     #[tokio::test]

@@ -10,7 +10,12 @@ use futures::future::join_all;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use wikimisc::wikidata::Wikidata;
 
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:56.0) Gecko/20100101 Firefox/56.0";
+const URL_LOAD_TIMEOUT_SEC: u64 = 60;
 const ADD_VIEW_COUNTS_BATCH_SIZE: usize = 3000;
 
 #[derive(Debug, Clone)]
@@ -57,10 +62,8 @@ impl GroupDate {
     }
 
     pub fn get_site_for_wiki(&self, wiki: &str) -> Option<&Site> {
-        match self.wiki2site_id.get(wiki) {
-            Some(site_id) => self.sites.get(site_id),
-            None => None,
-        }
+        let site_id = self.wiki2site_id.get(wiki)?;
+        self.sites.get(site_id)
     }
 
     async fn get_files_from_user_name(&self, user_name: &str) -> Result<Vec<String>> {
@@ -138,9 +141,14 @@ impl GroupDate {
         first_day: &str,
         last_day: &str,
     ) -> Option<u64> {
-        let server = Baglama2::fix_server_name_for_page_view_api(server);
+        let server = Self::fix_server_name_for_page_view_api(server);
         let url = format!("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{server}/all-access/user/{title}/daily/{first_day}/{last_day}");
-        let json_text = Baglama2::reqwest_client_external()?
+        let mut wd = Wikidata::new();
+        wd.set_user_agent(USER_AGENT);
+        wd.set_timeout(Duration::from_secs(URL_LOAD_TIMEOUT_SEC));
+        let json_text = wd
+            .reqwest_client()
+            .ok()?
             .get(url)
             .send()
             .await
@@ -157,6 +165,15 @@ impl GroupDate {
                 .filter_map(|views| views.as_u64())
                 .sum(),
         )
+    }
+
+    // TESTED
+    pub fn fix_server_name_for_page_view_api(server: &str) -> String {
+        match server {
+            "wikidata.wikipedia.org" => "wikidata.org".to_string(),
+            "species.wikipedia.org" => "species.wikimedia.org".to_string(),
+            _ => server.to_string(),
+        }
     }
 
     fn site2wiki(&self, site: &Site) -> Option<String> {
@@ -331,23 +348,23 @@ impl GroupDate {
     }
 }
 
-// temp deact
-// #[cfg(test)]
-// mod tests {
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-//     use super::*;
-
-//     #[tokio::test]
-//     async fn test_get_total_monthly_page_views() {
-//         let gd = GroupDate::new(1.into(), YearMonth::new(2022, 10));
-//         let total = gd
-//             .get_total_monthly_page_views(
-//                 "en.wikipedia.org",
-//                 "Eliza_Maria_Gordon-Cumming",
-//                 "20221001",
-//                 "20221031",
-//             )
-//             .await;
-//         assert_eq!(total, Some(110));
-//     }
-// }
+    #[test]
+    fn test_fix_server_name_for_page_view_api() {
+        assert_eq!(
+            GroupDate::fix_server_name_for_page_view_api("en.wikipedia.org"),
+            "en.wikipedia.org"
+        );
+        assert_eq!(
+            GroupDate::fix_server_name_for_page_view_api("species.wikipedia.org"),
+            "species.wikimedia.org"
+        );
+        assert_eq!(
+            GroupDate::fix_server_name_for_page_view_api("wikidata.wikipedia.org"),
+            "wikidata.org"
+        );
+    }
+}
