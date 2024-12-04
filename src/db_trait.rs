@@ -97,9 +97,12 @@ pub trait DbTrait {
         let mut chunk_num = 0;
         for files in all_files.chunks(CHUNK_SIZE) {
             chunk_num += 1;
-            println!("add_views_for_files_to_sqlite: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",all_files.len());
+            println!(
+                "add_views_for_files: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",
+                all_files.len()
+            );
             let globalimagelinks = GlobalImageLinks::load(files, self.baglama2()).await?;
-            println!("add_views_for_files_to_sqlite: globalimagelinks done");
+            println!("add_views_for_files: globalimagelinks done");
             let mut sql_values = vec![];
             let mut parts = vec![];
             for gil in &globalimagelinks {
@@ -133,9 +136,9 @@ pub trait DbTrait {
                     .await?;
             }
 
-            println!("add_views_for_files_to_sqlite: batch done");
+            println!("add_views_for_files: batch done");
         }
-        println!("add_views_for_files_to_sqlite: all batches done");
+        println!("add_views_for_files: all batches done");
 
         Ok(())
     }

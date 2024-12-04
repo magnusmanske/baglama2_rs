@@ -61,6 +61,15 @@ impl DbMySql {
             .await?;
         Ok(())
     }
+
+    async fn exec_vec(&self, sql: &str, payload: Vec<String>) -> Result<()> {
+        self.baglama
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, payload)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -165,11 +174,6 @@ impl DbTrait for DbMySql {
         Ok(ret)
     }
 
-    async fn add_views_for_files(&self, _all_files: &[String], _gd: &GroupDate) -> Result<()> {
-        // BIG ONE
-        todo!()
-    }
-
     async fn reset_main_page_view_count(&self) -> Result<()> {
         // TODO for all wikis?
         let group_status_id = self.get_group_status_id().await?;
@@ -247,11 +251,7 @@ impl DbTrait for DbMySql {
     async fn create_views_in_db(&self, parts: &[FilePart], sql_values: &[String]) -> Result<()> {
         let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
         let titles: Vec<String> = parts.iter().map(|p| p.page_title.to_owned()).collect();
-        self.baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, titles)
-            .await?;
+        self.exec_vec(&sql, titles).await?;
         Ok(())
     }
 
@@ -259,11 +259,7 @@ impl DbTrait for DbMySql {
         let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
             .to_string()
             + &values.join(",").to_string();
-        self.baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, images)
-            .await?;
+        self.exec_vec(&sql, images).await?;
         Ok(())
     }
 }
