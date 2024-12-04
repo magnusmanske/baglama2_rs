@@ -141,7 +141,7 @@ impl DbTrait for DbSqlite {
         &self.path_final
     }
 
-    fn finalize(&self) -> Result<()> {
+    async fn finalize(&self) -> Result<()> {
         if self.path_tmp != self.path_final {
             let _ = self.ym.make_production_directory(&self.baglama);
             std::fs::copy(&self.path_tmp, &self.path_final)?;

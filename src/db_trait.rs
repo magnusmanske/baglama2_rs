@@ -66,7 +66,7 @@ impl FromRow for ViewIdSiteIdTitle {
 #[async_trait]
 pub trait DbTrait {
     fn path_final(&self) -> &str;
-    fn finalize(&self) -> Result<()>;
+    async fn finalize(&self) -> Result<()>;
     fn load_sites(&self) -> Result<Vec<Site>>;
     async fn get_view_counts_todo(&self, batch_size: usize) -> Result<Vec<ViewCount>>;
     async fn get_group_status_id(&self) -> Result<usize>;

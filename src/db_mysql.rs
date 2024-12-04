@@ -130,8 +130,8 @@ impl DbTrait for DbMySql {
         &self.ym
     }
 
-    fn finalize(&self) -> Result<()> {
-        // Not needed for MySQL
+    async fn finalize(&self) -> Result<()> {
+        self.delete_all_files().await?;
         Ok(())
     }
 

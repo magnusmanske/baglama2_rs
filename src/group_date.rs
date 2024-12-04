@@ -15,10 +15,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use wikimisc::wikidata::Wikidata;
 
+const API_CALLS_IN_PARALLEL: usize = 10;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:56.0) Gecko/20100101 Firefox/56.0";
 const URL_LOAD_TIMEOUT_SEC: u64 = 60;
 const ADD_VIEW_COUNTS_BATCH_SIZE: usize = 3000;
+
+#[derive(Debug)]
+pub struct ViewsTodo {
+    server: String,
+    title: String,
+    first_day: String,
+    last_day: String,
+    view_id: usize,
+}
+
+impl ViewsTodo {
+    pub fn new(server: &str, title: &str, first_day: &str, last_day: &str, view_id: usize) -> Self {
+        Self {
+            server: server.to_string(),
+            title: title.to_string(),
+            first_day: first_day.to_string(),
+            last_day: last_day.to_string(),
+            view_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GroupDate {
@@ -140,15 +162,9 @@ impl GroupDate {
     }
 
     // TESTED
-    pub async fn get_total_monthly_page_views(
-        &self,
-        server: &str,
-        title: &str,
-        first_day: &str,
-        last_day: &str,
-    ) -> Option<u64> {
-        let server = Self::fix_server_name_for_page_view_api(server);
-        let url = format!("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{server}/all-access/user/{title}/daily/{first_day}/{last_day}");
+    pub async fn get_total_monthly_page_views(&self, vt: &ViewsTodo) -> Option<u64> {
+        let server = Self::fix_server_name_for_page_view_api(&vt.server);
+        let url = format!("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{server}/all-access/user/{}/daily/{}/{}",vt.title,vt.first_day,vt.last_day);
         let client = Self::get_reqwest_client();
         let json_text = client.get(url).send().await.ok()?.text().await.ok()?;
         let json: Value = serde_json::from_str(&json_text).ok()?;
@@ -215,27 +231,7 @@ impl GroupDate {
                 .await;
             }
             if !views_todo.is_empty() {
-                // println!("Preparing {} futures",views_todo.len());
-                for views_todo_batch in views_todo.chunks(10) {
-                    let futures: Vec<_> = views_todo_batch
-                        .iter()
-                        .map(|(server, title, first_day, last_day, _view_id)| {
-                            self.get_total_monthly_page_views(server, title, first_day, last_day)
-                        })
-                        .collect();
-                    let results: Vec<u64> = join_all(futures)
-                        .await
-                        .iter()
-                        .map(|r| r.unwrap_or(0))
-                        .collect();
-                    // println!("Futures complete");
-                    for (view_count, (_server, _title, _first_day, _last_day, view_id)) in
-                        results.into_iter().zip(views_todo_batch.iter())
-                    {
-                        let _ = db.update_view_count(*view_id, view_count).await;
-                    }
-                }
-                // println!("Updates complete");
+                self.process_views_todo(&views_todo, db).await;
             }
         }
 
@@ -244,15 +240,35 @@ impl GroupDate {
         Ok(())
     }
 
+    async fn process_views_todo(&mut self, views_todo: &[ViewsTodo], db: &DatabaseType) {
+        // println!("Preparing {} futures",views_todo.len());
+        for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
+            let futures: Vec<_> = views_todo_batch
+                .iter()
+                .map(|x| self.get_total_monthly_page_views(x))
+                .collect();
+            let results: Vec<u64> = join_all(futures)
+                .await
+                .iter()
+                .map(|r| r.unwrap_or(0))
+                .collect();
+            // println!("Futures complete");
+            for (view_count, vt) in results.into_iter().zip(views_todo_batch.iter()) {
+                let _ = db.update_view_count(vt.view_id, view_count).await;
+            }
+        }
+        // println!("Updates complete");
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn add_view_counts_process_row(
         &mut self,
         vc: ViewCount,
         db: &DatabaseType,
         found: &mut bool,
-        views_todo: &mut Vec<(String, String, String, String, usize)>,
-        first_day: &String,
-        last_day: &String,
+        views_todo: &mut Vec<ViewsTodo>,
+        first_day: &str,
+        last_day: &str,
     ) {
         let server = match vc.server {
             Some(server) => server,
@@ -279,12 +295,8 @@ impl GroupDate {
             .await
         {
             Some(title) => {
-                views_todo.push((
-                    server.to_string(),
-                    title.to_string(),
-                    first_day.to_string(),
-                    last_day.to_string(),
-                    vc.view_id,
+                views_todo.push(ViewsTodo::new(
+                    &server, &title, first_day, last_day, vc.view_id,
                 ));
             }
             None => {
@@ -338,7 +350,7 @@ impl GroupDate {
         println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
         self.finalize(&db).await?;
         println!("{}-{}: done!", self.group_id, self.ym);
-        db.finalize()?;
+        db.finalize().await?;
         Ok(())
     }
 
