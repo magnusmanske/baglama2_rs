@@ -1,11 +1,9 @@
-use crate::db_trait::DbTrait;
-use crate::global_image_links::GlobalImageLinks;
+use crate::db_trait::{DbTrait, FilePart};
 use crate::{Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rusqlite::params_from_iter;
 use rusqlite::Connection;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const SQLITE_DATA_TMP_PATH: &str = "/tmp";
@@ -67,59 +65,7 @@ impl DbSqlite {
         ))
     }
 
-    fn add_views_batch_for_files(
-        &self,
-        sql_values: Vec<String>,
-        parts: Vec<(usize, String, String)>,
-        group_status_id: usize,
-    ) -> Result<()> {
-        let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
-        let titles = parts.iter().map(|p| p.1.to_owned());
-        self.conn().execute(&sql, params_from_iter(titles))?;
-        let site_titles: Vec<String> = parts.iter().map(|part| part.1.to_owned()).collect();
-        let placeholders: Vec<String> = parts
-            .iter()
-            .map(|part| format!("(`site`={} AND `title`=?)", part.0))
-            .collect();
-        let sql = "SELECT id,site,title FROM `views` WHERE ".to_string()
-            + &placeholders.join(" OR ").to_string();
-        let viewid_site_id_title: Vec<(usize, usize, String)> = self
-            .conn()
-            .prepare(&sql)?
-            .query_map(params_from_iter(site_titles), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .filter_map(|x| x.ok())
-            .collect();
-        let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
-            .into_iter()
-            .map(|(view_id, site_id, title)| ((site_id, title.to_owned()), view_id))
-            .collect();
-        let mut values = vec![];
-        let mut images = vec![];
-        for (site_id, title, image) in &parts {
-            let view_id = match siteid_title_viewid.get(&(*site_id, title.to_owned())) {
-                Some(id) => id,
-                None => {
-                    println!("{site_id}/{title} not found, odd");
-                    continue;
-                }
-            };
-            values.push(format!("({group_status_id},{view_id},?)"));
-            images.push(image.to_owned());
-        }
-        if !values.is_empty() {
-            let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
-                .to_string()
-                + &values.join(",").to_string();
-            // println!("{sql}\n{images:?}\n");
-            self.conn().execute(&sql, params_from_iter(images))?;
-        }
-        Ok(())
-    }
-
     async fn seed_file_sites(&self) -> Result<()> {
-        // DO NOT IMPLEMENT THIS FOR MYSQL
         self.conn().execute("DELETE FROM `sites`", ())?;
         let sites = self.baglama.get_sites()?;
         for site in &sites {
@@ -141,7 +87,6 @@ impl DbSqlite {
     }
 
     async fn seed_file_groups(&self, group_id: &GroupId) -> Result<()> {
-        // DO NOT IMPLEMENT THIS FOR MYSQL
         self.conn().execute("DELETE FROM `groups`", ())?;
         let groups = self.baglama.get_group(group_id).await?;
         if let Some(group) = groups {
@@ -291,56 +236,12 @@ impl DbTrait for DbSqlite {
         Ok(files)
     }
 
-    async fn add_views_for_files(&self, all_files: &[String], gd: &GroupDate) -> Result<()> {
-        if all_files.is_empty() {
-            return Ok(());
-        }
+    fn baglama2(&self) -> &Arc<Baglama2> {
+        &self.baglama
+    }
 
-        let group_status_id = self.get_group_status_id().await?;
-
-        const CHUNK_SIZE: usize = 3000;
-        let mut chunk_num = 0;
-        for files in all_files.chunks(CHUNK_SIZE) {
-            chunk_num += 1;
-            println!("add_views_for_files_to_sqlite: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",all_files.len());
-            let globalimagelinks = GlobalImageLinks::load(files, &self.baglama).await?;
-            println!("add_views_for_files_to_sqlite: globalimagelinks done");
-            let mut sql_values = vec![];
-            let mut parts = vec![];
-            for gil in &globalimagelinks {
-                let site = match gd.get_site_for_wiki(&gil.wiki) {
-                    Some(site) => site,
-                    None => {
-                        //println!("Unknown wiki: {}",&gil.wiki);
-                        continue;
-                    }
-                };
-
-                let site_id = site.id();
-                let title = &gil.page_title;
-                let month = self.ym.month();
-                let year = self.ym.year();
-                let done = 0;
-                let namespace_id = gil.page_namespace_id;
-                let page_id = gil.page;
-                let views = 0;
-
-                let sql_value =
-                    format!("({site_id},?,{month},{year},{done},{namespace_id},{page_id},{views})");
-                sql_values.push(sql_value);
-                let part = (site_id, title.to_owned(), gil.to.to_owned());
-                parts.push(part);
-            }
-
-            if !parts.is_empty() {
-                self.add_views_batch_for_files(sql_values, parts, group_status_id)?;
-            }
-
-            println!("add_views_for_files_to_sqlite: batch done");
-        }
-        println!("add_views_for_files_to_sqlite: all batches done");
-
-        Ok(())
+    fn ym(&self) -> &YearMonth {
+        &self.ym
     }
 
     async fn reset_main_page_view_count(&self) -> Result<()> {
@@ -397,6 +298,47 @@ impl DbTrait for DbSqlite {
             "UPDATE `group_status` SET `status`='',`total_views`=null,`file`=null,`sqlite3`=null",
             (),
         )?;
+        Ok(())
+    }
+
+    async fn get_viewid_site_id_title(
+        &self,
+        parts: &[FilePart],
+    ) -> Result<Vec<(usize, usize, String)>> {
+        let site_titles: Vec<String> = parts
+            .iter()
+            .map(|part| part.page_title.to_owned())
+            .collect();
+        let placeholders: Vec<String> = parts
+            .iter()
+            .map(|part| format!("(`site`={} AND `title`=?)", part.site_id))
+            .collect();
+        let sql = "SELECT id,site,title FROM `views` WHERE ".to_string()
+            + &placeholders.join(" OR ").to_string();
+        let viewid_site_id_title: Vec<(usize, usize, String)> = self
+            .conn()
+            .prepare(&sql)?
+            .query_map(params_from_iter(site_titles), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(|x| x.ok())
+            .collect();
+        Ok(viewid_site_id_title)
+    }
+
+    async fn create_views_in_db(&self, parts: &[FilePart], sql_values: &[String]) -> Result<()> {
+        let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
+        let titles = parts.iter().map(|p| p.page_title.to_owned());
+        self.conn().execute(&sql, params_from_iter(titles))?;
+        Ok(())
+    }
+
+    async fn insert_group2view(&self, values: &[String], images: Vec<String>) -> Result<()> {
+        let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
+            .to_string()
+            + &values.join(",").to_string();
+        // println!("{sql}\n{images:?}\n");
+        self.conn().execute(&sql, params_from_iter(images))?;
         Ok(())
     }
 }

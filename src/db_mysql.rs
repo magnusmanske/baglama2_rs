@@ -1,4 +1,7 @@
-use crate::{db_trait::DbTrait, Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth};
+use crate::{
+    db_trait::{DbTrait, FilePart},
+    Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth,
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mysql_async::{from_row, prelude::*};
@@ -66,8 +69,17 @@ impl DbTrait for DbMySql {
         "" // Not needed for MySQL
     }
 
+    fn baglama2(&self) -> &Arc<Baglama2> {
+        &self.baglama
+    }
+
+    fn ym(&self) -> &YearMonth {
+        &self.ym
+    }
+
     fn finalize(&self) -> Result<()> {
-        todo!()
+        // Not needed for MySQL
+        Ok(())
     }
 
     fn load_sites(&self) -> Result<Vec<Site>> {
@@ -198,7 +210,61 @@ impl DbTrait for DbMySql {
     }
 
     async fn initialize(&self) -> Result<()> {
-        todo!()
+        let group_id = self.group_id.to_owned();
+        let year = self.ym.year();
+        let month = self.ym.month();
+        let sql = format!("REPLACE INTO `group_status` (`group_id`,`year`,`month`,`status`,`total_views`,`file`,`sqlite3`)
+        	VALUES ({group_id},{year},{month},'',null,null,null");
+        self.execute(&sql).await?;
+        Ok(())
+    }
+
+    async fn get_viewid_site_id_title(
+        &self,
+        parts: &[FilePart],
+    ) -> Result<Vec<(usize, usize, String)>> {
+        let site_titles: Vec<String> = parts
+            .iter()
+            .map(|part| part.page_title.to_owned())
+            .collect();
+        let placeholders: Vec<String> = parts
+            .iter()
+            .map(|part| format!("(`site`={} AND `title`=?)", part.site_id))
+            .collect();
+        let sql = "SELECT `id`,`site`,`title` FROM `views` WHERE ".to_string()
+            + &placeholders.join(" OR ").to_string();
+        let viewid_site_id_title = self
+            .baglama
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, site_titles)
+            .await?
+            .map_and_drop(from_row::<(usize, usize, String)>)
+            .await?;
+        Ok(viewid_site_id_title)
+    }
+
+    async fn create_views_in_db(&self, parts: &[FilePart], sql_values: &[String]) -> Result<()> {
+        let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
+        let titles: Vec<String> = parts.iter().map(|p| p.page_title.to_owned()).collect();
+        self.baglama
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, titles)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_group2view(&self, values: &[String], images: Vec<String>) -> Result<()> {
+        let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
+            .to_string()
+            + &values.join(",").to_string();
+        self.baglama
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, images)
+            .await?;
+        Ok(())
     }
 }
 
