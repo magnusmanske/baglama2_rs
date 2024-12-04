@@ -1,4 +1,4 @@
-use crate::db_trait::{DbTrait, FilePart};
+use crate::db_trait::{DbTrait, FilePart, ViewIdSiteIdTitle};
 use crate::{Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -301,10 +301,7 @@ impl DbTrait for DbSqlite {
         Ok(())
     }
 
-    async fn get_viewid_site_id_title(
-        &self,
-        parts: &[FilePart],
-    ) -> Result<Vec<(usize, usize, String)>> {
+    async fn get_viewid_site_id_title(&self, parts: &[FilePart]) -> Result<Vec<ViewIdSiteIdTitle>> {
         let site_titles: Vec<String> = parts
             .iter()
             .map(|part| part.page_title.to_owned())
@@ -315,13 +312,11 @@ impl DbTrait for DbSqlite {
             .collect();
         let sql = "SELECT id,site,title FROM `views` WHERE ".to_string()
             + &placeholders.join(" OR ").to_string();
-        let viewid_site_id_title: Vec<(usize, usize, String)> = self
+        let viewid_site_id_title: Vec<ViewIdSiteIdTitle> = self
             .conn()
             .prepare(&sql)?
-            .query_map(params_from_iter(site_titles), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .filter_map(|x| x.ok())
+            .query_map(params_from_iter(site_titles), ViewIdSiteIdTitle::from_row)?
+            .filter_map(|row| row.ok())
             .collect();
         Ok(viewid_site_id_title)
     }

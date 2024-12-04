@@ -3,21 +3,63 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use mysql_async::prelude::FromRow;
 use std::{collections::HashMap, sync::Arc};
 
+#[derive(Debug)]
 pub struct FilePart {
     pub site_id: usize,
     pub page_title: String,
+    pub page_id: usize,
     pub file: String,
 }
 
 impl FilePart {
-    pub fn new(site_id: usize, page_title: String, file: String) -> Self {
+    pub fn new(site_id: usize, page_title: String, page_id: usize, file: String) -> Self {
         Self {
             site_id,
             page_title,
+            page_id,
             file,
         }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ViewIdSiteIdTitle {
+    pub view_id: usize,
+    pub site_id: usize,
+    pub title: String,
+}
+
+impl ViewIdSiteIdTitle {
+    pub fn new(view_id: usize, site_id: usize, title: String) -> Self {
+        Self {
+            view_id,
+            site_id,
+            title,
+        }
+    }
+
+    pub fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+        Ok(Self {
+            view_id: row.get(0)?,
+            site_id: row.get(1)?,
+            title: row.get(2)?,
+        })
+    }
+}
+
+impl FromRow for ViewIdSiteIdTitle {
+    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+        ))
     }
 }
 
@@ -45,10 +87,7 @@ pub trait DbTrait {
     fn ym(&self) -> &YearMonth;
     async fn create_views_in_db(&self, parts: &[FilePart], sql_values: &[String]) -> Result<()>;
     async fn insert_group2view(&self, values: &[String], images: Vec<String>) -> Result<()>;
-    async fn get_viewid_site_id_title(
-        &self,
-        parts: &[FilePart],
-    ) -> Result<Vec<(usize, usize, String)>>;
+    async fn get_viewid_site_id_title(&self, parts: &[FilePart]) -> Result<Vec<ViewIdSiteIdTitle>>;
 
     async fn add_views_batch_for_files(
         &self,
@@ -64,7 +103,7 @@ pub trait DbTrait {
 
         let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
             .into_iter()
-            .map(|(view_id, site_id, title)| ((site_id, title.to_owned()), view_id))
+            .map(|x| ((x.site_id, x.title.to_owned()), x.view_id))
             .collect();
         let mut values = vec![];
         let mut images = vec![];
@@ -127,7 +166,7 @@ pub trait DbTrait {
                 let sql_value =
                     format!("({site_id},?,{month},{year},{done},{namespace_id},{page_id},{views})");
                 sql_values.push(sql_value);
-                let part = FilePart::new(site_id, title.to_owned(), gil.to.to_owned());
+                let part = FilePart::new(site_id, title.to_owned(), page_id, gil.to.to_owned());
                 parts.push(part);
             }
 

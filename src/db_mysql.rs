@@ -1,5 +1,5 @@
 use crate::{
-    db_trait::{DbTrait, FilePart},
+    db_trait::{DbTrait, FilePart, ViewIdSiteIdTitle},
     Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth,
 };
 use anyhow::{anyhow, Result};
@@ -40,6 +40,8 @@ impl DbMySql {
         }
     }
 
+    // tested
+    /// Sets the group_status to 'VIEW DATA COMPLETE' and updates the `total_views` field
     async fn update_group_status(&self, group_status_id: usize) -> Result<()> {
         let sql = format!(
                 "UPDATE group_status
@@ -198,6 +200,7 @@ impl DbTrait for DbMySql {
         Ok(())
     }
 
+    // tested
     async fn delete_all_files(&self) -> Result<()> {
         let group_status_id = self.get_group_status_id().await?;
         let sql = format!("DELETE FROM `files` WHERE `group_status_id`={group_status_id}");
@@ -214,6 +217,7 @@ impl DbTrait for DbMySql {
         Ok(())
     }
 
+    // tested
     async fn load_files_batch(&self, offset: usize, batch_size: usize) -> Result<Vec<String>> {
         let group_status_id = self.get_group_status_id().await?;
         let sql = format!("SELECT `name` FROM `files` WHERE `group_status_id`={group_status_id} LIMIT {batch_size} OFFSET {offset}");
@@ -248,11 +252,14 @@ impl DbTrait for DbMySql {
         Ok(())
     }
 
+    // tested
     async fn update_view_count(&self, view_id: usize, view_count: u64) -> Result<()> {
         let sql = format!("UPDATE `views` SET `done`=1,`views`={view_count} WHERE `id`={view_id}");
         self.execute(&sql).await
     }
 
+    // tested
+    /// Mark a view as done and set the view count to 0; usually for failures
     async fn view_done(&self, view_id: usize, done: u8) -> Result<()> {
         let sql = format!("UPDATE `views` SET `done`={done},`views`=0 WHERE `id`={view_id}");
         self.execute(&sql).await
@@ -262,6 +269,7 @@ impl DbTrait for DbMySql {
         5000 // Dunno?
     }
 
+    // tested
     async fn insert_files_batch(&self, batch: &[String]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -272,11 +280,13 @@ impl DbTrait for DbMySql {
             .map(|_| format!("({group_status_id},?)"))
             .collect::<Vec<String>>()
             .join(",");
-        let sql = format!("SELECT `id`,`site`,`title` FROM `views` WHERE {placeholders}");
+        let sql =
+            format!("INSERT IGNORE INTO `files` (`group_status_id`,`name`) VALUES {placeholders}");
         self.exec_vec(&sql, batch.to_vec()).await?;
         Ok(())
     }
 
+    // tested
     async fn initialize(&self) -> Result<()> {
         let group_id = self.group_id.to_owned();
         let year = self.ym.year();
@@ -288,17 +298,21 @@ impl DbTrait for DbMySql {
         Ok(())
     }
 
-    async fn get_viewid_site_id_title(
-        &self,
-        parts: &[FilePart],
-    ) -> Result<Vec<(usize, usize, String)>> {
-        let site_titles: Vec<String> = parts
-            .iter()
-            .map(|part| part.page_title.to_owned())
-            .collect();
+    // tested
+    async fn get_viewid_site_id_title(&self, parts: &[FilePart]) -> Result<Vec<ViewIdSiteIdTitle>> {
+        if parts.is_empty() {
+            return Ok(vec![]);
+        }
+        let year = self.ym.year();
+        let month = self.ym.month();
         let placeholders: Vec<String> = parts
             .iter()
-            .map(|part| format!("(`site`={} AND `title`=?)", part.site_id))
+            .map(|part| {
+                format!(
+                    "(`site`={} AND `page_id`={} AND `year`={year} AND `month`={month})",
+                    part.site_id, part.page_id
+                )
+            })
             .collect();
         let sql = "SELECT `id`,`site`,`title` FROM `views` WHERE ".to_string()
             + &placeholders.join(" OR ").to_string();
@@ -306,9 +320,9 @@ impl DbTrait for DbMySql {
             .baglama
             .get_tooldb_conn()
             .await?
-            .exec_iter(sql, site_titles)
+            .exec_iter(sql, ())
             .await?
-            .map_and_drop(from_row::<(usize, usize, String)>)
+            .map_and_drop(from_row::<ViewIdSiteIdTitle>)
             .await?;
         Ok(viewid_site_id_title)
     }
@@ -390,6 +404,7 @@ mod tests {
         let parts = vec![FilePart::new(
             1,
             "The_Page_Title".to_string(),
+            0,
             "The_File.jpg".to_string(),
         )];
         let sql_values = vec!["(12,?,3,2021,0,7,12345,67890)".to_string()];
@@ -425,6 +440,86 @@ mod tests {
         assert_eq!(
             *db.test_log.lock().await,
             ["DELETE FROM `files` WHERE `group_status_id`=29"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_view_count() {
+        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        db.update_view_count(12345, 67890).await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            ["UPDATE `views` SET `done`=1,`views`=67890 WHERE `id`=12345"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_view_done() {
+        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        db.view_done(12345, 1).await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            ["UPDATE `views` SET `done`=1,`views`=0 WHERE `id`=12345"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_group_status() {
+        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        db.update_group_status(12345).await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            ["UPDATE group_status SET status='VIEW DATA COMPLETE', total_views=(SELECT sum(views) FROM gs2site WHERE `group_status_id`=12345) WHERE id=12345"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_files_batch() {
+        let db = new_test_db(15, 2014, 2).await.unwrap();
+        db.group_status_id.get_or_init(|| async { 0 }).await;
+        assert_eq!(*db.group_status_id.get().unwrap(), 0);
+        db.delete_all_files().await.unwrap(); // Clear the slate
+        db.insert_files_batch(&["foo".to_string(), "bar".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(db.load_files_batch(0, 1).await.unwrap(), ["foo"]);
+        assert_eq!(db.load_files_batch(1, 1).await.unwrap(), ["bar"]);
+        db.delete_all_files().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_initialize() {
+        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        db.initialize().await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            [
+            	"REPLACE INTO `group_status` (`group_id`,`year`,`month`,`status`,`total_views`,`file`,`sqlite3`) VALUES (1,2014,2,'',null,null,null",
+             	"DELETE FROM `files` WHERE `group_status_id`=1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_viewid_site_id_title() {
+        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let parts = vec![
+            FilePart::new(158, "MeekMark".to_string(), 5153256, "Foo.jpg".to_string()),
+            FilePart::new(165, "typesetter".to_string(), 224872, "Bar.jpg".to_string()),
+        ];
+        let result = db.get_viewid_site_id_title(&parts).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0],
+            ViewIdSiteIdTitle::new(4, 158, "MeekMark".to_string())
+        );
+        assert_eq!(
+            result[1],
+            ViewIdSiteIdTitle::new(5, 165, "typesetter".to_string())
         );
     }
 }
