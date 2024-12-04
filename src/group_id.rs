@@ -14,7 +14,7 @@ impl TryFrom<usize> for GroupId {
 
     fn try_from(num: usize) -> Result<Self, Self::Error> {
         if num == 0 {
-            return Err(anyhow!("Group ID 0 is not valid"));
+            return Err(anyhow!("Group ID {num} is not valid"));
         }
         Ok(Self(num))
     }

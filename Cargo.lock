@@ -160,6 +160,7 @@ name = "baglama2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "chronoutil",
  "futures",

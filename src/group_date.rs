@@ -1,5 +1,6 @@
 use crate::baglama2::*;
 use crate::db_sqlite::DbSqlite as DatabaseType;
+use crate::db_trait::DbTrait;
 use lazy_static::lazy_static;
 // use crate::db_mysql::DbMySql as DatabaseType;
 use crate::GroupId;
@@ -57,8 +58,12 @@ impl GroupDate {
         Ok(())
     }
 
-    fn get_view_counts(&self, db: &DatabaseType, batch_size: usize) -> Result<Vec<ViewCount>> {
-        let ret = db.get_view_counts(batch_size)?;
+    async fn get_view_counts_todo(
+        &self,
+        db: &DatabaseType,
+        batch_size: usize,
+    ) -> Result<Vec<ViewCount>> {
+        let ret = db.get_view_counts_todo(batch_size).await?;
         Ok(ret)
     }
 
@@ -86,7 +91,7 @@ impl GroupDate {
             .await?
             .ok_or_else(|| anyhow!("Could not find group {} in MySQL database", self.group_id))?;
         println!("{group:?}");
-        db.delete_all_files()?;
+        db.delete_all_files().await?;
 
         // Get files in category tree from Commons
         println!(
@@ -111,7 +116,7 @@ impl GroupDate {
 
         let batch_size = db.file_insert_batch_size();
         for batch in files.chunks(batch_size) {
-            db.insert_files_batch(batch)?;
+            db.insert_files_batch(batch).await?;
         }
 
         Ok(())
@@ -124,7 +129,7 @@ impl GroupDate {
         let mut offset: usize = 0;
         const BATCH_SIZE: usize = 10000;
         loop {
-            let files = db.load_files_batch(offset, BATCH_SIZE)?;
+            let files = db.load_files_batch(offset, BATCH_SIZE).await?;
             let _ = db.add_views_for_files(&files, self).await;
             offset += files.len();
             if files.len() != BATCH_SIZE {
@@ -188,7 +193,7 @@ impl GroupDate {
         let last_day = self.ym.last_day()?;
 
         // Hide Main Page from view count
-        db.reset_main_page_view_count()?;
+        db.reset_main_page_view_count().await?;
 
         let batch_size = ADD_VIEW_COUNTS_BATCH_SIZE;
         let mut found = true;
@@ -196,7 +201,7 @@ impl GroupDate {
         while found {
             found = false;
             println!("add_view_counts: getting {batch_size} view counts");
-            let rows = self.get_view_counts(db, batch_size)?;
+            let rows = self.get_view_counts_todo(db, batch_size).await?;
             println!("add_view_counts: view counts retrieved");
             for vc in rows {
                 self.add_view_counts_process_row(
@@ -289,13 +294,13 @@ impl GroupDate {
     }
 
     async fn add_summary_statistics(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id()?;
+        let group_status_id = db.get_group_status_id().await?;
         db.add_summary_statistics(group_status_id).await
     }
 
     async fn finalize(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id()?;
-        let total_views = db.get_total_views(group_status_id)?;
+        let group_status_id = db.get_group_status_id().await?;
+        let total_views = db.get_total_views(group_status_id).await?;
         db.create_final_indices()?;
         let sqlite_filename = db.path_final();
         self.set_group_status("VIEW DATA COMPLETE", total_views, sqlite_filename)

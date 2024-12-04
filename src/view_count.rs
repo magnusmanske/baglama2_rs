@@ -1,3 +1,5 @@
+use mysql_async::prelude::*;
+
 #[derive(Debug, Clone)]
 pub struct ViewCount {
     pub view_id: usize,
@@ -19,6 +21,23 @@ impl ViewCount {
             server: row.get(4)?,
             done: row.get(5)?,
             site_id: row.get(6)?,
+        })
+    }
+}
+
+impl FromRow for ViewCount {
+    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            view_id: row.get(0).unwrap(),
+            title: row.get(1).unwrap(),
+            namespace_id: row.get(2).unwrap(),
+            grok_code: row.get(3).unwrap(),
+            server: row.get(4).unwrap(),
+            done: row.get(5).unwrap(),
+            site_id: row.get(6).unwrap(),
         })
     }
 }
