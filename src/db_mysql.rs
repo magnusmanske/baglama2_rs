@@ -33,6 +33,7 @@ impl DbMySql {
         })
     }
 
+    /// Used for internal testing only
     fn as_test(self) -> Self {
         Self {
             testing: true,
@@ -68,6 +69,7 @@ impl DbMySql {
         Ok(())
     }
 
+    /// Used for internal testing only
     fn test_log_sql(sql: &str) -> String {
         // Normalize spaces for testing
         sql.replace("\n", " ")
@@ -77,6 +79,8 @@ impl DbMySql {
             .join(" ")
     }
 
+    /// Runs a single SQL query with no parameters, and no return value
+    /// Does not run in testing mode
     async fn execute(&self, sql: &str) -> Result<()> {
         if self.testing {
             self.test_log
@@ -93,6 +97,8 @@ impl DbMySql {
         Ok(())
     }
 
+    /// Runs a single SQL query with a `Vec<String>` payload, and no return value
+    /// Does not run in testing mode
     async fn exec_vec(&self, sql: &str, payload: Vec<String>) -> Result<()> {
         if self.testing {
             self.test_log
@@ -232,20 +238,17 @@ impl DbTrait for DbMySql {
         Ok(ret)
     }
 
+    // tested
     async fn reset_main_page_view_count(&self) -> Result<()> {
         // TODO for all wikis?
         let group_status_id = self.get_group_status_id().await?;
-        let sql = "SELECT `view_id` FROM `group2view` WHERE `group_status_id`=? AND `view_id`=`views`.`id`";
+        let sql = format!("SELECT `view_id` FROM `group2view` WHERE `group_status_id`={group_status_id} AND `view_id`=`views`.`id`");
         let sql =
             format!("UPDATE views SET views=0 WHERE title='Main_Page' AND views.id IN ({sql})");
-        self.baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, (group_status_id,))
-            .await?;
-        Ok(())
+        self.execute(&sql).await
     }
 
+    // components are tested
     async fn add_summary_statistics(&self, group_status_id: usize) -> Result<()> {
         self.update_gs2site(group_status_id).await?;
         self.update_group_status(group_status_id).await?;
@@ -471,8 +474,19 @@ mod tests {
         db.update_group_status(12345).await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
+                *db.test_log.lock().await,
+                ["UPDATE group_status SET status='VIEW DATA COMPLETE', total_views=(SELECT sum(views) FROM gs2site WHERE `group_status_id`=12345) WHERE id=12345"]
+            );
+    }
+
+    #[tokio::test]
+    async fn test_reset_main_page_view_count() {
+        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        db.reset_main_page_view_count().await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
             *db.test_log.lock().await,
-            ["UPDATE group_status SET status='VIEW DATA COMPLETE', total_views=(SELECT sum(views) FROM gs2site WHERE `group_status_id`=12345) WHERE id=12345"]
+            ["UPDATE views SET views=0 WHERE title='Main_Page' AND views.id IN (SELECT `view_id` FROM `group2view` WHERE `group_status_id`=29 AND `view_id`=`views`.`id`)"]
         );
     }
 
