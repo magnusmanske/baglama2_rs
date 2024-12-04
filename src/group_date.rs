@@ -1,14 +1,14 @@
 use crate::baglama2::*;
-use crate::db_sqlite::DbSqlite as DatabaseType;
+// use crate::db_sqlite::DbSqlite as DatabaseType;
+use crate::db_mysql::DbMySql as DatabaseType;
 use crate::db_trait::DbTrait;
-use lazy_static::lazy_static;
-// use crate::db_mysql::DbMySql as DatabaseType;
 use crate::GroupId;
 use crate::Site;
 use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
+use lazy_static::lazy_static;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;

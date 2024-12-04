@@ -436,7 +436,9 @@ impl Baglama2 {
         let group_id = group_id.as_usize();
         let year = ym.year();
         let month = ym.month();
-        let sql = "REPLACE INTO `group_status` (group_id,year,month,status,total_views,sqlite3) VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)";
+        let sql = "INSERT INTO `group_status` (group_id,year,month,status,total_views,sqlite3)
+        	VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)
+         	ON DUPLICATE KEY UPDATE status=:status,total_views=:total_views,sqlite3=:sqlite_filename";
         let _ = mysql_connection
             .exec_drop(
                 sql,

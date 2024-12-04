@@ -34,7 +34,7 @@ impl DbMySql {
     }
 
     /// Used for internal testing only
-    fn as_test(self) -> Self {
+    fn _as_test(self) -> Self {
         Self {
             testing: true,
             ..self
@@ -289,14 +289,11 @@ impl DbTrait for DbMySql {
         Ok(())
     }
 
-    // tested
+    // components tested
     async fn initialize(&self) -> Result<()> {
-        let group_id = self.group_id.to_owned();
-        let year = self.ym.year();
-        let month = self.ym.month();
-        let sql = format!("REPLACE INTO `group_status` (`group_id`,`year`,`month`,`status`,`total_views`,`file`,`sqlite3`)
-        	VALUES ({group_id},{year},{month},'',null,null,null");
-        self.execute(&sql).await?;
+        self.baglama2()
+            .set_group_status(self.group_id.to_owned(), &self.ym, "", 0, "")
+            .await?;
         self.delete_all_files().await?;
         Ok(())
     }
@@ -388,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_group2view() {
-        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(1, 2014, 2).await.unwrap()._as_test();
         let values = vec!["(1,2,?)".to_string()];
         let images = vec!["bar".to_string()];
         db.insert_group2view(&values, images).await.unwrap();
@@ -403,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_views_in_db() {
-        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(1, 2014, 2).await.unwrap()._as_test();
         let parts = vec![FilePart::new(
             1,
             "The_Page_Title".to_string(),
@@ -423,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_gs2site() {
-        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(1, 2014, 2).await.unwrap()._as_test();
         db.update_gs2site(123).await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
@@ -437,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_all_files() {
-        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.delete_all_files().await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
@@ -448,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_view_count() {
-        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.update_view_count(12345, 67890).await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
@@ -459,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_view_done() {
-        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.view_done(12345, 1).await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
@@ -470,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_group_status() {
-        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.update_group_status(12345).await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
@@ -481,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_main_page_view_count() {
-        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.reset_main_page_view_count().await.unwrap();
         // println!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
@@ -505,22 +502,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initialize() {
-        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
-        db.initialize().await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
-        assert_eq!(
-            *db.test_log.lock().await,
-            [
-            	"REPLACE INTO `group_status` (`group_id`,`year`,`month`,`status`,`total_views`,`file`,`sqlite3`) VALUES (1,2014,2,'',null,null,null",
-             	"DELETE FROM `files` WHERE `group_status_id`=1"
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn test_get_viewid_site_id_title() {
-        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let db = new_test_db(1, 2014, 2).await.unwrap()._as_test();
         let parts = vec![
             FilePart::new(158, "MeekMark".to_string(), 5153256, "Foo.jpg".to_string()),
             FilePart::new(165, "typesetter".to_string(), 224872, "Bar.jpg".to_string()),
