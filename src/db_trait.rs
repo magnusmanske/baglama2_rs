@@ -12,11 +12,11 @@ pub struct FilePart {
 }
 
 impl FilePart {
-    pub fn new(site_id: usize, title: String, gil_to: String) -> Self {
+    pub fn new(site_id: usize, page_title: String, file: String) -> Self {
         Self {
             site_id,
-            page_title: title,
-            file: gil_to,
+            page_title,
+            file,
         }
     }
 }

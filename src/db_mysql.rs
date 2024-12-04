@@ -5,8 +5,9 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mysql_async::{from_row, prelude::*};
+use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 // WORK IN PROGRESS, DO NOT USE YET
 
@@ -15,7 +16,9 @@ pub struct DbMySql {
     baglama: Arc<Baglama2>,
     ym: YearMonth,
     group_id: GroupId,
-    files: Arc<Mutex<Vec<String>>>,
+    group_status_id: OnceCell<usize>,
+    testing: bool,
+    test_log: Arc<Mutex<Vec<Value>>>,
 }
 
 impl DbMySql {
@@ -24,8 +27,17 @@ impl DbMySql {
             baglama,
             ym: gd.ym().to_owned(),
             group_id: gd.group_id(),
-            files: Arc::new(Mutex::new(Vec::new())),
+            group_status_id: OnceCell::new(),
+            testing: false,
+            test_log: Arc::new(Mutex::new(vec![])),
         })
+    }
+
+    fn as_test(self) -> Self {
+        Self {
+            testing: true,
+            ..self
+        }
     }
 
     async fn update_group_status(&self, group_status_id: usize) -> Result<()> {
@@ -39,6 +51,7 @@ impl DbMySql {
         Ok(())
     }
 
+    // tested
     async fn update_gs2site(&self, group_status_id: usize) -> Result<()> {
         let sql = format!("DELETE FROM `gs2site` WHERE `group_status_id`={group_status_id}");
         self.execute(&sql).await?;
@@ -53,21 +66,44 @@ impl DbMySql {
         Ok(())
     }
 
+    fn test_log_sql(sql: &str) -> String {
+        // Normalize spaces for testing
+        sql.replace("\n", " ")
+            .replace("\t", " ")
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ")
+    }
+
     async fn execute(&self, sql: &str) -> Result<()> {
-        self.baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, ())
-            .await?;
+        if self.testing {
+            self.test_log
+                .lock()
+                .await
+                .push(json!(Self::test_log_sql(sql)));
+        } else {
+            self.baglama
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(sql, ())
+                .await?;
+        }
         Ok(())
     }
 
     async fn exec_vec(&self, sql: &str, payload: Vec<String>) -> Result<()> {
-        self.baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, payload)
-            .await?;
+        if self.testing {
+            self.test_log
+                .lock()
+                .await
+                .push(json!({"sql": Self::test_log_sql(sql),"payload": payload}));
+        } else {
+            self.baglama
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(sql, payload)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -95,6 +131,7 @@ impl DbTrait for DbMySql {
         self.baglama.get_sites()
     }
 
+    // tested
     async fn get_view_counts_todo(&self, batch_size: usize) -> Result<Vec<ViewCount>> {
         let group_status_id = self.get_group_status_id().await?;
         let sql = format!("SELECT DISTINCT `views`.`id` AS id,title,namespace_id,grok_code,server,done,`views`.`site` AS site_id
@@ -112,12 +149,16 @@ impl DbTrait for DbMySql {
         Ok(ret)
     }
 
+    // tested
     async fn get_group_status_id(&self) -> Result<usize> {
+        if let Some(ret) = self.group_status_id.get() {
+            return Ok(*ret);
+        }
         let group_id = self.group_id.to_owned();
         let year = self.ym.year();
         let month = self.ym.month();
         let sql = "SELECT `id` FROM `group_status` WHERE `group_id`=? AND `year`=? AND `month`=?";
-        let ret = self
+        let group_status_id = self
             .baglama
             .get_tooldb_conn()
             .await?
@@ -128,9 +169,14 @@ impl DbTrait for DbMySql {
             .first()
             .ok_or_else(|| anyhow!("No group_status.id for group {group_id} in {year}-{month}"))?
             .to_owned();
-        Ok(ret)
+        let ret = self
+            .group_status_id
+            .get_or_init(|| async { group_status_id })
+            .await;
+        Ok(*ret)
     }
 
+    // tested
     async fn get_total_views(&self, group_status_id: usize) -> Result<usize> {
         let sql = "SELECT ifnull(total_views,0) FROM group_status WHERE id=?";
         let ret = self
@@ -153,8 +199,9 @@ impl DbTrait for DbMySql {
     }
 
     async fn delete_all_files(&self) -> Result<()> {
-        self.files.lock().await.clear();
-        Ok(())
+        let group_status_id = self.get_group_status_id().await?;
+        let sql = format!("DELETE FROM `files` WHERE `group_status_id`={group_status_id}");
+        self.execute(&sql).await
     }
 
     fn delete_views(&self) -> Result<()> {
@@ -168,9 +215,16 @@ impl DbTrait for DbMySql {
     }
 
     async fn load_files_batch(&self, offset: usize, batch_size: usize) -> Result<Vec<String>> {
-        let files = self.files.lock().await;
-        let end = (offset + batch_size).min(files.len());
-        let ret = files[offset..end].to_vec();
+        let group_status_id = self.get_group_status_id().await?;
+        let sql = format!("SELECT `name` FROM `files` WHERE `group_status_id`={group_status_id} LIMIT {batch_size} OFFSET {offset}");
+        let ret = self
+            .baglama
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, ())
+            .await?
+            .map_and_drop(from_row::<String>)
+            .await?;
         Ok(ret)
     }
 
@@ -209,7 +263,17 @@ impl DbTrait for DbMySql {
     }
 
     async fn insert_files_batch(&self, batch: &[String]) -> Result<()> {
-        self.files.lock().await.extend_from_slice(batch);
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let group_status_id = self.get_group_status_id().await?;
+        let placeholders = batch
+            .iter()
+            .map(|_| format!("({group_status_id},?)"))
+            .collect::<Vec<String>>()
+            .join(",");
+        let sql = format!("SELECT `id`,`site`,`title` FROM `views` WHERE {placeholders}");
+        self.exec_vec(&sql, batch.to_vec()).await?;
         Ok(())
     }
 
@@ -220,6 +284,7 @@ impl DbTrait for DbMySql {
         let sql = format!("REPLACE INTO `group_status` (`group_id`,`year`,`month`,`status`,`total_views`,`file`,`sqlite3`)
         	VALUES ({group_id},{year},{month},'',null,null,null");
         self.execute(&sql).await?;
+        self.delete_all_files().await?;
         Ok(())
     }
 
@@ -248,6 +313,7 @@ impl DbTrait for DbMySql {
         Ok(viewid_site_id_title)
     }
 
+    // tested
     async fn create_views_in_db(&self, parts: &[FilePart], sql_values: &[String]) -> Result<()> {
         let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
         let titles: Vec<String> = parts.iter().map(|p| p.page_title.to_owned()).collect();
@@ -255,6 +321,7 @@ impl DbTrait for DbMySql {
         Ok(())
     }
 
+    // tested
     async fn insert_group2view(&self, values: &[String], images: Vec<String>) -> Result<()> {
         let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
             .to_string()
@@ -268,22 +335,25 @@ impl DbTrait for DbMySql {
 mod tests {
     use super::*;
 
+    /// Creates a new test DB
+    async fn new_test_db(group_id: usize, year: i32, month: u32) -> Result<DbMySql> {
+        let baglama = Arc::new(Baglama2::new().await.unwrap());
+        let group_id = GroupId::try_from(group_id).unwrap();
+        let ym = YearMonth::new(year, month).unwrap();
+        let db = DbMySql::new(&GroupDate::new(group_id, ym, baglama.clone()), baglama).unwrap();
+        Ok(db)
+    }
+
     #[tokio::test]
     async fn test_get_group_status_id() {
-        let baglama = Arc::new(Baglama2::new().await.unwrap());
-        let group_id = GroupId::try_from(1).unwrap();
-        let ym = YearMonth::new(2014, 2).unwrap();
-        let db = DbMySql::new(&GroupDate::new(group_id, ym, baglama.clone()), baglama).unwrap();
+        let db = new_test_db(1, 2014, 2).await.unwrap();
         let ret = db.get_group_status_id().await.unwrap();
         assert_eq!(ret, 1);
     }
 
     #[tokio::test]
     async fn test_get_view_counts_todo() {
-        let baglama = Arc::new(Baglama2::new().await.unwrap());
-        let group_id = GroupId::try_from(1).unwrap();
-        let ym = YearMonth::new(2014, 2).unwrap();
-        let db = DbMySql::new(&GroupDate::new(group_id, ym, baglama.clone()), baglama).unwrap();
+        let db = new_test_db(1, 2014, 2).await.unwrap();
         let ret = db.get_view_counts_todo(10).await.unwrap();
         // This might depend on the MySQL sort order
         assert_eq!(ret[0].site_id, 69);
@@ -292,13 +362,69 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_total_views() {
-        let baglama = Arc::new(Baglama2::new().await.unwrap());
-        let group_id = GroupId::try_from(1).unwrap();
-        let ym = YearMonth::new(2014, 2).unwrap();
-        let db = DbMySql::new(&GroupDate::new(group_id, ym, baglama.clone()), baglama).unwrap();
+        let db = new_test_db(1, 2014, 2).await.unwrap();
         let group_status_id = db.get_group_status_id().await.unwrap();
         assert_eq!(group_status_id, 1);
         let ret = db.get_total_views(group_status_id).await.unwrap();
         assert_eq!(ret, 722790216);
+    }
+
+    #[tokio::test]
+    async fn test_insert_group2view() {
+        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let values = vec!["(1,2,?)".to_string()];
+        let images = vec!["bar".to_string()];
+        db.insert_group2view(&values, images).await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            [
+                json!({"payload": ["bar"], "sql": "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES (1,2,?)"})
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_views_in_db() {
+        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        let parts = vec![FilePart::new(
+            1,
+            "The_Page_Title".to_string(),
+            "The_File.jpg".to_string(),
+        )];
+        let sql_values = vec!["(12,?,3,2021,0,7,12345,67890)".to_string()];
+        db.create_views_in_db(&parts, &sql_values).await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            [
+                json!({"payload":["The_Page_Title"],"sql":"INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES (12,?,3,2021,0,7,12345,67890)"})
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_gs2site() {
+        let db = new_test_db(1, 2014, 2).await.unwrap().as_test();
+        db.update_gs2site(123).await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+                *db.test_log.lock().await,
+                [
+                "DELETE FROM `gs2site` WHERE `group_status_id`=123",
+                "INSERT INTO `gs2site` (group_status_id,site_id,pages,views) SELECT 123,sites.id,COUNT(DISTINCT page_id),SUM(views) FROM `views`,`sites`,`group2view` WHERE views.site=sites.id AND view_id=views.id AND group_status_id=123 GROUP BY sites.id"
+                ]
+            );
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_files() {
+        let db = new_test_db(15, 2014, 2).await.unwrap().as_test();
+        db.delete_all_files().await.unwrap();
+        // println!("{}", json!(*db.test_log.lock().await));
+        assert_eq!(
+            *db.test_log.lock().await,
+            ["DELETE FROM `files` WHERE `group_status_id`=29"]
+        );
     }
 }
