@@ -272,7 +272,11 @@ impl Baglama2 {
         placeholders.join(",")
     }
 
-    async fn query_commons_repeat(&self, sql: &str, todo: &[String]) -> Result<Vec<String>> {
+    async fn query_commons_repeat(
+        &self,
+        sql: &str,
+        remaining_queries: &[String],
+    ) -> Result<Vec<String>> {
         let mut attempts_left = 5;
         let mut ret = vec![];
         loop {
@@ -290,7 +294,7 @@ impl Baglama2 {
                     }
                 }
             };
-            let result = match conn.exec_iter(sql, todo.to_owned()).await {
+            let result = match conn.exec_iter(sql, remaining_queries.to_owned()).await {
                 Ok(res) => res,
                 Err(e) => {
                     if attempts_left == 0 {
@@ -325,18 +329,18 @@ impl Baglama2 {
             if depth == 0 {
                 break;
             }
-            let todo: Vec<String> = check
+            let remaining: Vec<String> = check
                 .iter()
                 .filter(|category| !subcats.contains(category))
                 .map(|category| category.to_owned())
                 .collect();
-            if todo.is_empty() {
+            if remaining.is_empty() {
                 break;
             }
-            subcats.extend_from_slice(&todo);
-            let placeholders = Baglama2::sql_placeholders(todo.len());
+            subcats.extend_from_slice(&remaining);
+            let placeholders = Baglama2::sql_placeholders(remaining.len());
             let sql = format!("SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title)) FROM page,categorylinks WHERE page_id=cl_from AND cl_to IN ({}) AND cl_type='subcat'",placeholders);
-            check = self.query_commons_repeat(&sql, &todo).await?;
+            check = self.query_commons_repeat(&sql, &remaining).await?;
             if check.is_empty() {
                 break;
             }
