@@ -3,6 +3,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use log::debug;
 use mysql_async::prelude::FromRow;
 use std::{collections::HashMap, sync::Arc};
 
@@ -96,15 +97,20 @@ pub trait DbTrait {
         group_status_id: usize,
     ) -> Result<()> {
         if sql_values.is_empty() {
+            debug!("add_views_batch_for_files: NO sql_values!!!");
             return Ok(());
         }
+        debug!("add_views_batch_for_files: {} parts", parts.len());
         self.create_views_in_db(&parts, &sql_values).await?;
+        debug!("B");
         let viewid_site_id_title = self.get_viewid_site_id_title(&parts).await?;
+        debug!("C: {viewid_site_id_title:?}");
 
         let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
             .into_iter()
             .map(|x| ((x.site_id, x.title.to_owned()), x.view_id))
             .collect();
+        debug!("D: {siteid_title_viewid:?}");
         let mut values = vec![];
         let mut images = vec![];
         for part in &parts {
@@ -112,16 +118,15 @@ pub trait DbTrait {
             {
                 Some(id) => id,
                 None => {
-                    println!("{}/{} not found, odd", part.site_id, part.page_title);
+                    debug!("{}/{} not found, odd", part.site_id, part.page_title);
                     continue;
                 }
             };
             values.push(format!("({group_status_id},{view_id},?)"));
             images.push(part.file.to_owned());
         }
-        if !values.is_empty() {
-            self.insert_group2view(&values, images).await?;
-        }
+        debug!("add_views_batch_for_files: {} values", values.len());
+        self.insert_group2view(&values, images).await?;
         Ok(())
     }
 
@@ -136,19 +141,22 @@ pub trait DbTrait {
         let mut chunk_num = 0;
         for files in all_files.chunks(CHUNK_SIZE) {
             chunk_num += 1;
-            println!(
+            debug!(
                 "add_views_for_files: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",
-                all_files.len()
+                all_files.len(),
             );
             let globalimagelinks = GlobalImageLinks::load(files, self.baglama2()).await?;
-            println!("add_views_for_files: globalimagelinks done");
+            debug!(
+                "add_views_for_files: globalimagelinks done, {} found",
+                globalimagelinks.len(),
+            );
             let mut sql_values = vec![];
             let mut parts = vec![];
             for gil in &globalimagelinks {
                 let site = match gd.get_site_for_wiki(&gil.wiki) {
                     Some(site) => site,
                     None => {
-                        //println!("Unknown wiki: {}",&gil.wiki);
+                        //debug!("Unknown wiki: {}",&gil.wiki);
                         continue;
                     }
                 };
@@ -162,22 +170,24 @@ pub trait DbTrait {
                 let page_id = gil.page;
                 let views = 0;
 
-                // site,title,month,year,done,namespace_id,page_id,views
                 let sql_value =
                     format!("({site_id},?,{month},{year},{done},{namespace_id},{page_id},{views})");
                 sql_values.push(sql_value);
                 let part = FilePart::new(site_id, title.to_owned(), page_id, gil.to.to_owned());
                 parts.push(part);
             }
+            debug!(
+                "add_views_for_files: {} values, {} parts",
+                sql_values.len(),
+                parts.len(),
+            );
 
-            if !parts.is_empty() {
-                self.add_views_batch_for_files(sql_values, parts, group_status_id)
-                    .await?;
-            }
+            self.add_views_batch_for_files(sql_values, parts, group_status_id)
+                .await?;
 
-            println!("add_views_for_files: batch done");
+            debug!("add_views_for_files: batch done");
         }
-        println!("add_views_for_files: all batches done");
+        debug!("add_views_for_files: all batches done");
 
         Ok(())
     }

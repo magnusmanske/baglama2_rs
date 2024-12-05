@@ -2,6 +2,7 @@ use crate::db_trait::{DbTrait, FilePart, ViewIdSiteIdTitle};
 use crate::{Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use log::debug;
 use rusqlite::params_from_iter;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
@@ -25,7 +26,7 @@ impl DbSqlite {
         if std::path::Path::new(&path_final).exists() && !std::path::Path::new(&path_tmp).exists() {
             path_tmp = path_final.clone();
         }
-        println!(
+        debug!(
             "{}: {} [ {path_tmp} => {path_final} ]",
             &gd.ym(),
             gd.group_id()
@@ -128,7 +129,7 @@ impl DbSqlite {
             let sql = "INSERT INTO `group_status` (group_id,year,month) VALUES (?,?,?)";
             self.conn().execute(
                 sql,
-                rusqlite::params![group_id.as_usize(), ym.year(), ym.month()],
+                rusqlite::params![group_id.get(), ym.year(), ym.month()],
             )?;
         }
         Ok(())
@@ -180,7 +181,7 @@ impl DbTrait for DbSqlite {
         let group_status_id: usize = self
             .conn()
             .prepare(sql)?
-            .query_map((group_id.as_usize(), year, month), |row| row.get(0))?
+            .query_map((group_id.get(), year, month), |row| row.get(0))?
             .next()
             .ok_or(anyhow!("No group_status for group {group_id}"))??;
         Ok(group_status_id)
@@ -332,7 +333,7 @@ impl DbTrait for DbSqlite {
         let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
             .to_string()
             + &values.join(",").to_string();
-        // println!("{sql}\n{images:?}\n");
+        // debug!("{sql}\n{images:?}\n");
         self.conn().execute(&sql, params_from_iter(images))?;
         Ok(())
     }

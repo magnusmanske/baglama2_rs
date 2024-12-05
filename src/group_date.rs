@@ -9,6 +9,8 @@ use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use lazy_static::lazy_static;
+use log::debug;
+use log::warn;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,11 +114,11 @@ impl GroupDate {
             .get_group(&self.group_id)
             .await?
             .ok_or_else(|| anyhow!("Could not find group {} in MySQL database", self.group_id))?;
-        println!("{group:?}");
+        debug!("{group:?}");
         db.delete_all_files().await?;
 
         // Get files in category tree from Commons
-        println!(
+        debug!(
             "Getting files from {}, depth {}",
             group.category(),
             group.depth()
@@ -128,7 +130,7 @@ impl GroupDate {
                 .await?
         };
         if files.len() < 5 {
-            eprintln!(
+            warn!(
                 "{} / {} has {} files",
                 group.category(),
                 group.depth(),
@@ -202,23 +204,24 @@ impl GroupDate {
     }
 
     pub async fn add_view_counts(&mut self, db: &DatabaseType) -> Result<()> {
-        println!("add_view_counts: loading sites");
+        debug!("add_view_counts: loading sites");
         self.load_sites(db).await?;
-        println!("add_view_counts: sites loaded");
+        debug!("add_view_counts: sites loaded");
         let first_day = self.ym.first_day()?;
         let last_day = self.ym.last_day()?;
 
         // Hide Main Page from view count
         db.reset_main_page_view_count().await?;
+        debug!("main page view count reset");
 
         let batch_size = ADD_VIEW_COUNTS_BATCH_SIZE;
         let mut found = true;
         let mut views_todo = vec![];
         while found {
             found = false;
-            println!("add_view_counts: getting {batch_size} view counts");
+            debug!("add_view_counts: getting {batch_size} view counts");
             let rows = self.get_view_counts_todo(db, batch_size).await?;
-            println!("add_view_counts: view counts retrieved");
+            debug!("add_view_counts: view counts retrieved");
             for vc in rows {
                 self.add_view_counts_process_row(
                     vc,
@@ -235,14 +238,15 @@ impl GroupDate {
             }
         }
 
-        println!("add_view_counts: adding summary statistics");
+        debug!("add_view_counts: adding summary statistics");
         self.add_summary_statistics(db).await?;
         Ok(())
     }
 
     async fn process_views_todo(&mut self, views_todo: &[ViewsTodo], db: &DatabaseType) {
-        // println!("Preparing {} futures",views_todo.len());
+        debug!("Preparing {} futures", views_todo.len());
         for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
+            debug!("Processing {views_todo_batch:?}");
             let futures: Vec<_> = views_todo_batch
                 .iter()
                 .map(|x| self.get_total_monthly_page_views(x))
@@ -252,12 +256,12 @@ impl GroupDate {
                 .iter()
                 .map(|r| r.unwrap_or(0))
                 .collect();
-            // println!("Futures complete");
+            debug!("Futures complete");
             for (view_count, vt) in results.into_iter().zip(views_todo_batch.iter()) {
                 let _ = db.update_view_count(vt.view_id, view_count).await;
             }
         }
-        // println!("Updates complete");
+        debug!("View updates complete");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -339,17 +343,17 @@ impl GroupDate {
 
     pub async fn create_sqlite(&mut self) -> Result<()> {
         let db = DatabaseType::new(self, self.baglama.clone())?;
-        println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
+        debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
         db.initialize().await?;
-        println!("{}-{}: add_files", self.group_id, self.ym);
+        debug!("{}-{}: add_files", self.group_id, self.ym);
         self.add_files(&db).await?;
-        println!("{}-{}: add_pages", self.group_id, self.ym);
+        debug!("{}-{}: add_pages", self.group_id, self.ym);
         self.add_pages(&db).await?;
-        println!("{}-{}: add_view_counts", self.group_id, self.ym);
+        debug!("{}-{}: add_view_counts", self.group_id, self.ym);
         self.add_view_counts(&db).await?;
-        println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
+        debug!("{}-{}: finalize_sqlite", self.group_id, self.ym);
         self.finalize(&db).await?;
-        println!("{}-{}: done!", self.group_id, self.ym);
+        debug!("{}-{}: done!", self.group_id, self.ym);
         db.finalize().await?;
         Ok(())
     }

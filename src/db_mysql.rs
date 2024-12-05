@@ -170,7 +170,7 @@ impl DbTrait for DbMySql {
             .baglama
             .get_tooldb_conn()
             .await?
-            .exec_iter(sql, (group_id.as_usize(), year, month))
+            .exec_iter(sql, (group_id.get(), year, month))
             .await?
             .map_and_drop(from_row::<usize>)
             .await?
@@ -241,10 +241,12 @@ impl DbTrait for DbMySql {
     // tested
     async fn reset_main_page_view_count(&self) -> Result<()> {
         // TODO for all wikis?
+        let main_page_id = 47751469;
+        let enwiki = 158;
         let group_status_id = self.get_group_status_id().await?;
         let sql = format!("SELECT `view_id` FROM `group2view` WHERE `group_status_id`={group_status_id} AND `view_id`=`views`.`id`");
         let sql =
-            format!("UPDATE views SET views=0 WHERE title='Main_Page' AND views.id IN ({sql})");
+            format!("UPDATE views SET views=0 WHERE page_id={main_page_id} AND site={enwiki} AND views.id IN ({sql})");
         self.execute(&sql).await
     }
 
@@ -329,7 +331,7 @@ impl DbTrait for DbMySql {
 
     // tested
     async fn create_views_in_db(&self, parts: &[FilePart], sql_values: &[String]) -> Result<()> {
-        let sql = "INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
+        let sql = "INSERT IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES ".to_string() + &sql_values.join(",");
         let titles: Vec<String> = parts.iter().map(|p| p.page_title.to_owned()).collect();
         self.exec_vec(&sql, titles).await?;
         Ok(())
@@ -337,10 +339,12 @@ impl DbTrait for DbMySql {
 
     // tested
     async fn insert_group2view(&self, values: &[String], images: Vec<String>) -> Result<()> {
-        let sql = "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
-            .to_string()
-            + &values.join(",").to_string();
-        self.exec_vec(&sql, images).await?;
+        if !values.is_empty() {
+            let sql = "INSERT IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
+                .to_string()
+                + &values.join(",").to_string();
+            self.exec_vec(&sql, images).await?;
+        }
         Ok(())
     }
 }
@@ -389,11 +393,11 @@ mod tests {
         let values = vec!["(1,2,?)".to_string()];
         let images = vec!["bar".to_string()];
         db.insert_group2view(&values, images).await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
             *db.test_log.lock().await,
             [
-                json!({"payload": ["bar"], "sql": "INSERT OR IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES (1,2,?)"})
+                json!({"payload": ["bar"], "sql": "INSERT IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES (1,2,?)"})
             ]
         );
     }
@@ -409,11 +413,11 @@ mod tests {
         )];
         let sql_values = vec!["(12,?,3,2021,0,7,12345,67890)".to_string()];
         db.create_views_in_db(&parts, &sql_values).await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
             *db.test_log.lock().await,
             [
-                json!({"payload":["The_Page_Title"],"sql":"INSERT OR IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES (12,?,3,2021,0,7,12345,67890)"})
+                json!({"payload":["The_Page_Title"],"sql":"INSERT IGNORE INTO `views` (site,title,month,year,done,namespace_id,page_id,views) VALUES (12,?,3,2021,0,7,12345,67890)"})
             ]
         );
     }
@@ -422,7 +426,7 @@ mod tests {
     async fn test_update_gs2site() {
         let db = new_test_db(1, 2014, 2).await.unwrap()._as_test();
         db.update_gs2site(123).await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
                 *db.test_log.lock().await,
                 [
@@ -436,7 +440,7 @@ mod tests {
     async fn test_delete_all_files() {
         let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.delete_all_files().await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
             *db.test_log.lock().await,
             ["DELETE FROM `files` WHERE `group_status_id`=29"]
@@ -447,7 +451,7 @@ mod tests {
     async fn test_update_view_count() {
         let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.update_view_count(12345, 67890).await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
             *db.test_log.lock().await,
             ["UPDATE `views` SET `done`=1,`views`=67890 WHERE `id`=12345"]
@@ -458,7 +462,7 @@ mod tests {
     async fn test_view_done() {
         let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.view_done(12345, 1).await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
             *db.test_log.lock().await,
             ["UPDATE `views` SET `done`=1,`views`=0 WHERE `id`=12345"]
@@ -469,7 +473,7 @@ mod tests {
     async fn test_update_group_status() {
         let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.update_group_status(12345).await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
                 *db.test_log.lock().await,
                 ["UPDATE group_status SET status='VIEW DATA COMPLETE', total_views=(SELECT sum(views) FROM gs2site WHERE `group_status_id`=12345) WHERE id=12345"]
@@ -480,10 +484,10 @@ mod tests {
     async fn test_reset_main_page_view_count() {
         let db = new_test_db(15, 2014, 2).await.unwrap()._as_test();
         db.reset_main_page_view_count().await.unwrap();
-        // println!("{}", json!(*db.test_log.lock().await));
+        // debug!("{}", json!(*db.test_log.lock().await));
         assert_eq!(
             *db.test_log.lock().await,
-            ["UPDATE views SET views=0 WHERE title='Main_Page' AND views.id IN (SELECT `view_id` FROM `group2view` WHERE `group_status_id`=29 AND `view_id`=`views`.`id`)"]
+            ["UPDATE views SET views=0 WHERE page_id=47751469 AND site=158 AND views.id IN (SELECT `view_id` FROM `group2view` WHERE `group_status_id`=29 AND `view_id`=`views`.`id`)"]
         );
     }
 
