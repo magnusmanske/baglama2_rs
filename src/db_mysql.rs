@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use mysql_async::{from_row, prelude::*};
+use mysql_async::{from_row, from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
@@ -333,8 +333,12 @@ impl DbTrait for DbMySql {
             .await?
             .exec_iter(sql, ())
             .await?
-            .map_and_drop(from_row::<ViewIdSiteIdTitle>)
-            .await?;
+            .map_and_drop(from_row_opt::<ViewIdSiteIdTitle>)
+            .await?
+            .into_iter()
+            .filter_map(|x| x.ok())
+            // .map(|(view_id, site_id, title)| ViewIdSiteIdTitle::new(view_id, site_id, title))
+            .collect();
         Ok(viewid_site_id_title)
     }
 
