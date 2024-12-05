@@ -1,4 +1,5 @@
 use crate::baglama2::*;
+use futures::prelude::*;
 // use crate::db_sqlite::DbSqlite as DatabaseType;
 use crate::db_mysql::DbMySql as DatabaseType;
 use crate::db_trait::DbTrait;
@@ -9,7 +10,6 @@ use crate::Site;
 use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
-use futures::future::join_all;
 use lazy_static::lazy_static;
 use log::debug;
 use log::warn;
@@ -309,22 +309,35 @@ impl GroupDate {
 
     async fn process_views_todo(&mut self, views_todo: &[ViewsTodo], db: &DatabaseType) {
         debug!("Preparing {} futures", views_todo.len());
-        for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
-            debug!("Processing {views_todo_batch:?}");
-            let futures: Vec<_> = views_todo_batch
-                .iter()
-                .map(|x| self.get_total_monthly_page_views(x))
-                .collect();
-            let results: Vec<u64> = join_all(futures)
-                .await
-                .iter()
-                .map(|r| r.unwrap_or(0))
-                .collect();
-            debug!("Futures complete");
-            for (view_count, vt) in results.into_iter().zip(views_todo_batch.iter()) {
-                let _ = db.update_view_count(vt.view_id, view_count).await;
-            }
+
+        let futures: Vec<_> = views_todo
+            .iter()
+            .map(|x| self.get_total_monthly_page_views(x))
+            .collect();
+        let stream = futures::stream::iter(futures).buffered(API_CALLS_IN_PARALLEL);
+        let results = stream.collect::<Vec<_>>().await;
+        for (view_count, vt) in results.into_iter().zip(views_todo.iter()) {
+            let _ = db
+                .update_view_count(vt.view_id, view_count.unwrap_or(0))
+                .await;
         }
+
+        // for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
+        //     debug!("Processing {views_todo_batch:?}");
+        //     let futures: Vec<_> = views_todo_batch
+        //         .iter()
+        //         .map(|x| self.get_total_monthly_page_views(x))
+        //         .collect();
+        //     let results: Vec<u64> = join_all(futures)
+        //         .await
+        //         .iter()
+        //         .map(|r| r.unwrap_or(0))
+        //         .collect();
+        //     debug!("Futures complete");
+        //     for (view_count, vt) in results.into_iter().zip(views_todo_batch.iter()) {
+        //         let _ = db.update_view_count(vt.view_id, view_count).await;
+        //     }
+        // }
         debug!("View updates complete");
     }
 

@@ -20,6 +20,7 @@ lazy_static = "^1"
 anyhow = "*"
 wikimisc = { git = "https://github.com/magnusmanske/wikimisc" }
 log = "*"
+base64 = "^0.22"
 
 [profile.release]
 opt-level = 3

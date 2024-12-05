@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
 use mysql_async::{from_row, prelude::*};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -234,7 +235,11 @@ impl DbTrait for DbMySql {
             .exec_iter(sql, ())
             .await?
             .map_and_drop(from_row::<String>)
-            .await?;
+            .await?
+            .iter()
+            .filter_map(|s| general_purpose::STANDARD.decode(s.as_bytes()).ok())
+            .filter_map(|s| String::from_utf8(s).ok())
+            .collect();
         Ok(ret)
     }
 
@@ -287,7 +292,11 @@ impl DbTrait for DbMySql {
             .join(",");
         let sql =
             format!("INSERT IGNORE INTO `files` (`group_status_id`,`name`) VALUES {placeholders}");
-        self.exec_vec(&sql, batch.to_vec()).await?;
+        let batch = batch
+            .iter()
+            .map(|s| general_purpose::STANDARD.encode(s.as_bytes()).to_string())
+            .collect();
+        self.exec_vec(&sql, batch).await?;
         Ok(())
     }
 
