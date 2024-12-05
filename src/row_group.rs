@@ -52,16 +52,33 @@ impl FromRow for RowGroup {
         Self: Sized,
     {
         Ok(Self {
-            id: row.get(0).unwrap(),
-            category: Baglama2::value2opt_string(row.as_ref(1).unwrap())
-                .unwrap()
-                .trim()
-                .to_string(),
-            depth: row.get(2).unwrap(),
-            added_by: Baglama2::value2opt_string(row.as_ref(3).unwrap()).unwrap(),
-            just_added: row.get(4).unwrap(),
-            is_active: row.get(5).unwrap(),
-            is_user_name: row.get(6).unwrap(),
+            id: row
+                .get(0)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            category: Baglama2::value2opt_string(
+                row.as_ref(1)
+                    .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            )
+            .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?
+            .trim()
+            .to_string(),
+            depth: row
+                .get(2)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            added_by: Baglama2::value2opt_string(
+                row.as_ref(3)
+                    .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            )
+            .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            just_added: row
+                .get(4)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            is_active: row
+                .get(5)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            is_user_name: row
+                .get(6)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
         })
     }
 }

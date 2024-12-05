@@ -61,13 +61,18 @@ impl FromRow for Site {
         Self: Sized,
     {
         Ok(Self {
-            id: row.get(0).unwrap(),
+            id: row
+                .get(0)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             grok_code: row.get(1).unwrap(),
             server: row.get(2).unwrap(),
             giu_code: row.get(3).unwrap(),
             project: row.get(4).unwrap(),
             language: row.get(5).unwrap(),
-            name: Baglama2::value2opt_string(row.as_ref(6).unwrap()),
+            name: Baglama2::value2opt_string(
+                row.as_ref(6)
+                    .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            ),
         })
     }
 }

@@ -84,18 +84,18 @@ impl Baglama2 {
     pub fn sqlite_schema_file(&self) -> String {
         self.config
             .get("sqlite_schema_file")
-            .unwrap()
+            .expect("sqlite_schema_file not found")
             .as_str()
-            .unwrap()
+            .expect("sqlite_schema_file not found")
             .to_string()
     }
 
     pub fn sqlite_data_root_path(&self) -> String {
         self.config
             .get("sqlite_data_root_path")
-            .unwrap()
+            .expect("sqlite_data_root_path not found")
             .as_str()
-            .unwrap()
+            .expect("sqlite_data_root_path not found")
             .to_string()
     }
 

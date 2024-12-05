@@ -19,11 +19,21 @@ impl FromRow for RowGroupStatus {
         Self: Sized,
     {
         Ok(Self {
-            id: row.get(0).unwrap(),
-            group_id: row.get(1).unwrap(),
-            year: row.get(2).unwrap(),
-            month: row.get(3).unwrap(),
-            status: row.get(4).unwrap(),
+            id: row
+                .get(0)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            group_id: row
+                .get(1)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            year: row
+                .get(2)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            month: row
+                .get(3)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            status: row
+                .get(4)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             total_views: row.get(5).unwrap(),
             file: row.get(6).unwrap(),
             sqlite3: row.get(7).unwrap(),

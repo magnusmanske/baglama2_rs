@@ -47,7 +47,9 @@ impl DbSqlite {
 
     /// Returns a mutex lock on the sqlite connection
     fn conn(&self) -> std::sync::MutexGuard<Connection> {
-        self.connection.lock().unwrap()
+        self.connection
+            .lock()
+            .expect("DbSqlite connection mutex poisoned")
     }
 
     fn construct_sqlite3_filename(gd: &GroupDate, baglama: &Baglama2) -> Result<String> {

@@ -52,7 +52,9 @@ toolforge-jobs run --image tf-php74 --mem 1500Mi --command '/data/project/glamto
 fn month(month: Option<&String>) -> u32 {
     match month.map(|s| s.as_str()) {
         Some("lm") => {
-            let last: DateTime<Utc> = Utc::now().checked_sub_months(Months::new(1)).unwrap();
+            let last: DateTime<Utc> = Utc::now()
+                .checked_sub_months(Months::new(1))
+                .expect("Bad month {month}");
             last.month()
         }
         Some(s) => s.parse::<u32>().expect("Month: number expected, not {s}"),
@@ -63,7 +65,9 @@ fn month(month: Option<&String>) -> u32 {
 fn year(year: Option<&String>) -> i32 {
     match year.map(|s| s.as_str()) {
         Some("lm") => {
-            let last: DateTime<Utc> = Utc::now().checked_sub_months(Months::new(1)).unwrap();
+            let last: DateTime<Utc> = Utc::now()
+                .checked_sub_months(Months::new(1))
+                .expect("Bad year {year}");
             last.year()
         }
         Some(s) => s.parse::<i32>().expect("Year: number expected, not {s}"),
@@ -78,10 +82,16 @@ async fn process_all_groups(
     requires_previous_date: bool,
 ) -> Result<()> {
     baglama.clear_incomplete_group_status(year, month).await?;
-    let max_concurrent = baglama.config()["max_concurrent_jobs"].as_u64().unwrap();
+    let max_concurrent = baglama.config()["max_concurrent_jobs"]
+        .as_u64()
+        .unwrap_or(4);
     let concurrent: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     loop {
-        if *concurrent.lock().unwrap() >= max_concurrent {
+        if *concurrent
+            .lock()
+            .expect("main: concurrent lock poisoned [1]")
+            >= max_concurrent
+        {
             baglama.hold_on().await;
             continue;
         }
@@ -91,11 +101,18 @@ async fn process_all_groups(
         if let Some(group_id) = group_id_opt {
             let concurrent = concurrent.clone();
             let baglama = baglama.clone();
-            *concurrent.lock().unwrap() += 1;
-            info!("Now {} jobs running", concurrent.lock().unwrap());
+            *concurrent
+                .lock()
+                .expect("main: concurrent lock poisoned [2]") += 1;
+            info!(
+                "Now {} jobs running",
+                concurrent
+                    .lock()
+                    .expect("main: concurrent lock poisoned [3]")
+            );
             let mut gd = GroupDate::new(
                 group_id.try_into()?,
-                YearMonth::new(year, month).unwrap(),
+                YearMonth::new(year, month).expect("Bad year/month {year}/{month}"),
                 baglama.clone(),
             );
             let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
@@ -108,11 +125,17 @@ async fn process_all_groups(
                     }
                 }
                 drop(gd);
-                *concurrent.lock().unwrap() -= 1;
+                *concurrent
+                    .lock()
+                    .expect("main: concurrent lock poisoned [4]") -= 1;
             });
         } else {
             // Wait for threads to finish
-            if *concurrent.lock().unwrap() > 0 {
+            if *concurrent
+                .lock()
+                .expect("main: concurrent lock poisoned [5]")
+                > 0
+            {
                 baglama.hold_on().await;
                 continue;
             }
@@ -126,20 +149,22 @@ async fn process_all_groups(
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     log::set_max_level(LevelFilter::Info);
-    let argv: Vec<String> = env::args_os().map(|s| s.into_string().unwrap()).collect();
+    let argv: Vec<String> = env::args_os()
+        .map(|s| s.into_string().expect("Bad argv"))
+        .collect();
     let baglama = Arc::new(Baglama2::new().await?);
     baglama.deactivate_nonexistent_categories().await?;
     match argv.get(1).map(|s| s.as_str()) {
         Some("run") => {
             let group_id = argv
                 .get(2)
-                .map(|s| s.parse::<usize>().unwrap())
+                .map(|s| s.parse::<usize>().expect("bad group ID"))
                 .expect("Group ID expected");
             let year = year(argv.get(3));
             let month = month(argv.get(4));
             let mut gd = GroupDate::new(
                 group_id.try_into()?,
-                YearMonth::new(year, month).unwrap(),
+                YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),
             );
             let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
@@ -151,7 +176,7 @@ async fn main() -> Result<()> {
             if let Some(group_id) = baglama.get_next_group_id(year, month, false).await {
                 GroupDate::new(
                     group_id.try_into()?,
-                    YearMonth::new(year, month).unwrap(),
+                    YearMonth::new(year, month).expect("bad year/month"),
                     baglama.clone(),
                 )
                 .create_sqlite()
@@ -171,7 +196,7 @@ async fn main() -> Result<()> {
                 if let Some(group_id) = baglama.get_next_group_id(year, month, false).await {
                     let mut gd = GroupDate::new(
                         group_id.try_into()?,
-                        YearMonth::new(year, month).unwrap(),
+                        YearMonth::new(year, month).expect("bad year/month"),
                         baglama.clone(),
                     );
                     let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
