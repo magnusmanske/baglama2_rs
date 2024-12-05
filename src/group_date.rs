@@ -2,6 +2,8 @@ use crate::baglama2::*;
 // use crate::db_sqlite::DbSqlite as DatabaseType;
 use crate::db_mysql::DbMySql as DatabaseType;
 use crate::db_trait::DbTrait;
+use crate::db_trait::FilePart;
+use crate::global_image_links::GlobalImageLinks;
 use crate::GroupId;
 use crate::Site;
 use crate::ViewCount;
@@ -154,12 +156,74 @@ impl GroupDate {
         const BATCH_SIZE: usize = 10000;
         loop {
             let files = db.load_files_batch(offset, BATCH_SIZE).await?;
-            let _ = db.add_views_for_files(&files, self).await;
+            let _ = self.add_views_for_files(&files, db).await;
             offset += files.len();
             if files.len() != BATCH_SIZE {
                 break;
             }
         }
+        Ok(())
+    }
+
+    async fn add_views_for_files(&self, all_files: &[String], db: &DatabaseType) -> Result<()> {
+        if all_files.is_empty() {
+            return Ok(());
+        }
+
+        let group_status_id = db.get_group_status_id().await?;
+
+        const CHUNK_SIZE: usize = 3000;
+        let mut chunk_num = 0;
+        for files in all_files.chunks(CHUNK_SIZE) {
+            chunk_num += 1;
+            debug!(
+                "add_views_for_files: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",
+                all_files.len(),
+            );
+            let globalimagelinks = GlobalImageLinks::load(files, db.baglama2()).await?;
+            debug!(
+                "add_views_for_files: globalimagelinks done, {} found",
+                globalimagelinks.len(),
+            );
+            let mut sql_values = vec![];
+            let mut parts = vec![];
+            for gil in &globalimagelinks {
+                let site = match self.get_site_for_wiki(&gil.wiki) {
+                    Some(site) => site,
+                    None => {
+                        //debug!("Unknown wiki: {}",&gil.wiki);
+                        continue;
+                    }
+                };
+
+                let site_id = site.id();
+                let title = &gil.page_title;
+                let month = self.ym().month();
+                let year = self.ym().year();
+                let done = 0;
+                let namespace_id = gil.page_namespace_id;
+                let page_id = gil.page;
+                let views = 0;
+
+                let sql_value =
+                    format!("({site_id},?,{month},{year},{done},{namespace_id},{page_id},{views})");
+                sql_values.push(sql_value);
+                let part = FilePart::new(site_id, title.to_owned(), page_id, gil.to.to_owned());
+                parts.push(part);
+            }
+            debug!(
+                "add_views_for_files: {} values, {} parts",
+                sql_values.len(),
+                parts.len(),
+            );
+
+            self.add_views_batch_for_files(sql_values, parts, group_status_id, db)
+                .await?;
+
+            debug!("add_views_for_files: batch done");
+        }
+        debug!("add_views_for_files: all batches done");
+
         Ok(())
     }
 
@@ -262,6 +326,47 @@ impl GroupDate {
             }
         }
         debug!("View updates complete");
+    }
+
+    async fn add_views_batch_for_files(
+        &self,
+        sql_values: Vec<String>,
+        parts: Vec<FilePart>,
+        group_status_id: usize,
+        db: &DatabaseType,
+    ) -> Result<()> {
+        if sql_values.is_empty() {
+            debug!("add_views_batch_for_files: NO sql_values!!!");
+            return Ok(());
+        }
+        debug!("add_views_batch_for_files: {} parts", parts.len());
+        db.create_views_in_db(&parts, &sql_values).await?;
+        debug!("B");
+        let viewid_site_id_title = db.get_viewid_site_id_title(&parts).await?;
+        debug!("C: {viewid_site_id_title:?}");
+
+        let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
+            .into_iter()
+            .map(|x| ((x.site_id, x.title.to_owned()), x.view_id))
+            .collect();
+        debug!("D: {siteid_title_viewid:?}");
+        let mut values = vec![];
+        let mut images = vec![];
+        for part in &parts {
+            let view_id = match siteid_title_viewid.get(&(part.site_id, part.page_title.to_owned()))
+            {
+                Some(id) => id,
+                None => {
+                    debug!("{}/{} not found, odd", part.site_id, part.page_title);
+                    continue;
+                }
+            };
+            values.push(format!("({group_status_id},{view_id},?)"));
+            images.push(part.file.to_owned());
+        }
+        debug!("add_views_batch_for_files: {} values", values.len());
+        db.insert_group2view(&values, images).await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
