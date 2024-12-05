@@ -235,7 +235,7 @@ impl Baglama2 {
         let sites: Vec<RowGroupStatus> = self
             .get_tooldb_conn()
             .await?
-            .exec_iter(sql, (group_id.as_usize(), ym.year(), ym.month()))
+            .exec_iter(sql, (group_id.get(), ym.year(), ym.month()))
             .await?
             .map_and_drop(from_row::<RowGroupStatus>)
             .await?;
@@ -433,10 +433,12 @@ impl Baglama2 {
         sqlite_filename: &str,
     ) -> Result<()> {
         let mut mysql_connection = self.get_tooldb_conn().await?;
-        let group_id = group_id.as_usize();
+        let group_id = group_id.get();
         let year = ym.year();
         let month = ym.month();
-        let sql = "REPLACE INTO `group_status` (group_id,year,month,status,total_views,sqlite3) VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)";
+        let sql = "INSERT INTO `group_status` (group_id,year,month,status,total_views,sqlite3)
+        	VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)
+         	ON DUPLICATE KEY UPDATE status=:status,total_views=:total_views,sqlite3=:sqlite_filename";
         let _ = mysql_connection
             .exec_drop(
                 sql,
@@ -449,7 +451,6 @@ impl Baglama2 {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]

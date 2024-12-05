@@ -1,23 +1,50 @@
 use crate::baglama2::*;
-use crate::db_sqlite::DbSqlite as DatabaseType;
-use lazy_static::lazy_static;
-// use crate::db_mysql::DbMySql as DatabaseType;
+use futures::prelude::*;
+// use crate::db_sqlite::DbSqlite as DatabaseType;
+use crate::db_mysql::DbMySql as DatabaseType;
+use crate::db_trait::DbTrait;
+use crate::db_trait::FilePart;
+use crate::global_image_links::GlobalImageLinks;
 use crate::GroupId;
 use crate::Site;
 use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
-use futures::future::join_all;
+use lazy_static::lazy_static;
+use log::debug;
+use log::warn;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use wikimisc::wikidata::Wikidata;
 
+const API_CALLS_IN_PARALLEL: usize = 10;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:56.0) Gecko/20100101 Firefox/56.0";
 const URL_LOAD_TIMEOUT_SEC: u64 = 60;
 const ADD_VIEW_COUNTS_BATCH_SIZE: usize = 3000;
+
+#[derive(Debug)]
+pub struct ViewsTodo {
+    server: String,
+    title: String,
+    first_day: String,
+    last_day: String,
+    view_id: usize,
+}
+
+impl ViewsTodo {
+    pub fn new(server: &str, title: &str, first_day: &str, last_day: &str, view_id: usize) -> Self {
+        Self {
+            server: server.to_string(),
+            title: title.to_string(),
+            first_day: first_day.to_string(),
+            last_day: last_day.to_string(),
+            view_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GroupDate {
@@ -57,8 +84,12 @@ impl GroupDate {
         Ok(())
     }
 
-    fn get_view_counts(&self, db: &DatabaseType, batch_size: usize) -> Result<Vec<ViewCount>> {
-        let ret = db.get_view_counts(batch_size)?;
+    async fn get_view_counts_todo(
+        &self,
+        db: &DatabaseType,
+        batch_size: usize,
+    ) -> Result<Vec<ViewCount>> {
+        let ret = db.get_view_counts_todo(batch_size).await?;
         Ok(ret)
     }
 
@@ -85,11 +116,11 @@ impl GroupDate {
             .get_group(&self.group_id)
             .await?
             .ok_or_else(|| anyhow!("Could not find group {} in MySQL database", self.group_id))?;
-        println!("{group:?}");
-        db.delete_all_files()?;
+        debug!("{group:?}");
+        db.delete_all_files().await?;
 
         // Get files in category tree from Commons
-        println!(
+        debug!(
             "Getting files from {}, depth {}",
             group.category(),
             group.depth()
@@ -101,7 +132,7 @@ impl GroupDate {
                 .await?
         };
         if files.len() < 5 {
-            eprintln!(
+            warn!(
                 "{} / {} has {} files",
                 group.category(),
                 group.depth(),
@@ -111,7 +142,7 @@ impl GroupDate {
 
         let batch_size = db.file_insert_batch_size();
         for batch in files.chunks(batch_size) {
-            db.insert_files_batch(batch)?;
+            db.insert_files_batch(batch).await?;
         }
 
         Ok(())
@@ -124,8 +155,8 @@ impl GroupDate {
         let mut offset: usize = 0;
         const BATCH_SIZE: usize = 10000;
         loop {
-            let files = db.load_files_batch(offset, BATCH_SIZE)?;
-            let _ = db.add_views_for_files(&files, self).await;
+            let files = db.load_files_batch(offset, BATCH_SIZE).await?;
+            let _ = self.add_views_for_files(&files, db).await;
             offset += files.len();
             if files.len() != BATCH_SIZE {
                 break;
@@ -134,16 +165,72 @@ impl GroupDate {
         Ok(())
     }
 
+    async fn add_views_for_files(&self, all_files: &[String], db: &DatabaseType) -> Result<()> {
+        if all_files.is_empty() {
+            return Ok(());
+        }
+
+        let group_status_id = db.get_group_status_id().await?;
+
+        const CHUNK_SIZE: usize = 3000;
+        let mut chunk_num = 0;
+        for files in all_files.chunks(CHUNK_SIZE) {
+            chunk_num += 1;
+            debug!(
+                "add_views_for_files: starting chunk {chunk_num} ({CHUNK_SIZE} of {} files total)",
+                all_files.len(),
+            );
+            let globalimagelinks = GlobalImageLinks::load(files, db.baglama2()).await?;
+            debug!(
+                "add_views_for_files: globalimagelinks done, {} found",
+                globalimagelinks.len(),
+            );
+            let mut sql_values = vec![];
+            let mut parts = vec![];
+            for gil in &globalimagelinks {
+                let site = match self.get_site_for_wiki(&gil.wiki) {
+                    Some(site) => site,
+                    None => {
+                        //debug!("Unknown wiki: {}",&gil.wiki);
+                        continue;
+                    }
+                };
+
+                let site_id = site.id();
+                let title = &gil.page_title;
+                let month = self.ym().month();
+                let year = self.ym().year();
+                let done = 0;
+                let namespace_id = gil.page_namespace_id;
+                let page_id = gil.page;
+                let views = 0;
+
+                let sql_value =
+                    format!("({site_id},?,{month},{year},{done},{namespace_id},{page_id},{views})");
+                sql_values.push(sql_value);
+                let part = FilePart::new(site_id, title.to_owned(), page_id, gil.to.to_owned());
+                parts.push(part);
+            }
+            debug!(
+                "add_views_for_files: {} values, {} parts",
+                sql_values.len(),
+                parts.len(),
+            );
+
+            self.add_views_batch_for_files(sql_values, parts, group_status_id, db)
+                .await?;
+
+            debug!("add_views_for_files: batch done");
+        }
+        debug!("add_views_for_files: all batches done");
+
+        Ok(())
+    }
+
     // TESTED
-    pub async fn get_total_monthly_page_views(
-        &self,
-        server: &str,
-        title: &str,
-        first_day: &str,
-        last_day: &str,
-    ) -> Option<u64> {
-        let server = Self::fix_server_name_for_page_view_api(server);
-        let url = format!("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{server}/all-access/user/{title}/daily/{first_day}/{last_day}");
+    pub async fn get_total_monthly_page_views(&self, vt: &ViewsTodo) -> Option<u64> {
+        let server = Self::fix_server_name_for_page_view_api(&vt.server);
+        let url = format!("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/{server}/all-access/user/{}/daily/{}/{}",vt.title,vt.first_day,vt.last_day);
         let client = Self::get_reqwest_client();
         let json_text = client.get(url).send().await.ok()?.text().await.ok()?;
         let json: Value = serde_json::from_str(&json_text).ok()?;
@@ -181,23 +268,24 @@ impl GroupDate {
     }
 
     pub async fn add_view_counts(&mut self, db: &DatabaseType) -> Result<()> {
-        println!("add_view_counts: loading sites");
+        debug!("add_view_counts: loading sites");
         self.load_sites(db).await?;
-        println!("add_view_counts: sites loaded");
+        debug!("add_view_counts: sites loaded");
         let first_day = self.ym.first_day()?;
         let last_day = self.ym.last_day()?;
 
         // Hide Main Page from view count
-        db.reset_main_page_view_count()?;
+        db.reset_main_page_view_count().await?;
+        debug!("main page view count reset");
 
         let batch_size = ADD_VIEW_COUNTS_BATCH_SIZE;
         let mut found = true;
         let mut views_todo = vec![];
         while found {
             found = false;
-            println!("add_view_counts: getting {batch_size} view counts");
-            let rows = self.get_view_counts(db, batch_size)?;
-            println!("add_view_counts: view counts retrieved");
+            debug!("add_view_counts: getting {batch_size} view counts");
+            let rows = self.get_view_counts_todo(db, batch_size).await?;
+            debug!("add_view_counts: view counts retrieved");
             for vc in rows {
                 self.add_view_counts_process_row(
                     vc,
@@ -210,32 +298,87 @@ impl GroupDate {
                 .await;
             }
             if !views_todo.is_empty() {
-                // println!("Preparing {} futures",views_todo.len());
-                for views_todo_batch in views_todo.chunks(10) {
-                    let futures: Vec<_> = views_todo_batch
-                        .iter()
-                        .map(|(server, title, first_day, last_day, _view_id)| {
-                            self.get_total_monthly_page_views(server, title, first_day, last_day)
-                        })
-                        .collect();
-                    let results: Vec<u64> = join_all(futures)
-                        .await
-                        .iter()
-                        .map(|r| r.unwrap_or(0))
-                        .collect();
-                    // println!("Futures complete");
-                    for (view_count, (_server, _title, _first_day, _last_day, view_id)) in
-                        results.into_iter().zip(views_todo_batch.iter())
-                    {
-                        let _ = db.update_view_count(*view_id, view_count).await;
-                    }
-                }
-                // println!("Updates complete");
+                self.process_views_todo(&views_todo, db).await;
             }
         }
 
-        println!("add_view_counts: adding summary statistics");
+        debug!("add_view_counts: adding summary statistics");
         self.add_summary_statistics(db).await?;
+        Ok(())
+    }
+
+    async fn process_views_todo(&mut self, views_todo: &[ViewsTodo], db: &DatabaseType) {
+        debug!("Preparing {} futures", views_todo.len());
+
+        let futures: Vec<_> = views_todo
+            .iter()
+            .map(|x| self.get_total_monthly_page_views(x))
+            .collect();
+        let stream = futures::stream::iter(futures).buffered(API_CALLS_IN_PARALLEL);
+        let results = stream.collect::<Vec<_>>().await;
+        for (view_count, vt) in results.into_iter().zip(views_todo.iter()) {
+            let _ = db
+                .update_view_count(vt.view_id, view_count.unwrap_or(0))
+                .await;
+        }
+
+        // for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
+        //     debug!("Processing {views_todo_batch:?}");
+        //     let futures: Vec<_> = views_todo_batch
+        //         .iter()
+        //         .map(|x| self.get_total_monthly_page_views(x))
+        //         .collect();
+        //     let results: Vec<u64> = join_all(futures)
+        //         .await
+        //         .iter()
+        //         .map(|r| r.unwrap_or(0))
+        //         .collect();
+        //     debug!("Futures complete");
+        //     for (view_count, vt) in results.into_iter().zip(views_todo_batch.iter()) {
+        //         let _ = db.update_view_count(vt.view_id, view_count).await;
+        //     }
+        // }
+        debug!("View updates complete");
+    }
+
+    async fn add_views_batch_for_files(
+        &self,
+        sql_values: Vec<String>,
+        parts: Vec<FilePart>,
+        group_status_id: usize,
+        db: &DatabaseType,
+    ) -> Result<()> {
+        if sql_values.is_empty() {
+            debug!("add_views_batch_for_files: NO sql_values!!!");
+            return Ok(());
+        }
+        debug!("add_views_batch_for_files: {} parts", parts.len());
+        db.create_views_in_db(&parts, &sql_values).await?;
+        debug!("B");
+        let viewid_site_id_title = db.get_viewid_site_id_title(&parts).await?;
+        debug!("C: {viewid_site_id_title:?}");
+
+        let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
+            .into_iter()
+            .map(|x| ((x.site_id, x.title.to_owned()), x.view_id))
+            .collect();
+        debug!("D: {siteid_title_viewid:?}");
+        let mut values = vec![];
+        let mut images = vec![];
+        for part in &parts {
+            let view_id = match siteid_title_viewid.get(&(part.site_id, part.page_title.to_owned()))
+            {
+                Some(id) => id,
+                None => {
+                    debug!("{}/{} not found, odd", part.site_id, part.page_title);
+                    continue;
+                }
+            };
+            values.push(format!("({group_status_id},{view_id},?)"));
+            images.push(part.file.to_owned());
+        }
+        debug!("add_views_batch_for_files: {} values", values.len());
+        db.insert_group2view(&values, images).await?;
         Ok(())
     }
 
@@ -245,9 +388,9 @@ impl GroupDate {
         vc: ViewCount,
         db: &DatabaseType,
         found: &mut bool,
-        views_todo: &mut Vec<(String, String, String, String, usize)>,
-        first_day: &String,
-        last_day: &String,
+        views_todo: &mut Vec<ViewsTodo>,
+        first_day: &str,
+        last_day: &str,
     ) {
         let server = match vc.server {
             Some(server) => server,
@@ -274,12 +417,8 @@ impl GroupDate {
             .await
         {
             Some(title) => {
-                views_todo.push((
-                    server.to_string(),
-                    title.to_string(),
-                    first_day.to_string(),
-                    last_day.to_string(),
-                    vc.view_id,
+                views_todo.push(ViewsTodo::new(
+                    &server, &title, first_day, last_day, vc.view_id,
                 ));
             }
             None => {
@@ -289,13 +428,13 @@ impl GroupDate {
     }
 
     async fn add_summary_statistics(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id()?;
+        let group_status_id = db.get_group_status_id().await?;
         db.add_summary_statistics(group_status_id).await
     }
 
     async fn finalize(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id()?;
-        let total_views = db.get_total_views(group_status_id)?;
+        let group_status_id = db.get_group_status_id().await?;
+        let total_views = db.get_total_views(group_status_id).await?;
         db.create_final_indices()?;
         let sqlite_filename = db.path_final();
         self.set_group_status("VIEW DATA COMPLETE", total_views, sqlite_filename)
@@ -322,18 +461,18 @@ impl GroupDate {
 
     pub async fn create_sqlite(&mut self) -> Result<()> {
         let db = DatabaseType::new(self, self.baglama.clone())?;
-        println!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
+        debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
         db.initialize().await?;
-        println!("{}-{}: add_files", self.group_id, self.ym);
+        debug!("{}-{}: add_files", self.group_id, self.ym);
         self.add_files(&db).await?;
-        println!("{}-{}: add_pages", self.group_id, self.ym);
+        debug!("{}-{}: add_pages", self.group_id, self.ym);
         self.add_pages(&db).await?;
-        println!("{}-{}: add_view_counts", self.group_id, self.ym);
+        debug!("{}-{}: add_view_counts", self.group_id, self.ym);
         self.add_view_counts(&db).await?;
-        println!("{}-{}: finalize_sqlite", self.group_id, self.ym);
+        debug!("{}-{}: finalize_sqlite", self.group_id, self.ym);
         self.finalize(&db).await?;
-        println!("{}-{}: done!", self.group_id, self.ym);
-        db.finalize()?;
+        debug!("{}-{}: done!", self.group_id, self.ym);
+        db.finalize().await?;
         Ok(())
     }
 

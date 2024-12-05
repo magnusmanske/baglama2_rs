@@ -2,9 +2,10 @@ use anyhow::Result;
 use baglama2::*;
 use chrono::{DateTime, Datelike, Months, Utc};
 use group_date::*;
-pub use group_id::GroupId;
+use log::{info, LevelFilter};
 pub use site::Site;
 use std::env;
+use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
@@ -28,14 +29,16 @@ pub use year_month::YearMonth;
 pub mod baglama2;
 pub mod db_mysql;
 pub mod db_sqlite;
+pub mod db_trait;
 pub mod global_image_links;
 pub mod group_date;
-pub mod group_id;
 pub mod row_group;
 pub mod row_group_status;
 pub mod site;
 pub mod view_count;
 pub mod year_month;
+
+pub type GroupId = NonZero<usize>;
 
 /*
 ssh magnus@tools-login.wmflabs.org -L 3307:commonswiki.web.db.svc.eqiad.wmflabs:3306 -N &
@@ -89,7 +92,7 @@ async fn process_all_groups(
             let concurrent = concurrent.clone();
             let baglama = baglama.clone();
             *concurrent.lock().unwrap() += 1;
-            println!("Now {} jobs running", concurrent.lock().unwrap());
+            info!("Now {} jobs running", concurrent.lock().unwrap());
             let mut gd = GroupDate::new(
                 group_id.try_into()?,
                 YearMonth::new(year, month).unwrap(),
@@ -101,7 +104,7 @@ async fn process_all_groups(
                     Ok(_) => {}
                     Err(err) => {
                         let _ = gd.set_group_status("FAILED", 0, "").await;
-                        println!("{group_id} failed: {:?}", &err);
+                        info!("{group_id} failed: {:?}", &err);
                     }
                 }
                 drop(gd);
@@ -113,7 +116,7 @@ async fn process_all_groups(
                 baglama.hold_on().await;
                 continue;
             }
-            println!("Complete");
+            info!("Complete");
             break;
         }
     }
@@ -122,6 +125,7 @@ async fn process_all_groups(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    log::set_max_level(LevelFilter::Info);
     let argv: Vec<String> = env::args_os().map(|s| s.into_string().unwrap()).collect();
     let baglama = Arc::new(Baglama2::new().await?);
     baglama.deactivate_nonexistent_categories().await?;
@@ -153,7 +157,7 @@ async fn main() -> Result<()> {
                 .create_sqlite()
                 .await?;
             } else {
-                println!("No more groups for {year}/{month}");
+                info!("No more groups for {year}/{month}");
             }
         }
         Some("next_all_seq") => {
@@ -175,11 +179,11 @@ async fn main() -> Result<()> {
                         Ok(_) => {}
                         Err(err) => {
                             let _ = gd.set_group_status("FAILED", 0, "").await;
-                            println!("{group_id} failed: {:?}", &err);
+                            info!("{group_id} failed: {:?}", &err);
                         }
                     }
                 } else {
-                    println!("No more groups for {year}/{month}");
+                    info!("No more groups for {year}/{month}");
                     break;
                 }
             }
@@ -195,7 +199,7 @@ async fn main() -> Result<()> {
             let current_year = chrono::Utc::now().year();
             let current_month = chrono::Utc::now().month();
             loop {
-                println!("BACKFILLING {year}-{month}");
+                info!("BACKFILLING {year}-{month}");
                 process_all_groups(year, month, baglama.clone(), true).await?;
                 month += 1;
                 if month > 12 {
@@ -209,7 +213,7 @@ async fn main() -> Result<()> {
         }
         Some("test") => {
             let current_month = chrono::Utc::now().month();
-            println!("{current_month}");
+            info!("{current_month}");
         }
         other => panic!("Action required (not {:?}", other),
     }
