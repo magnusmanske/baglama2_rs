@@ -54,9 +54,12 @@ impl FromRow for ViewIdSiteIdTitle {
         Self: Sized,
     {
         Ok(Self::new(
-            row.get(0).unwrap(),
-            row.get(1).unwrap(),
-            row.get(2).unwrap(),
+            row.get(0)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            row.get(1)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            row.get(2)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
         ))
     }
 }

@@ -58,7 +58,12 @@ impl YearMonth {
 impl std::fmt::Display for YearMonth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tmp = chrono::NaiveDate::from_ymd_opt(self.year, self.month, 1)
-            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not create NaiveDate for {}-{}",
+                    self.year, self.month
+                )
+            })
             .format("%Y-%m")
             .to_string();
         f.write_str(&tmp)

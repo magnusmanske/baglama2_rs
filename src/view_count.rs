@@ -30,18 +30,33 @@ impl FromRow for ViewCount {
     where
         Self: Sized,
     {
-        let title = String::from_utf8(row.get(1).unwrap()).map_err(|e| {
+        let title = row
+            .get(1)
+            .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?;
+        let title = String::from_utf8(title).map_err(|e| {
             eprintln!("ViewCount::from_row_opt {e}");
             mysql_async::FromRowError(row.to_owned())
         })?;
         Ok(Self {
-            view_id: row.get(0).unwrap(),
+            view_id: row
+                .get(0)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             title,
-            namespace_id: row.get(2).unwrap(),
-            grok_code: row.get(3).unwrap(),
-            server: row.get(4).unwrap(),
-            done: row.get(5).unwrap(),
-            site_id: row.get(6).unwrap(),
+            namespace_id: row
+                .get(2)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            grok_code: row
+                .get(3)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            server: row
+                .get(4)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            done: row
+                .get(5)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            site_id: row
+                .get(6)
+                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
         })
     }
 }
