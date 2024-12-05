@@ -30,9 +30,11 @@ impl FromRow for ViewCount {
     where
         Self: Sized,
     {
+        let title = String::from_utf8(row.get(1).unwrap())
+            .map_err(|_e| mysql_async::FromRowError(row.to_owned()))?;
         Ok(Self {
             view_id: row.get(0).unwrap(),
-            title: row.get(1).unwrap(),
+            title,
             namespace_id: row.get(2).unwrap(),
             grok_code: row.get(3).unwrap(),
             server: row.get(4).unwrap(),
