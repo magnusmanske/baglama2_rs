@@ -53,13 +53,17 @@ impl FromRow for ViewIdSiteIdTitle {
     where
         Self: Sized,
     {
+        let title: Vec<u8> = row
+            .get(2)
+            .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?;
+        let title =
+            String::from_utf8(title).map_err(|_| mysql_async::FromRowError(row.to_owned()))?;
         Ok(Self::new(
             row.get(0)
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             row.get(1)
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
-            row.get(2)
-                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            title,
         ))
     }
 }
