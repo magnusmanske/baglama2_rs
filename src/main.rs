@@ -148,7 +148,7 @@ async fn process_all_groups(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    log::set_max_level(LevelFilter::Info);
+    log::set_max_level(LevelFilter::Trace);
     let argv: Vec<String> = env::args_os()
         .map(|s| s.into_string().expect("Bad argv"))
         .collect();
