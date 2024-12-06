@@ -1,5 +1,7 @@
 use mysql_async::prelude::*;
 
+use crate::Baglama2;
+
 #[derive(Debug, Clone)]
 pub struct ViewCount {
     pub view_id: usize,
@@ -31,12 +33,11 @@ impl FromRow for ViewCount {
         Self: Sized,
     {
         let title = row
-            .get(1)
+            .as_ref(1)
+            .ok_or_else(|| mysql_async::FromRowError(row.clone()))
+            .unwrap();
+        let title = Baglama2::value2opt_string(title)
             .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?;
-        let title = String::from_utf8(title).map_err(|e| {
-            eprintln!("ViewCount::from_row_opt {e}");
-            mysql_async::FromRowError(row.to_owned())
-        })?;
         Ok(Self {
             view_id: row
                 .get(0)
