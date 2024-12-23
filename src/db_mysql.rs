@@ -210,7 +210,7 @@ impl DbTrait for DbMySql {
     // tested
     async fn delete_all_files(&self) -> Result<()> {
         let group_status_id = self.get_group_status_id().await?;
-        let sql = format!("DELETE FROM `files` WHERE `group_status_id`={group_status_id}");
+        let sql = format!("DELETE FROM `tmp_files` WHERE `group_status_id`={group_status_id}");
         self.execute(&sql).await
     }
 
@@ -227,7 +227,7 @@ impl DbTrait for DbMySql {
     // tested
     async fn load_files_batch(&self, offset: usize, batch_size: usize) -> Result<Vec<String>> {
         let group_status_id = self.get_group_status_id().await?;
-        let sql = format!("SELECT `name` FROM `files` WHERE `group_status_id`={group_status_id} LIMIT {batch_size} OFFSET {offset}");
+        let sql = format!("SELECT `name` FROM `tmp_files` WHERE `group_status_id`={group_status_id} LIMIT {batch_size} OFFSET {offset}");
         let ret = self
             .baglama
             .get_tooldb_conn()
@@ -290,8 +290,9 @@ impl DbTrait for DbMySql {
             .map(|_| format!("({group_status_id},?)"))
             .collect::<Vec<String>>()
             .join(",");
-        let sql =
-            format!("INSERT IGNORE INTO `files` (`group_status_id`,`name`) VALUES {placeholders}");
+        let sql = format!(
+            "INSERT IGNORE INTO `tmp_files` (`group_status_id`,`name`) VALUES {placeholders}"
+        );
         let batch = batch
             .iter()
             .map(|s| general_purpose::STANDARD.encode(s.as_bytes()).to_string())

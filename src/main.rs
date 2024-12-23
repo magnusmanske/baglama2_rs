@@ -244,9 +244,3 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
-
-/*
-ssh magnus@tools-login.wmflabs.org -L 3311:oxztsldqokc.svc.trove.eqiad1.wikimedia.cloud:3306 -N & \
-ssh magnus@tools-login.wmflabs.org -L 3310:commonswiki.web.db.svc.eqiad.wmflabs:3306 -N &
-
-*/
