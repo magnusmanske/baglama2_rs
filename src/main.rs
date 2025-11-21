@@ -32,6 +32,8 @@ pub mod db_sqlite;
 pub mod db_trait;
 pub mod global_image_links;
 pub mod group_date;
+pub mod month_views;
+pub mod page;
 pub mod row_group;
 pub mod row_group_status;
 pub mod site;
@@ -168,7 +170,8 @@ async fn main() -> Result<()> {
                 baglama.clone(),
             );
             let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
-            gd.create_sqlite().await?;
+            gd.create_mysql2().await?;
+            // gd.create_sqlite().await?;
         }
         Some("next") => {
             let year = year(argv.get(2));

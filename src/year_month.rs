@@ -2,7 +2,7 @@ use crate::Baglama2;
 use anyhow::{anyhow, Result};
 use chrono::Datelike;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct YearMonth {
     year: i32,
     month: u32,

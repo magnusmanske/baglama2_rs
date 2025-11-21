@@ -82,7 +82,7 @@ impl DbMySql {
 
     /// Runs a single SQL query with no parameters, and no return value
     /// Does not run in testing mode
-    async fn execute(&self, sql: &str) -> Result<()> {
+    pub async fn execute(&self, sql: &str) -> Result<()> {
         if self.testing {
             self.test_log
                 .lock()

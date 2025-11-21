@@ -459,6 +459,16 @@ impl GroupDate {
             .await
     }
 
+    pub async fn create_mysql2(&mut self) -> Result<()> {
+        let mv = crate::month_views::MonthViews::new(self.ym().to_owned());
+        let db = crate::db_mysql::DbMySql::new(self, self.baglama.clone())?;
+        debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
+        db.initialize().await?;
+        debug!("{}-{}: add_files", self.group_id, self.ym);
+        // self.add_files(&db).await?;
+        Ok(())
+    }
+
     pub async fn create_sqlite(&mut self) -> Result<()> {
         let db = DatabaseType::new(self, self.baglama.clone())?;
         debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);

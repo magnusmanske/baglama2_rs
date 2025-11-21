@@ -46,7 +46,7 @@ impl DbSqlite {
     }
 
     /// Returns a mutex lock on the sqlite connection
-    fn conn(&self) -> std::sync::MutexGuard<Connection> {
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.connection
             .lock()
             .expect("DbSqlite connection mutex poisoned")
