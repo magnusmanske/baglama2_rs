@@ -3,15 +3,24 @@ use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Page {
-    pub id: usize,
+    pub id: Option<usize>,
     pub site_id: usize,
     pub title: String,
-    pub namespace_id: usize,
+    pub namespace_id: i32,
 }
 
 impl Page {
     pub fn sql_fields() -> &'static str {
         "id,site,title,namespace_id"
+    }
+
+    pub fn new(site_id: usize, title: String, namespace_id: i32) -> Self {
+        Self {
+            id: None,
+            site_id,
+            title,
+            namespace_id,
+        }
     }
 }
 

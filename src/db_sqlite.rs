@@ -1,5 +1,5 @@
 use crate::db_trait::{DbTrait, FilePart, ViewIdSiteIdTitle};
-use crate::{Baglama2, GroupDate, GroupId, Site, ViewCount, YearMonth};
+use crate::{Baglama2, DbId, GroupDate, GroupId, Site, ViewCount, YearMonth};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::debug;
@@ -76,7 +76,7 @@ impl DbSqlite {
             self.conn().execute(
                 sql,
                 rusqlite::params![
-                    site.id(),
+                    site.id() as isize,
                     site.grok_code(),
                     site.server(),
                     site.giu_code(),
@@ -98,7 +98,7 @@ impl DbSqlite {
             self.conn().execute(
                 sql,
                 rusqlite::params![
-                    group.id(),
+                    group.id() as isize,
                     group.category(),
                     group.depth(),
                     group.added_by(),
@@ -117,8 +117,8 @@ impl DbSqlite {
             self.conn().execute(
                 sql,
                 rusqlite::params![
-                    gs.id,
-                    gs.group_id,
+                    gs.id as isize,
+                    gs.group_id as isize,
                     gs.year,
                     gs.month,
                     gs.status,
@@ -131,7 +131,7 @@ impl DbSqlite {
             let sql = "INSERT INTO `group_status` (group_id,year,month) VALUES (?,?,?)";
             self.conn().execute(
                 sql,
-                rusqlite::params![group_id.get(), ym.year(), ym.month()],
+                rusqlite::params![group_id.get() as isize, ym.year(), ym.month()],
             )?;
         }
         Ok(())
@@ -175,26 +175,26 @@ impl DbTrait for DbSqlite {
         Ok(ret)
     }
 
-    async fn get_group_status_id(&self) -> Result<usize> {
-        let group_id = self.group_id.to_owned();
+    async fn get_group_status_id(&self) -> Result<DbId> {
+        let group_id: usize = self.group_id.to_owned().into();
         let year = self.ym.year();
         let month = self.ym.month();
         let sql = "SELECT `id` FROM `group_status` WHERE `group_id`=? AND `year`=? AND `month`=?";
-        let group_status_id: usize = self
+        let group_status_id: isize = self
             .conn()
             .prepare(sql)?
-            .query_map((group_id.get(), year, month), |row| row.get(0))?
+            .query_map((group_id as isize, year, month), |row| row.get(0))?
             .next()
             .ok_or(anyhow!("No group_status for group {group_id}"))??;
-        Ok(group_status_id)
+        Ok(group_status_id as DbId)
     }
 
-    async fn get_total_views(&self, group_status_id: usize) -> Result<usize> {
+    async fn get_total_views(&self, group_status_id: DbId) -> Result<isize> {
         let sql = "SELECT ifnull(total_views,0) FROM group_status WHERE id=?";
-        let total_views: usize = self
+        let total_views: isize = self
             .conn()
             .prepare(sql)?
-            .query_map([group_status_id], |row| row.get(0))?
+            .query_map([group_status_id as isize], |row| row.get(0))?
             .next()
             .unwrap_or(Ok(0))?;
         Ok(total_views)
@@ -254,32 +254,32 @@ impl DbTrait for DbSqlite {
         Ok(())
     }
 
-    async fn add_summary_statistics(&self, group_status_id: usize) -> Result<()> {
+    async fn add_summary_statistics(&self, group_status_id: DbId) -> Result<()> {
         self.conn()
             .execute("CREATE INDEX `views_site` ON `views` (site)", ())?;
         self.conn().execute("DELETE FROM `gs2site`", ())?;
-        self.conn().execute("INSERT INTO `gs2site` SELECT sites.id,?1,sites.id,COUNT(DISTINCT page_id),SUM(views) FROM `views`,`sites` WHERE views.site=sites.id GROUP BY sites.id",rusqlite::params![group_status_id])?;
-        self.conn().execute("UPDATE group_status SET status='VIEW DATA COMPLETE',total_views=(SELECT sum(views) FROM gs2site) WHERE id=?1",rusqlite::params![group_status_id])?;
+        self.conn().execute("INSERT INTO `gs2site` SELECT sites.id,?1,sites.id,COUNT(DISTINCT page_id),SUM(views) FROM `views`,`sites` WHERE views.site=sites.id GROUP BY sites.id",rusqlite::params![group_status_id as isize])?;
+        self.conn().execute("UPDATE group_status SET status='VIEW DATA COMPLETE',total_views=(SELECT sum(views) FROM gs2site) WHERE id=?1",rusqlite::params![group_status_id as isize])?;
         Ok(())
     }
 
-    async fn update_view_count(&self, view_id: usize, view_count: u64) -> Result<()> {
+    async fn update_view_count(&self, view_id: DbId, view_count: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE `views` SET `done`=1,`views`=?1 WHERE `id`=?2",
-            rusqlite::params![view_count, view_id],
+            rusqlite::params![view_count, view_id as isize],
         )?;
         Ok(())
     }
 
-    async fn view_done(&self, view_id: usize, done: u8) -> Result<()> {
+    async fn view_done(&self, view_id: DbId, done: u8) -> Result<()> {
         self.conn().execute(
             "UPDATE `views` SET `done`=?1,`views`=0 WHERE `id`=?2",
-            rusqlite::params![done, view_id],
+            rusqlite::params![done, view_id as isize],
         )?;
         Ok(())
     }
 
-    fn file_insert_batch_size(&self) -> usize {
+    fn file_insert_batch_size(&self) -> isize {
         450 // sqlite3 limit is 500
     }
 

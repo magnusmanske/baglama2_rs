@@ -3,7 +3,7 @@ use anyhow::Result;
 
 #[derive(Debug, Clone)]
 pub struct MonthViews {
-    ym: YearMonth,
+    _ym: YearMonth,
     table: String,
     table_exists: bool,
 }
@@ -11,7 +11,7 @@ pub struct MonthViews {
 impl MonthViews {
     pub fn new(ym: YearMonth) -> Self {
         Self {
-            ym,
+            _ym: ym,
             table: format!("month_views_{}", ym.to_string().replace('-', "_")),
             table_exists: false,
         }
@@ -22,7 +22,7 @@ impl MonthViews {
             return Ok(());
         }
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} {{
+            "CREATE TABLE IF NOT EXISTS `{}` {{
         	`page_id` int(11) unsigned NOT NULL AUTO_INCREMENT,
          	`views` int(11) unsigned DEFAULT NULL,
           	PRIMARY KEY (`page_id`)
@@ -31,6 +31,7 @@ impl MonthViews {
         );
         println!("{sql}");
         db.execute(&sql).await?;
+        println!("Table `{}` created (or ignored) successfully", self.table);
         self.table_exists = true;
         Ok(())
     }

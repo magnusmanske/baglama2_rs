@@ -1,11 +1,11 @@
-use crate::baglama2::*;
+use crate::{baglama2::*, DbId};
 use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct RowGroup {
-    id: usize,
+    id: DbId,
     category: String,
-    depth: usize,
+    depth: isize,
     added_by: String,
     just_added: u8,
     is_active: u8,
@@ -17,7 +17,7 @@ impl RowGroup {
     pub fn sql_select() -> String {
         "SELECT id,FROM_BASE64(TO_BASE64(category)),depth,FROM_BASE64(TO_BASE64(added_by)),just_added,is_active,is_user_name FROM `groups`".to_string()
     }
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> DbId {
         self.id
     }
 
@@ -25,7 +25,7 @@ impl RowGroup {
         &self.category
     }
 
-    pub fn depth(&self) -> usize {
+    pub fn depth(&self) -> isize {
         self.depth
     }
 

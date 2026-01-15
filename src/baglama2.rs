@@ -1,5 +1,6 @@
 use crate::row_group::RowGroup;
 use crate::row_group_status::RowGroupStatus;
+use crate::DbId;
 use crate::GroupId;
 use crate::Site;
 use crate::YearMonth;
@@ -125,7 +126,7 @@ impl Baglama2 {
             .iter()
             .filter(|group| non_existing_categories.contains(group.category()))
             .map(|group| group.id())
-            .collect::<Vec<usize>>();
+            .collect::<Vec<DbId>>();
         if groups_to_deactivate.is_empty() {
             return Ok(());
         }
@@ -133,7 +134,7 @@ impl Baglama2 {
         Ok(())
     }
 
-    async fn deactivate_groups(&self, group_ids: &[usize]) -> Result<()> {
+    async fn deactivate_groups(&self, group_ids: &[DbId]) -> Result<()> {
         let placeholders = Baglama2::sql_placeholders(group_ids.len());
         let sql = format!("UPDATE `groups` SET is_active=0 WHERE id IN ({placeholders})");
         self.get_tooldb_conn()
@@ -231,7 +232,10 @@ impl Baglama2 {
         group_id: &GroupId,
         ym: &YearMonth,
     ) -> Result<Option<RowGroupStatus>> {
-        let sql = "SELECT id,group_id,year,month,status,total_views,file,sqlite3 FROM `group_status` WHERE group_id=? AND year=? AND month=?" ;
+        let sql = format!(
+            "SELECT {} FROM `group_status` WHERE group_id=? AND year=? AND month=?",
+            RowGroupStatus::sql_all()
+        );
         let sites: Vec<RowGroupStatus> = self
             .get_tooldb_conn()
             .await?
@@ -321,7 +325,7 @@ impl Baglama2 {
     }
 
     // TESTED
-    async fn find_subcats(&self, root: &Vec<String>, depth: usize) -> Result<Vec<String>> {
+    async fn find_subcats(&self, root: &Vec<String>, depth: isize) -> Result<Vec<String>> {
         let mut depth = depth;
         let mut check = root.to_owned();
         let mut subcats: Vec<String> = vec![];
@@ -356,7 +360,7 @@ impl Baglama2 {
     pub async fn get_pages_in_category(
         &self,
         category: &str,
-        depth: usize,
+        depth: isize,
         namespace: isize,
     ) -> Result<Vec<String>> {
         let category = category.replace(" ", "_");
@@ -394,7 +398,7 @@ impl Baglama2 {
         year: i32,
         month: u32,
         requires_previous_date: bool,
-    ) -> Option<usize> {
+    ) -> Option<DbId> {
         let mut conn = self.get_tooldb_conn().await.ok()?;
         let mut sql = "SELECT id FROM groups WHERE is_active=1".to_string();
         sql += " AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month)";
@@ -407,7 +411,7 @@ impl Baglama2 {
             .exec_iter(sql, mysql_async::params!(year, month))
             .await
             .ok()?
-            .map_and_drop(from_row::<usize>)
+            .map_and_drop(from_row::<DbId>)
             .await
             .ok()?;
         results.first().map(|id| id.to_owned())
@@ -455,6 +459,8 @@ impl Baglama2 {
 
 #[cfg(test)]
 mod tests {
+    use crate::row_group_status::StorageType;
+
     use super::*;
 
     #[test]
@@ -538,6 +544,7 @@ mod tests {
             total_views: Some(2062290),
             file: None,
             sqlite3: Some("/data/project/glamtools/viewdata/202210/782.sqlite3".to_string()),
+            storage: StorageType::Sqlite3,
         });
         let gs = baglama
             .get_group_status(&782.try_into().unwrap(), &YearMonth::new(2022, 10).unwrap())
