@@ -61,7 +61,6 @@ impl FromRow for GlobalImageLinks {
     where
         Self: Sized,
     {
-        // let e = mysql_async::FromRowError(row.clone());
         let ret = Self {
             wiki: row
                 .get(0)
@@ -72,7 +71,6 @@ impl FromRow for GlobalImageLinks {
             page_namespace_id: row
                 .get(2)
                 .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
-            //page_namespace: row.get(3).ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
             page_title: Baglama2::value2opt_string(
                 row.as_ref(4)
                     .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,

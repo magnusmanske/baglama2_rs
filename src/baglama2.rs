@@ -213,6 +213,44 @@ impl Baglama2 {
         }
     }
 
+    /// Updates sites in the tooldb from the Commons database
+    pub async fn update_sites(&self) -> Result<()> {
+        let sites = self.get_sites_from_commons_db().await?;
+        let params = sites
+            .iter()
+            .flat_map(|(server, giu_code, project, language)| [server, giu_code, project, language])
+            .collect::<Vec<_>>();
+
+        let placeholder = "(?,?,?,?)".to_string();
+        let mut placeholders: Vec<String> = Vec::new();
+        placeholders.resize(sites.len(), placeholder);
+        let placeholders = placeholders.join(",");
+
+        let sql = format!(
+            "INSERT IGNORE INTO `sites` (server,giu_code,project,language) VALUES {placeholders}"
+        );
+
+        self.get_tooldb_conn().await?.exec_drop(sql, params).await?;
+        Ok(())
+    }
+
+    async fn get_sites_from_commons_db(&self) -> Result<Vec<(String, String, String, String)>> {
+        let sql = r"SELECT
+        substr(reverse(site_domain),2) as `server`,
+        site_global_key as `giu_code`,
+        site_group as `project`,
+        regexp_replace(substr(reverse(site_domain),2),'\\..*$','') as `language`
+        FROM sites";
+        let sites = self
+            .get_commons_conn()
+            .await?
+            .exec_iter(sql, ())
+            .await?
+            .map_and_drop(from_row::<(String, String, String, String)>)
+            .await?;
+        Ok(sites)
+    }
+
     // TESTED
     pub async fn get_group(&self, group_id: &GroupId) -> Result<Option<RowGroup>> {
         let sql = format!("{} WHERE id={group_id}", RowGroup::sql_select());

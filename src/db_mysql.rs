@@ -7,14 +7,14 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-// use base64::{engine::general_purpose, Engine as _};
 use log::warn;
-use mysql_async::{from_row, from_row_opt, prelude::*};
+use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 const FILES_CHUNK_SIZE: usize = 1000;
+const PAGES_CHUNK_SIZE: usize = 500;
 
 struct PageFile {
     page: Page,
@@ -57,11 +57,10 @@ impl DbMySql {
             .await?;
         self.sites = sites.into_iter().map(|site| (site.id(), site)).collect();
         for site in self.sites.values() {
-            if let Some(wiki) = self.site2wiki(site) {
+            if let Some(wiki) = site.giu_code().to_owned() {
                 self.wiki2site_id.insert(wiki, site.id());
             }
         }
-        println!("Loaded {} sites", self.sites.len());
         Ok(())
     }
 
@@ -140,12 +139,12 @@ impl DbMySql {
             .exec_iter(sql, ())
             .await
             .ok()?
-            .map_and_drop(from_row::<usize>)
+            .map_and_drop(from_row_opt::<usize>)
             .await
             .ok()?;
-        match groups.first().map(|group| group.to_owned()) {
-            Some(id) => GroupId::try_from(id).ok(),
-            None => None,
+        match groups.first().as_ref() {
+            Some(Ok(id)) => GroupId::try_from(*id).ok(),
+            _ => None,
         }
     }
 
@@ -198,6 +197,12 @@ impl DbMySql {
             self.insert_file_pages(&page_files).await?;
         }
 
+        // TODO FIXME
+        if false {
+            self.baglama2()
+                .set_group_status(group_id, &self.ym, "SCANNED", 0, "")
+                .await?;
+        }
         Ok(())
     }
 
@@ -241,7 +246,7 @@ impl DbMySql {
     /// Returns missing files.
     async fn match_existing_files(
         &self,
-        page_files: &mut Vec<PageFile>,
+        page_files: &mut [PageFile],
         files: Vec<String>,
     ) -> Result<Vec<String>> {
         let placeholders = Baglama2::sql_placeholders(files.len());
@@ -260,7 +265,7 @@ impl DbMySql {
             .filter_map(|f| Some((f.name, f.id?)))
             .collect();
         let mut file_to_create = Vec::new();
-        for pf in page_files {
+        for pf in page_files.iter_mut() {
             if pf.file.id.is_none() {
                 match file2id.get(&pf.file.name) {
                     Some(id) => pf.file.id = Some(*id),
@@ -273,9 +278,119 @@ impl DbMySql {
         Ok(file_to_create)
     }
 
-    async fn ensure_pages_exist(&self, page_files: &mut Vec<PageFile>) -> Result<()> {
-        println!("ensure_pages_exist");
-        todo!()
+    async fn ensure_pages_exist(&self, page_files: &mut [PageFile]) -> Result<()> {
+        println!("ensure_pages_exist: INIT {}", page_files.len());
+        let pages = page_files
+            .iter()
+            .map(|pf| pf.page.to_owned())
+            .collect::<Vec<_>>();
+
+        let pages_to_create = self.match_existing_pages(page_files, pages).await?;
+        println!("ensure_pages_exist: CREATE {}", pages_to_create.len());
+        if !pages_to_create.is_empty() {
+            self.create_pages(&pages_to_create).await?;
+            let failed_to_create = self
+                .match_existing_pages(page_files, pages_to_create)
+                .await?;
+            if !failed_to_create.is_empty() {
+                warn!("CAUTION: Failed to create pages: {failed_to_create:?}");
+            }
+        }
+        println!("ensure_pages_exist: DONE {}", page_files.len());
+        Ok(())
+    }
+
+    async fn create_pages(&self, pages: &[Page]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let placeholder = "(?,?,?)".to_string();
+        let mut placeholders: Vec<String> = Vec::new();
+        placeholders.resize(pages.len(), placeholder);
+        let placeholders = placeholders.join(",");
+
+        let params = pages
+            .iter()
+            .flat_map(|p| {
+                [
+                    p.site_id.to_string(),
+                    p.title.to_owned(),
+                    p.namespace_id.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let sql = format!(
+            "INSERT IGNORE INTO `pages` (`site`,`title`,`namespace_id`) VALUES {placeholders}"
+        );
+        println!("Creating {} pages", pages.len());
+        self.baglama2()
+            .get_tooldb_conn()
+            .await?
+            .exec_drop(sql, params)
+            .await?;
+        Ok(())
+    }
+
+    /// Finds existing pages.
+    /// Returns missing pages.
+    async fn match_existing_pages(
+        &self,
+        page_files: &mut [PageFile],
+        all_pages: Vec<Page>,
+    ) -> Result<Vec<Page>> {
+        let mut pages_to_create = Vec::new();
+        for pages in all_pages.chunks(PAGES_CHUNK_SIZE) {
+            let placeholder = "(site=? AND title=? AND namespace_id=?)".to_string();
+            let mut placeholders: Vec<String> = Vec::new();
+            placeholders.resize(pages.len(), placeholder);
+            let placeholders = placeholders.join(" OR ");
+
+            let params = pages
+                .iter()
+                .flat_map(|p| {
+                    [
+                        p.site_id.to_string(),
+                        p.title.to_owned(),
+                        p.namespace_id.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+
+            let sql = format!(
+                "SELECT `id`,`site`,`title`,`namespace_id` FROM `pages` WHERE {placeholders}"
+            );
+            println!("Querying {} pages", pages.len());
+            let page2id: HashMap<(usize, String, i32), DbId> = self
+                .baglama2()
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(sql, &params)
+                .await?
+                .map_and_drop(Page::from_row_opt)
+                .await?
+                .into_iter()
+                .filter_map(|f| f.ok())
+                .filter_map(|f| Some(((f.site_id, f.title, f.namespace_id), f.id?)))
+                .collect();
+            for pf in page_files.iter_mut() {
+                if pf.page.id.is_none() {
+                    let key = (
+                        pf.page.site_id,
+                        pf.page.title.to_owned(),
+                        pf.page.namespace_id,
+                    );
+                    match page2id.get(&key) {
+                        Some(id) => pf.page.id = Some(*id),
+                        None => {
+                            pages_to_create.push(pf.page.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(pages_to_create)
     }
 
     async fn insert_file_pages(&self, page_files: &Vec<PageFile>) -> Result<()> {
@@ -483,12 +598,17 @@ impl DbTrait for DbMySql {
             .await?
             .exec_iter(sql, (group_status_id,))
             .await?
-            .map_and_drop(from_row::<isize>)
+            .map_and_drop(from_row_opt::<isize>)
             .await?
             .first()
             .ok_or_else(|| anyhow!("get_total_views for group_status_id {group_status_id}"))?
             .to_owned();
-        Ok(ret)
+        match ret {
+            Ok(value) => Ok(value),
+            _ => Err(anyhow!(
+                "get_total_views for group_status_id {group_status_id}"
+            )),
+        }
     }
 
     fn create_final_indices(&self) -> Result<()> {
@@ -524,12 +644,11 @@ impl DbTrait for DbMySql {
             .await?
             .exec_iter(sql, ())
             .await?
-            .map_and_drop(from_row::<String>)
-            .await?;
-        // .iter()
-        // .filter_map(|s| general_purpose::STANDARD.decode(s.as_bytes()).ok())
-        // .filter_map(|s| String::from_utf8(s).ok())
-        // .collect();
+            .map_and_drop(from_row_opt::<String>)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(ret)
     }
 

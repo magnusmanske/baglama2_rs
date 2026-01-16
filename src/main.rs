@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
         Some("mysql2") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
+            baglama.update_sites().await?;
             process_mysql2(
                 YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),

@@ -1,4 +1,4 @@
-use crate::DbId;
+use crate::{baglama2::Baglama2, DbId};
 use mysql_async::prelude::*;
 
 pub struct File {
@@ -24,11 +24,16 @@ impl FromRow for File {
     where
         Self: Sized,
     {
+        let title = Baglama2::value2opt_string(
+            row.as_ref(1)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+        )
+        .ok_or_else(|| mysql_async::FromRowError(row.clone()))?;
+
         Ok(Self::new(
             row.get("id")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
-            row.get("title")
-                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            title,
         ))
     }
 }

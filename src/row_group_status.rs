@@ -41,27 +41,27 @@ impl FromRow for RowGroupStatus {
         Self: Sized,
     {
         let storage: String = row
-            .get(8)
+            .get("storage")
             .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?;
         Ok(Self {
             id: row
-                .get(0)
+                .get("id")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             group_id: row
-                .get(1)
+                .get("group_id")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             year: row
-                .get(2)
+                .get("year")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             month: row
-                .get(3)
+                .get("month")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             status: row
-                .get(4)
+                .get("status")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
-            total_views: row.get(5).unwrap(),
-            file: row.get(6).unwrap(),
-            sqlite3: row.get(7).unwrap(),
+            total_views: row.get("total_views").unwrap(),
+            file: row.get("file").unwrap(),
+            sqlite3: row.get("sqlite3").unwrap(),
             storage: storage
                 .as_str()
                 .try_into()

@@ -1,6 +1,8 @@
 // use anyhow::Result;
 use mysql_async::prelude::*;
 
+use crate::baglama2::Baglama2;
+
 #[derive(Debug, Clone)]
 pub struct Page {
     pub id: Option<usize>,
@@ -29,18 +31,22 @@ impl FromRow for Page {
     where
         Self: Sized,
     {
+        let title = Baglama2::value2opt_string(
+            row.as_ref(2)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+        )
+        .ok_or_else(|| mysql_async::FromRowError(row.clone()))?;
+
         Ok(Self {
             id: row
-                .get(0)
+                .get("id")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
             site_id: row
-                .get(1)
+                .get("site")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
-            title: row
-                .get(2)
-                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
+            title,
             namespace_id: row
-                .get(3)
+                .get("namespace_id")
                 .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
         })
     }
