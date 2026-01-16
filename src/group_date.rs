@@ -432,14 +432,14 @@ impl GroupDate {
         db.add_summary_statistics(group_status_id).await
     }
 
-    async fn finalize(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id().await?;
-        let total_views = db.get_total_views(group_status_id).await?;
-        db.create_final_indices()?;
-        let sqlite_filename = db.path_final();
-        self.set_group_status("VIEW DATA COMPLETE", total_views as DbId, sqlite_filename)
-            .await
-    }
+    // async fn finalize(&self, db: &DatabaseType) -> Result<()> {
+    //     let group_status_id = db.get_group_status_id().await?;
+    //     let total_views = db.get_total_views(group_status_id).await?;
+    //     db.create_final_indices()?;
+    //     let sqlite_filename = db.path_final();
+    //     self.set_group_status("VIEW DATA COMPLETE", total_views as DbId, sqlite_filename)
+    //         .await
+    // }
 
     /// Convenience wrapper around Baglama2.set_group_status
     pub async fn set_group_status(

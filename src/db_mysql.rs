@@ -21,6 +21,12 @@ struct PageFile {
     file: File,
 }
 
+impl PageFile {
+    pub fn is_valid(&self) -> bool {
+        self.page.id.is_some() && self.file.id.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DbMySql {
     baglama: Arc<Baglama2>,
@@ -125,9 +131,9 @@ impl DbMySql {
         Ok(files)
     }
 
-    async fn get_next_group_id_to_process(&self) -> Option<GroupId> {
+    async fn get_next_group_id_to_process(&self) -> Option<(DbId, GroupId)> {
         let sql = format!(
-	        "SELECT group_id FROM `group_status` WHERE `year`={} AND `month`={} AND `status`='STARTED' LIMIT 1",
+	        "SELECT id,group_id FROM `group_status` WHERE `year`={} AND `month`={} AND `status`='STARTED' LIMIT 1",
 	        self.ym.year(),
 	        self.ym.month()
 	    );
@@ -139,11 +145,15 @@ impl DbMySql {
             .exec_iter(sql, ())
             .await
             .ok()?
-            .map_and_drop(from_row_opt::<usize>)
+            .map_and_drop(from_row_opt::<(usize, usize)>)
             .await
             .ok()?;
         match groups.first().as_ref() {
-            Some(Ok(id)) => GroupId::try_from(*id).ok(),
+            Some(Ok((id, group_id))) => {
+                let id = *id;
+                let group_id = GroupId::try_from(*group_id).ok()?;
+                Some((id, group_id))
+            }
             _ => None,
         }
     }
@@ -151,7 +161,7 @@ impl DbMySql {
     pub async fn add_pages(&self) -> Result<()> {
         loop {
             println!("Looking for next group");
-            let group_id = match self.get_next_group_id_to_process().await {
+            let (group_status_id, group_id) = match self.get_next_group_id_to_process().await {
                 Some(id) => id,
                 None => break,
             };
@@ -159,7 +169,8 @@ impl DbMySql {
             let files = self.get_files_for_group(group_id).await?;
             println!("Group ID: {}", group_id);
             println!("Files: {}", files.len());
-            self.add_files_and_pages_for_group(&files, group_id).await?;
+            self.add_files_and_pages_for_group(&files, group_id, group_status_id)
+                .await?;
             // TODO mark group_id AS scanned
         }
         todo!()
@@ -169,6 +180,7 @@ impl DbMySql {
         &self,
         all_files: &[String],
         group_id: GroupId,
+        group_status_id: DbId,
     ) -> Result<()> {
         if all_files.is_empty() {
             return Ok(());
@@ -194,19 +206,17 @@ impl DbMySql {
             println!("{} page_files", page_files.len());
             self.ensure_files_exist(&mut page_files).await?;
             self.ensure_pages_exist(&mut page_files).await?;
-            self.insert_file_pages(&page_files).await?;
+            self.insert_file_pages(&page_files, group_status_id).await?;
         }
 
-        // TODO FIXME
-        if false {
-            self.baglama2()
-                .set_group_status(group_id, &self.ym, "SCANNED", 0, "")
-                .await?;
-        }
-        Ok(())
+        self.baglama2()
+            .set_group_status(group_id, &self.ym, "SCANNED", 0, "")
+            .await?;
+        todo!()
+        // Ok(())
     }
 
-    async fn ensure_files_exist(&self, page_files: &mut Vec<PageFile>) -> Result<()> {
+    async fn ensure_files_exist(&self, page_files: &mut [PageFile]) -> Result<()> {
         println!("ensure_files_exist: INIT {}", page_files.len());
         let files = page_files
             .iter()
@@ -300,36 +310,38 @@ impl DbMySql {
         Ok(())
     }
 
-    async fn create_pages(&self, pages: &[Page]) -> Result<()> {
-        if pages.is_empty() {
+    async fn create_pages(&self, all_pages: &[Page]) -> Result<()> {
+        if all_pages.is_empty() {
             return Ok(());
         }
 
-        let placeholder = "(?,?,?)".to_string();
-        let mut placeholders: Vec<String> = Vec::new();
-        placeholders.resize(pages.len(), placeholder);
-        let placeholders = placeholders.join(",");
+        for pages in all_pages.chunks(2000) {
+            let placeholder = "(?,?,?)".to_string();
+            let mut placeholders: Vec<String> = Vec::new();
+            placeholders.resize(pages.len(), placeholder);
+            let placeholders = placeholders.join(",");
 
-        let params = pages
-            .iter()
-            .flat_map(|p| {
-                [
-                    p.site_id.to_string(),
-                    p.title.to_owned(),
-                    p.namespace_id.to_string(),
-                ]
-            })
-            .collect::<Vec<_>>();
+            let params = pages
+                .iter()
+                .flat_map(|p| {
+                    [
+                        p.site_id.to_string(),
+                        p.title.to_owned(),
+                        p.namespace_id.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
 
-        let sql = format!(
-            "INSERT IGNORE INTO `pages` (`site`,`title`,`namespace_id`) VALUES {placeholders}"
-        );
-        println!("Creating {} pages", pages.len());
-        self.baglama2()
-            .get_tooldb_conn()
-            .await?
-            .exec_drop(sql, params)
-            .await?;
+            let sql = format!(
+                "INSERT IGNORE INTO `pages` (`site`,`title`,`namespace_id`) VALUES {placeholders}"
+            );
+            println!("Creating {} pages", pages.len());
+            self.baglama2()
+                .get_tooldb_conn()
+                .await?
+                .exec_drop(sql, params)
+                .await?;
+        }
         Ok(())
     }
 
@@ -393,8 +405,43 @@ impl DbMySql {
         Ok(pages_to_create)
     }
 
-    async fn insert_file_pages(&self, page_files: &Vec<PageFile>) -> Result<()> {
-        todo!()
+    async fn insert_file_pages(
+        &self,
+        all_page_files: &[PageFile],
+        group_status_id: usize,
+    ) -> Result<()> {
+        // let invalid_pages = page_files
+        //     .iter()
+        //     .filter(|pf| !pf.is_valid())
+        //     .collect::<Vec<_>>();
+        // println!(
+        //     "{} total, {} invalid",
+        //     page_files.len(),
+        //     invalid_pages.len()
+        // );
+        for page_files in all_page_files.chunks(PAGES_CHUNK_SIZE) {
+            let params = page_files
+                .iter()
+                .filter(|pf| pf.is_valid())
+                .flat_map(|pf| [group_status_id, pf.file.id.unwrap(), pf.page.id.unwrap()])
+                .collect::<Vec<_>>();
+            let placeholders = page_files
+                .iter()
+                .map(|_| "(?,?,?)".to_string())
+                .collect::<Vec<String>>()
+                .join(",");
+
+            let sql = format!(
+                "INSERT IGNORE INTO {} (group_status_id, file_id, page_id) VALUES {placeholders}",
+                self.table_name()
+            );
+            self.baglama
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(sql, params)
+                .await?;
+        }
+        Ok(())
     }
 
     fn get_site_for_wiki(&self, wiki: &str) -> Option<&Site> {
@@ -421,19 +468,19 @@ impl DbMySql {
         format!("viewdata_{:04}_{:02}", self.ym.year(), self.ym.month())
     }
 
-    fn site2wiki(&self, site: &Site) -> Option<String> {
-        let (language, project) = match (site.language(), site.project()) {
-            (Some(l), Some(p)) => (l, p),
-            _ => return None,
-        };
-        if language == "commons" {
-            Some("commonswiki".to_string())
-        } else if project == "wikipedia" {
-            Some(format!("{}wiki", language))
-        } else {
-            Some(format!("{}{}", language, project))
-        }
-    }
+    // fn site2wiki(&self, site: &Site) -> Option<String> {
+    //     let (language, project) = match (site.language(), site.project()) {
+    //         (Some(l), Some(p)) => (l, p),
+    //         _ => return None,
+    //     };
+    //     if language == "commons" {
+    //         Some("commonswiki".to_string())
+    //     } else if project == "wikipedia" {
+    //         Some(format!("{}wiki", language))
+    //     } else {
+    //         Some(format!("{}{}", language, project))
+    //     }
+    // }
 
     /// Used for internal testing only
     fn _as_test(self) -> Self {

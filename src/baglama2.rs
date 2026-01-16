@@ -216,20 +216,25 @@ impl Baglama2 {
     /// Updates sites in the tooldb from the Commons database
     pub async fn update_sites(&self) -> Result<()> {
         let sites = self.get_sites_from_commons_db().await?;
+        self.ensure_sites_in_tooldb(sites).await?;
+        Ok(())
+    }
+
+    async fn ensure_sites_in_tooldb(
+        &self,
+        sites: Vec<(String, String, String, String)>,
+    ) -> Result<()> {
         let params = sites
             .iter()
             .flat_map(|(server, giu_code, project, language)| [server, giu_code, project, language])
             .collect::<Vec<_>>();
-
         let placeholder = "(?,?,?,?)".to_string();
         let mut placeholders: Vec<String> = Vec::new();
         placeholders.resize(sites.len(), placeholder);
         let placeholders = placeholders.join(",");
-
         let sql = format!(
             "INSERT IGNORE INTO `sites` (server,giu_code,project,language) VALUES {placeholders}"
         );
-
         self.get_tooldb_conn().await?.exec_drop(sql, params).await?;
         Ok(())
     }
