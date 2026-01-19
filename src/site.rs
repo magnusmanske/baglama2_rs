@@ -1,10 +1,10 @@
-use crate::Baglama2;
+use crate::{Baglama2, DbId};
 use anyhow::Result;
 use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Site {
-    id: usize,
+    id: DbId,
     grok_code: Option<String>,
     server: Option<String>,
     giu_code: Option<String>,
@@ -15,8 +15,9 @@ pub struct Site {
 
 impl Site {
     pub fn from_sqlite_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+        let id: isize = row.get(0)?;
         Ok(Self {
-            id: row.get(0)?,
+            id: id as DbId,
             grok_code: row.get(1)?,
             server: row.get(2)?,
             giu_code: row.get(3)?,
@@ -26,7 +27,7 @@ impl Site {
         })
     }
 
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> DbId {
         self.id
     }
 

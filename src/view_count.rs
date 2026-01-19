@@ -1,28 +1,30 @@
 use mysql_async::prelude::*;
 
-use crate::Baglama2;
+use crate::{Baglama2, DbId};
 
 #[derive(Debug, Clone)]
 pub struct ViewCount {
-    pub view_id: usize,
+    pub view_id: DbId,
     pub title: String,
     pub namespace_id: i32,
     pub grok_code: Option<String>,
     pub server: Option<String>,
     pub done: i8,
-    pub site_id: usize,
+    pub site_id: DbId,
 }
 
 impl ViewCount {
     pub fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+        let view_id: isize = row.get(0)?;
+        let site_id: isize = row.get(6)?;
         Ok(Self {
-            view_id: row.get(0)?,
+            view_id: view_id as DbId,
             title: row.get(1)?,
             namespace_id: row.get(2)?,
             grok_code: row.get(3)?,
             server: row.get(4)?,
             done: row.get(5)?,
-            site_id: row.get(6)?,
+            site_id: site_id as DbId,
         })
     }
 }

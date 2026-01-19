@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
+use crate::db_mysql::DbMySql;
+
+pub type DbId = usize;
+
 /* TODO
 2023-09
 2023-10
@@ -30,15 +34,18 @@ pub mod baglama2;
 pub mod db_mysql;
 pub mod db_sqlite;
 pub mod db_trait;
+pub mod file;
 pub mod global_image_links;
 pub mod group_date;
+pub mod month_views;
+pub mod page;
 pub mod row_group;
 pub mod row_group_status;
 pub mod site;
 pub mod view_count;
 pub mod year_month;
 
-pub type GroupId = NonZero<usize>;
+pub type GroupId = NonZero<DbId>;
 
 /*
 ssh magnus@tools-login.wmflabs.org -L 3307:commonswiki.web.db.svc.eqiad.wmflabs:3306 -N &
@@ -146,6 +153,14 @@ async fn process_all_groups(
     Ok(())
 }
 
+async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
+    let db = DbMySql::new(ym, baglama.clone()).await?;
+    db.start_missing_groups().await?;
+    db.ensure_table_exists().await?;
+    db.add_pages().await?;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     log::set_max_level(LevelFilter::Trace);
@@ -155,10 +170,20 @@ async fn main() -> Result<()> {
     let baglama = Arc::new(Baglama2::new().await?);
     baglama.deactivate_nonexistent_categories().await?;
     match argv.get(1).map(|s| s.as_str()) {
-        Some("run") => {
+        Some("mysql2") => {
+            let year = year(argv.get(2));
+            let month = month(argv.get(3));
+            baglama.update_sites().await?;
+            process_mysql2(
+                YearMonth::new(year, month).expect("bad year/month"),
+                baglama.clone(),
+            )
+            .await?;
+        }
+        Some("_run") => {
             let group_id = argv
                 .get(2)
-                .map(|s| s.parse::<usize>().expect("bad group ID"))
+                .map(|s| s.parse::<DbId>().expect("bad group ID"))
                 .expect("Group ID expected");
             let year = year(argv.get(3));
             let month = month(argv.get(4));
@@ -168,9 +193,10 @@ async fn main() -> Result<()> {
                 baglama.clone(),
             );
             let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
-            gd.create_sqlite().await?;
+            gd.create_mysql2().await?;
+            // gd.create_sqlite().await?;
         }
-        Some("next") => {
+        Some("_next") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
             if let Some(group_id) = baglama.get_next_group_id(year, month, false).await {
@@ -185,7 +211,7 @@ async fn main() -> Result<()> {
                 info!("No more groups for {year}/{month}");
             }
         }
-        Some("next_all_seq") => {
+        Some("_next_all_seq") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
             if argv.get(4).is_none() {
@@ -213,12 +239,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some("next_all") => {
+        Some("_next_all") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
             process_all_groups(year, month, baglama.clone(), false).await?;
         }
-        Some("backfill") => {
+        Some("_backfill") => {
             let mut year = year(argv.get(2));
             let mut month = month(argv.get(3));
             let current_year = chrono::Utc::now().year();
@@ -236,7 +262,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some("test") => {
+        Some("_test") => {
             let current_month = chrono::Utc::now().month();
             info!("{current_month}");
         }

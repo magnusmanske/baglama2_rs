@@ -1,4 +1,5 @@
 use crate::baglama2::*;
+use crate::DbId;
 use futures::prelude::*;
 // use crate::db_sqlite::DbSqlite as DatabaseType;
 use crate::db_mysql::DbMySql as DatabaseType;
@@ -31,11 +32,11 @@ pub struct ViewsTodo {
     title: String,
     first_day: String,
     last_day: String,
-    view_id: usize,
+    view_id: DbId,
 }
 
 impl ViewsTodo {
-    pub fn new(server: &str, title: &str, first_day: &str, last_day: &str, view_id: usize) -> Self {
+    pub fn new(server: &str, title: &str, first_day: &str, last_day: &str, view_id: DbId) -> Self {
         Self {
             server: server.to_string(),
             title: title.to_string(),
@@ -50,8 +51,8 @@ impl ViewsTodo {
 pub struct GroupDate {
     group_id: GroupId,
     ym: YearMonth,
-    sites: HashMap<usize, Site>,
-    wiki2site_id: HashMap<String, usize>,
+    sites: HashMap<DbId, Site>,
+    wiki2site_id: HashMap<String, DbId>,
     baglama: Arc<Baglama2>,
 }
 
@@ -105,7 +106,7 @@ impl GroupDate {
     async fn get_files_from_commons_category_tree(
         &self,
         category: &str,
-        depth: usize,
+        depth: isize,
     ) -> Result<Vec<String>> {
         self.baglama.get_pages_in_category(category, depth, 6).await
     }
@@ -141,7 +142,7 @@ impl GroupDate {
         }
 
         let batch_size = db.file_insert_batch_size();
-        for batch in files.chunks(batch_size) {
+        for batch in files.chunks(batch_size as usize) {
             db.insert_files_batch(batch).await?;
         }
 
@@ -202,7 +203,7 @@ impl GroupDate {
                 let year = self.ym().year();
                 let done = 0;
                 let namespace_id = gil.page_namespace_id;
-                let page_id = gil.page;
+                let page_id = gil.page as DbId;
                 let views = 0;
 
                 let sql_value =
@@ -317,9 +318,8 @@ impl GroupDate {
         let stream = futures::stream::iter(futures).buffered(API_CALLS_IN_PARALLEL);
         let results = stream.collect::<Vec<_>>().await;
         for (view_count, vt) in results.into_iter().zip(views_todo.iter()) {
-            let _ = db
-                .update_view_count(vt.view_id, view_count.unwrap_or(0))
-                .await;
+            let view_id = view_count.unwrap_or(0) as i64;
+            let _ = db.update_view_count(vt.view_id, view_id).await;
         }
 
         // for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
@@ -432,14 +432,14 @@ impl GroupDate {
         db.add_summary_statistics(group_status_id).await
     }
 
-    async fn finalize(&self, db: &DatabaseType) -> Result<()> {
-        let group_status_id = db.get_group_status_id().await?;
-        let total_views = db.get_total_views(group_status_id).await?;
-        db.create_final_indices()?;
-        let sqlite_filename = db.path_final();
-        self.set_group_status("VIEW DATA COMPLETE", total_views, sqlite_filename)
-            .await
-    }
+    // async fn finalize(&self, db: &DatabaseType) -> Result<()> {
+    //     let group_status_id = db.get_group_status_id().await?;
+    //     let total_views = db.get_total_views(group_status_id).await?;
+    //     db.create_final_indices()?;
+    //     let sqlite_filename = db.path_final();
+    //     self.set_group_status("VIEW DATA COMPLETE", total_views as DbId, sqlite_filename)
+    //         .await
+    // }
 
     /// Convenience wrapper around Baglama2.set_group_status
     pub async fn set_group_status(
@@ -459,21 +459,33 @@ impl GroupDate {
             .await
     }
 
+    pub async fn create_mysql2(&mut self) -> Result<()> {
+        todo!()
+        // let _mv = crate::month_views::MonthViews::new(self.ym().to_owned());
+        // let db = crate::db_mysql::DbMySql::new(self, self.baglama.clone())?;
+        // debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
+        // db.initialize().await?;
+        // debug!("{}-{}: add_files", self.group_id, self.ym);
+        // // self.add_files(&db).await?;
+        // Ok(())
+    }
+
     pub async fn create_sqlite(&mut self) -> Result<()> {
-        let db = DatabaseType::new(self, self.baglama.clone())?;
-        debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
-        db.initialize().await?;
-        debug!("{}-{}: add_files", self.group_id, self.ym);
-        self.add_files(&db).await?;
-        debug!("{}-{}: add_pages", self.group_id, self.ym);
-        self.add_pages(&db).await?;
-        debug!("{}-{}: add_view_counts", self.group_id, self.ym);
-        self.add_view_counts(&db).await?;
-        debug!("{}-{}: finalize_sqlite", self.group_id, self.ym);
-        self.finalize(&db).await?;
-        debug!("{}-{}: done!", self.group_id, self.ym);
-        db.finalize().await?;
-        Ok(())
+        todo!()
+        // let db = DatabaseType::new(self, self.baglama.clone())?;
+        // debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
+        // db.initialize().await?;
+        // debug!("{}-{}: add_files", self.group_id, self.ym);
+        // self.add_files(&db).await?;
+        // debug!("{}-{}: add_pages", self.group_id, self.ym);
+        // self.add_pages(&db).await?;
+        // debug!("{}-{}: add_view_counts", self.group_id, self.ym);
+        // self.add_view_counts(&db).await?;
+        // debug!("{}-{}: finalize_sqlite", self.group_id, self.ym);
+        // self.finalize(&db).await?;
+        // debug!("{}-{}: done!", self.group_id, self.ym);
+        // db.finalize().await?;
+        // Ok(())
     }
 
     fn get_reqwest_client() -> Arc<reqwest::Client> {
