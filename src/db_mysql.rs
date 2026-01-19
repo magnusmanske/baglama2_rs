@@ -192,7 +192,8 @@ impl DbMySql {
         }
         // let mut futures = Vec::new();
         for files in all_files.chunks(FILES_CHUNK_SIZE) {
-            self.add_files_and_pages_for_group_chunks(group_status_id, files);
+            self.add_files_and_pages_for_group_chunks(group_status_id, files)
+                .await?;
             // futures.push(self.add_files_and_pages_for_group_chunks(group_status_id, files));
         }
         // try_join_all(futures).await?;
