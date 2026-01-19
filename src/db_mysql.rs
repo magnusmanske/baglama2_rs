@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use futures::future::try_join_all;
+// use futures::future::try_join_all;
 use log::warn;
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
@@ -190,11 +190,12 @@ impl DbMySql {
         if all_files.is_empty() {
             return Ok(());
         }
-        let mut futures = Vec::new();
+        // let mut futures = Vec::new();
         for files in all_files.chunks(FILES_CHUNK_SIZE) {
-            futures.push(self.add_files_and_pages_for_group_chunks(group_status_id, files));
+            self.add_files_and_pages_for_group_chunks(group_status_id, files);
+            // futures.push(self.add_files_and_pages_for_group_chunks(group_status_id, files));
         }
-        try_join_all(futures).await?;
+        // try_join_all(futures).await?;
         self.baglama2()
             .set_group_status(group_id, &self.ym, "SCANNED", 0, "")
             .await?;
