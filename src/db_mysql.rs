@@ -8,14 +8,16 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 // use futures::future::try_join_all;
-use log::warn;
-use mysql_async::{from_row_opt, prelude::*};
+use log::{error, warn};
+use mysql_async::{from_row, from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::Mutex;
+use tools_interface::{Pageviews, PageviewsAccess, PageviewsAgent, PageviewsGranularity};
 
 const FILES_CHUNK_SIZE: usize = 1000;
 const PAGES_CHUNK_SIZE: usize = 500;
@@ -54,6 +56,104 @@ impl DbMySql {
         };
         ret.initialize_sites().await?;
         Ok(ret)
+    }
+
+    pub async fn load_missing_views(&self) -> Result<()> {
+        let table_name = self.table_name();
+        let pv = Pageviews::new(
+            PageviewsGranularity::Monthly, // Get monthly views
+            PageviewsAccess::All,          // Get all-access views
+            PageviewsAgent::User,          // Get views from humans only
+        );
+        let sql = format!(
+            "SELECT vd.id,`server`,`title`
+			        FROM {table_name} AS vd,pages,sites
+			        WHERE page_views IS NULL
+			        AND pages_id=pages.id
+			        AND pages.site=sites.id
+			        LIMIT 100"
+        );
+        loop {
+            // Get next 100 rows with missing view data from database
+            let rows = self
+                .baglama
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(&sql, ())
+                .await?
+                .map_and_drop(from_row::<(usize, String, String)>)
+                .await?;
+            if rows.is_empty() {
+                // All done
+                break;
+            }
+
+            // Prepare getting view data from API
+            let page2id = rows
+                .into_iter()
+                .filter_map(|(id, server, title)| {
+                    let title_with_underscores = title.replace(' ', "_");
+                    let project = server.strip_suffix(".org")?.to_string();
+                    Some(((project, title_with_underscores), id))
+                })
+                .collect::<HashMap<(String, String), usize>>();
+            let project_pages = page2id.keys().cloned().collect::<Vec<_>>();
+
+            // Get view data from API
+            let results = pv
+                .get_multiple_articles(
+                    &project_pages,
+                    &Pageviews::month_start(2016, 1).unwrap(),
+                    &Pageviews::month_end(2016, 12).unwrap(),
+                    5,
+                )
+                .await;
+            let results = match results {
+                Ok(results) => results,
+                Err(e) => {
+                    error!("Error getting pageviews: {}. Waiting 5 seconds.", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            // Map results back to viewdata_*.id
+            let mut id2views: HashMap<usize, u64> = page2id.values().map(|id| (*id, 0)).collect();
+            for result in results {
+                let project = result.project.to_owned();
+                let page = result.article.to_owned();
+                let key = (project, page);
+                match page2id.get(&key) {
+                    Some(id) => {
+                        id2views.insert(*id, result.total_views());
+                    }
+                    None => {
+                        error!("Page not found: {:?}", key);
+                    }
+                }
+            }
+
+            // Construct SQL query
+            let ids = id2views
+                .keys()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = id2views
+                .into_iter()
+                .map(|(id, views)| format!("WHEN {id} THEN {views}"))
+                .collect::<Vec<String>>()
+                .join("\n");
+            let sql = format!("UPDATE {table_name} SET page_views = CASE id {sql} ELSE page_views END WHERE id IN ({ids})");
+
+            // Update page_views column
+            self.baglama2()
+                .get_tooldb_conn()
+                .await?
+                .exec_drop(sql, ())
+                .await?;
+        }
+        Ok(())
     }
 
     async fn initialize_sites(&mut self) -> Result<()> {

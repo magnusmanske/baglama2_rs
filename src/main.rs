@@ -161,6 +161,13 @@ async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
     Ok(())
 }
 
+async fn process_mysql2_views(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
+    let db = DbMySql::new(ym, baglama.clone()).await?;
+    db.ensure_table_exists().await?;
+    db.load_missing_views().await?;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     log::set_max_level(LevelFilter::Trace);
@@ -175,6 +182,16 @@ async fn main() -> Result<()> {
             let month = month(argv.get(3));
             baglama.update_sites().await?;
             process_mysql2(
+                YearMonth::new(year, month).expect("bad year/month"),
+                baglama.clone(),
+            )
+            .await?;
+        }
+        Some("mysql2_views") => {
+            let year = year(argv.get(2));
+            let month = month(argv.get(3));
+            baglama.update_sites().await?;
+            process_mysql2_views(
                 YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),
             )
