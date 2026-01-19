@@ -314,9 +314,9 @@ impl Baglama2 {
 
     // TESTED
     pub fn sql_placeholders(num: usize) -> String {
-        let mut placeholders: Vec<String> = Vec::new();
-        placeholders.resize(num, "?".to_string());
-        placeholders.join(",")
+        let mut placeholders = "?,".repeat(num);
+        placeholders.pop();
+        placeholders
     }
 
     async fn query_commons_repeat(

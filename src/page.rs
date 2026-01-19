@@ -3,7 +3,7 @@ use mysql_async::prelude::*;
 
 use crate::baglama2::Baglama2;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Page {
     pub id: Option<usize>,
     pub site_id: usize,

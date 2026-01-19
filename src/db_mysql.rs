@@ -7,14 +7,19 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::future::try_join_all;
 use log::warn;
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 const FILES_CHUNK_SIZE: usize = 1000;
 const PAGES_CHUNK_SIZE: usize = 500;
+const MATCH_EXISTING_FILES_CHUNK_SIZE: usize = 10000;
 
 struct PageFile {
     page: Page,
@@ -171,9 +176,9 @@ impl DbMySql {
             println!("Files: {}", files.len());
             self.add_files_and_pages_for_group(&files, group_id, group_status_id)
                 .await?;
-            // TODO mark group_id AS scanned
         }
-        todo!()
+        // TODO views
+        Ok(())
     }
 
     async fn add_files_and_pages_for_group(
@@ -185,70 +190,88 @@ impl DbMySql {
         if all_files.is_empty() {
             return Ok(());
         }
-
+        let mut futures = Vec::new();
         for files in all_files.chunks(FILES_CHUNK_SIZE) {
-            let globalimagelinks = GlobalImageLinks::load(files, self.baglama2()).await?;
-            println!("{} globalimagelinks", globalimagelinks.len());
-            let mut page_files = Vec::new();
-            for gil in &globalimagelinks {
-                let site = match self.get_site_for_wiki(&gil.wiki) {
-                    Some(site) => site,
-                    None => {
-                        println!("add_views_for_files: Unknown wiki: {}", &gil.wiki);
-                        continue;
-                    }
-                };
-
-                let file = File::new_no_id(&gil.to);
-                let page = Page::new(site.id(), gil.page_title.to_owned(), gil.page_namespace_id);
-                page_files.push(PageFile { page, file });
-            }
-            println!("{} page_files", page_files.len());
-            self.ensure_files_exist(&mut page_files).await?;
-            self.ensure_pages_exist(&mut page_files).await?;
-            self.insert_file_pages(&page_files, group_status_id).await?;
+            futures.push(self.add_files_and_pages_for_group_chunks(group_status_id, files));
         }
-
+        try_join_all(futures).await?;
         self.baglama2()
             .set_group_status(group_id, &self.ym, "SCANNED", 0, "")
             .await?;
-        todo!()
-        // Ok(())
+        Ok(())
+    }
+
+    async fn add_files_and_pages_for_group_chunks(
+        &self,
+        group_status_id: usize,
+        files: &[String],
+    ) -> Result<()> {
+        let globalimagelinks = GlobalImageLinks::load(files, self.baglama2()).await?;
+        let mut page_files = Vec::new();
+        for gil in &globalimagelinks {
+            let site = match self.get_site_for_wiki(&gil.wiki) {
+                Some(site) => site,
+                None => {
+                    println!("add_views_for_files: Unknown wiki: {}", &gil.wiki);
+                    continue;
+                }
+            };
+
+            let file = File::new_no_id(&gil.to);
+            let page = Page::new(site.id(), gil.page_title.to_owned(), gil.page_namespace_id);
+            page_files.push(PageFile { page, file });
+        }
+        self.ensure_files_exist(&mut page_files).await?;
+        self.ensure_pages_exist(&mut page_files).await?;
+        self.insert_file_pages(&page_files, group_status_id).await?;
+        Ok(())
     }
 
     async fn ensure_files_exist(&self, page_files: &mut [PageFile]) -> Result<()> {
-        println!("ensure_files_exist: INIT {}", page_files.len());
         let files = page_files
             .iter()
             .map(|pf| pf.file.name.to_owned())
             .collect::<Vec<_>>();
 
         let files_to_create = self.match_existing_files(page_files, files).await?;
-        println!("ensure_files_exist: CREATE {}", files_to_create.len());
-        if !files_to_create.is_empty() {
-            self.create_files(&files_to_create).await?;
-            let failed_to_create = self
-                .match_existing_files(page_files, files_to_create)
-                .await?;
-            if !failed_to_create.is_empty() {
-                warn!("CAUTION: Failed to create files: {failed_to_create:?}");
-            }
+        if files_to_create.is_empty() {
+            return Ok(());
         }
-        println!("ensure_files_exist: DONE {}", page_files.len());
+        self.create_files(&files_to_create).await?;
+        let failed_to_create = self
+            .match_existing_files(page_files, files_to_create)
+            .await?;
+        if !failed_to_create.is_empty() {
+            warn!("CAUTION: Failed to create files: {failed_to_create:?}");
+        }
         Ok(())
     }
 
-    async fn create_files(&self, files: &Vec<String>) -> Result<()> {
-        let mut placeholders: Vec<String> = Vec::new();
-        placeholders.resize(files.len(), "(?)".to_string());
-        let placeholders = placeholders.join(",");
-        let sql = format!("INSERT IGNORE INTO `files` (`name`) VALUES {placeholders}");
-        println!("Creating {} files", files.len());
-        self.baglama2()
-            .get_tooldb_conn()
-            .await?
-            .exec_drop(sql, files)
-            .await?;
+    /// Returns a string of placeholders for SQL queries.
+    /// s is the string to repeat, including final comma, which will be removed.
+    /// Returns an error is count is 0.
+    fn get_placeholders(s: &str, count: usize) -> Result<String> {
+        if count == 0 {
+            return Err(anyhow!("Asking for 0 repeats of {s}"));
+        }
+        let mut placeholders = s.repeat(count);
+        placeholders.pop();
+        Ok(placeholders)
+    }
+
+    async fn create_files(&self, all_files: &[String]) -> Result<()> {
+        if all_files.is_empty() {
+            return Ok(());
+        }
+        for files in all_files.chunks(1000) {
+            let placeholders = Self::get_placeholders("(?),", files.len())?;
+            let sql = format!("INSERT IGNORE INTO `files` (`name`) VALUES {placeholders}");
+            self.baglama2()
+                .get_tooldb_conn()
+                .await?
+                .exec_drop(sql, files.to_owned())
+                .await?;
+        }
         Ok(())
     }
 
@@ -257,30 +280,34 @@ impl DbMySql {
     async fn match_existing_files(
         &self,
         page_files: &mut [PageFile],
-        files: Vec<String>,
+        mut all_files: Vec<String>,
     ) -> Result<Vec<String>> {
-        let placeholders = Baglama2::sql_placeholders(files.len());
-        let sql = format!("SELECT `id`,`name` FROM `files` WHERE `name` IN ({placeholders})");
-        println!("Querying {} files", files.len());
-        let file2id: HashMap<String, DbId> = self
-            .baglama2()
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, &files)
-            .await?
-            .map_and_drop(File::from_row_opt)
-            .await?
-            .into_iter()
-            .filter_map(|f| f.ok())
-            .filter_map(|f| Some((f.name, f.id?)))
-            .collect();
+        all_files.sort();
+        all_files.dedup();
         let mut file_to_create = Vec::new();
-        for pf in page_files.iter_mut() {
-            if pf.file.id.is_none() {
-                match file2id.get(&pf.file.name) {
-                    Some(id) => pf.file.id = Some(*id),
-                    None => {
-                        file_to_create.push(pf.file.name.to_owned());
+        for files in all_files.chunks(MATCH_EXISTING_FILES_CHUNK_SIZE) {
+            let files = files.iter().collect::<Vec<_>>();
+            let placeholders = Self::get_placeholders("?,", files.len())?;
+            let sql = format!("SELECT `id`,`name` FROM `files` WHERE `name` IN ({placeholders})");
+            let file2id: HashMap<String, DbId> = self
+                .baglama2()
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(sql, &files)
+                .await?
+                .map_and_drop(File::from_row_opt)
+                .await?
+                .into_iter()
+                .filter_map(|f| f.ok())
+                .filter_map(|f| Some((f.name, f.id?)))
+                .collect();
+            for pf in page_files.iter_mut() {
+                if pf.file.id.is_none() {
+                    match file2id.get(&pf.file.name) {
+                        Some(id) => pf.file.id = Some(*id),
+                        None => {
+                            file_to_create.push(pf.file.name.to_owned());
+                        }
                     }
                 }
             }
@@ -289,14 +316,14 @@ impl DbMySql {
     }
 
     async fn ensure_pages_exist(&self, page_files: &mut [PageFile]) -> Result<()> {
-        println!("ensure_pages_exist: INIT {}", page_files.len());
         let pages = page_files
             .iter()
             .map(|pf| pf.page.to_owned())
             .collect::<Vec<_>>();
 
-        let pages_to_create = self.match_existing_pages(page_files, pages).await?;
-        println!("ensure_pages_exist: CREATE {}", pages_to_create.len());
+        let pages_to_create = self
+            .match_existing_pages(page_files, pages.to_owned())
+            .await?;
         if !pages_to_create.is_empty() {
             self.create_pages(&pages_to_create).await?;
             let failed_to_create = self
@@ -306,7 +333,6 @@ impl DbMySql {
                 warn!("CAUTION: Failed to create pages: {failed_to_create:?}");
             }
         }
-        println!("ensure_pages_exist: DONE {}", page_files.len());
         Ok(())
     }
 
@@ -314,34 +340,39 @@ impl DbMySql {
         if all_pages.is_empty() {
             return Ok(());
         }
-
+        // let mut futures = vec![];
         for pages in all_pages.chunks(2000) {
-            let placeholder = "(?,?,?)".to_string();
-            let mut placeholders: Vec<String> = Vec::new();
-            placeholders.resize(pages.len(), placeholder);
-            let placeholders = placeholders.join(",");
-
-            let params = pages
-                .iter()
-                .flat_map(|p| {
-                    [
-                        p.site_id.to_string(),
-                        p.title.to_owned(),
-                        p.namespace_id.to_string(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-
-            let sql = format!(
-                "INSERT IGNORE INTO `pages` (`site`,`title`,`namespace_id`) VALUES {placeholders}"
-            );
-            println!("Creating {} pages", pages.len());
-            self.baglama2()
-                .get_tooldb_conn()
-                .await?
-                .exec_drop(sql, params)
-                .await?;
+            self.create_page_chunks(pages).await?;
+            // let future = self.create_page_chunks(pages);
+            // futures.push(future);
         }
+        // try_join_all(futures).await?;
+        Ok(())
+    }
+
+    async fn create_page_chunks(&self, pages: &[Page]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let placeholders = Self::get_placeholders("(?,?,?),", pages.len())?;
+        let params = pages
+            .iter()
+            .flat_map(|p| {
+                [
+                    p.site_id.to_string(),
+                    p.title.to_owned(),
+                    p.namespace_id.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "INSERT IGNORE INTO `pages` (`site`,`title`,`namespace_id`) VALUES {placeholders}"
+        );
+        self.baglama2()
+            .get_tooldb_conn()
+            .await?
+            .exec_drop(sql, params)
+            .await?;
         Ok(())
     }
 
@@ -352,7 +383,7 @@ impl DbMySql {
         page_files: &mut [PageFile],
         all_pages: Vec<Page>,
     ) -> Result<Vec<Page>> {
-        let mut pages_to_create = Vec::new();
+        let mut pages_to_create = HashSet::new();
         for pages in all_pages.chunks(PAGES_CHUNK_SIZE) {
             let placeholder = "(site=? AND title=? AND namespace_id=?)".to_string();
             let mut placeholders: Vec<String> = Vec::new();
@@ -373,7 +404,6 @@ impl DbMySql {
             let sql = format!(
                 "SELECT `id`,`site`,`title`,`namespace_id` FROM `pages` WHERE {placeholders}"
             );
-            println!("Querying {} pages", pages.len());
             let page2id: HashMap<(usize, String, i32), DbId> = self
                 .baglama2()
                 .get_tooldb_conn()
@@ -396,13 +426,13 @@ impl DbMySql {
                     match page2id.get(&key) {
                         Some(id) => pf.page.id = Some(*id),
                         None => {
-                            pages_to_create.push(pf.page.to_owned());
+                            pages_to_create.insert(pf.page.to_owned());
                         }
                     }
                 }
             }
         }
-        Ok(pages_to_create)
+        Ok(pages_to_create.into_iter().collect::<Vec<_>>())
     }
 
     async fn insert_file_pages(
@@ -410,37 +440,40 @@ impl DbMySql {
         all_page_files: &[PageFile],
         group_status_id: usize,
     ) -> Result<()> {
-        // let invalid_pages = page_files
-        //     .iter()
-        //     .filter(|pf| !pf.is_valid())
-        //     .collect::<Vec<_>>();
-        // println!(
-        //     "{} total, {} invalid",
-        //     page_files.len(),
-        //     invalid_pages.len()
-        // );
+        // let mut futures = vec![];
         for page_files in all_page_files.chunks(PAGES_CHUNK_SIZE) {
-            let params = page_files
-                .iter()
-                .filter(|pf| pf.is_valid())
-                .flat_map(|pf| [group_status_id, pf.file.id.unwrap(), pf.page.id.unwrap()])
-                .collect::<Vec<_>>();
-            let placeholders = page_files
-                .iter()
-                .map(|_| "(?,?,?)".to_string())
-                .collect::<Vec<String>>()
-                .join(",");
-
-            let sql = format!(
-                "INSERT IGNORE INTO {} (group_status_id, file_id, page_id) VALUES {placeholders}",
-                self.table_name()
-            );
-            self.baglama
-                .get_tooldb_conn()
-                .await?
-                .exec_iter(sql, params)
+            self.insert_file_pages_chunk(group_status_id, page_files)
                 .await?;
+            // futures.push(self.insert_file_pages_chunk(group_status_id, page_files));
         }
+        // try_join_all(futures).await?;
+        Ok(())
+    }
+
+    async fn insert_file_pages_chunk(
+        &self,
+        group_status_id: usize,
+        page_files: &[PageFile],
+    ) -> Result<()> {
+        let params = page_files
+            .iter()
+            .filter(|pf| pf.is_valid())
+            .flat_map(|pf| [group_status_id, pf.file.id.unwrap(), pf.page.id.unwrap()])
+            .collect::<Vec<_>>();
+        if params.is_empty() {
+            return Ok(());
+        }
+        let number_of_valid_page_files = params.len() / 3;
+        let placeholders = Self::get_placeholders("(?,?,?),", number_of_valid_page_files)?;
+        let sql = format!(
+            "INSERT IGNORE INTO {} (group_status_id, files_id, pages_id) VALUES {placeholders}",
+            self.table_name()
+        );
+        self.baglama
+            .get_tooldb_conn()
+            .await?
+            .exec_iter(sql, params)
+            .await?;
         Ok(())
     }
 
@@ -449,38 +482,9 @@ impl DbMySql {
         self.sites.get(site_id)
     }
 
-    // fn really_load_sites(&mut self) -> Result<()> {
-    //     if !self.wiki2site_id.is_empty() {
-    //         return Ok(());
-    //     }
-    //     let sites = self.load_sites()?;
-    //     println!("Loaded {} sites", sites.len());
-    //     for site in &sites {
-    //         if let Some(wiki) = self.site2wiki(site) {
-    //             self.wiki2site_id.insert(wiki, site.id());
-    //             // self.sites.insert(site.id(), site.to_owned());
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
     fn table_name(&self) -> String {
         format!("viewdata_{:04}_{:02}", self.ym.year(), self.ym.month())
     }
-
-    // fn site2wiki(&self, site: &Site) -> Option<String> {
-    //     let (language, project) = match (site.language(), site.project()) {
-    //         (Some(l), Some(p)) => (l, p),
-    //         _ => return None,
-    //     };
-    //     if language == "commons" {
-    //         Some("commonswiki".to_string())
-    //     } else if project == "wikipedia" {
-    //         Some(format!("{}wiki", language))
-    //     } else {
-    //         Some(format!("{}{}", language, project))
-    //     }
-    // }
 
     /// Used for internal testing only
     fn _as_test(self) -> Self {
@@ -504,18 +508,8 @@ impl DbMySql {
     }
 
     // tested
-    async fn update_gs2site(&self, group_status_id: DbId) -> Result<()> {
-        let sql = format!("DELETE FROM `gs2site` WHERE `group_status_id`={group_status_id}");
-        self.execute(&sql).await?;
-        let sql = format!(
-                "INSERT INTO `gs2site` (group_status_id,site_id,pages,views)
-                	SELECT {group_status_id},sites.id,COUNT(DISTINCT page_id),SUM(views)
-                 	FROM `views`,`sites`,`group2view`
-                  	WHERE views.site=sites.id AND view_id=views.id AND group_status_id={group_status_id}
-                   	GROUP BY sites.id"
-            );
-        self.execute(&sql).await?;
-        Ok(())
+    async fn update_gs2site(&self, _group_status_id: DbId) -> Result<()> {
+        unimplemented!("update_gs2site")
     }
 
     /// Used for internal testing only
@@ -591,49 +585,12 @@ impl DbTrait for DbMySql {
 
     // tested
     async fn get_view_counts_todo(&self, _batch_size: usize) -> Result<Vec<ViewCount>> {
-        todo!()
-        // let group_status_id = self.get_group_status_id().await?;
-        // let sql = format!("SELECT DISTINCT `views`.`id` AS id,title,namespace_id,grok_code,server,done,`views`.`site` AS site_id
-        // 	FROM `views`,`sites`,`group2view`
-        //  	WHERE `done`=0 AND `sites`.`id`=`views`.`site` AND `group_status_id`={group_status_id} AND `view_id`=`views`.`id`
-        //   	LIMIT {batch_size}");
-        // let ret = self
-        //     .baglama
-        //     .get_tooldb_conn()
-        //     .await?
-        //     .exec_iter(sql, ())
-        //     .await?
-        //     .map_and_drop(from_row::<ViewCount>)
-        //     .await?;
-        // Ok(ret)
+        unimplemented!()
     }
 
     // tested
     async fn get_group_status_id(&self) -> Result<usize> {
-        todo!()
-        // if let Some(ret) = self.group_status_id.get() {
-        //     return Ok(*ret);
-        // }
-        // let group_id = self.group_id.to_owned();
-        // let year = self.ym.year();
-        // let month = self.ym.month();
-        // let sql = "SELECT `id` FROM `group_status` WHERE `group_id`=? AND `year`=? AND `month`=?";
-        // let group_status_id = self
-        //     .baglama
-        //     .get_tooldb_conn()
-        //     .await?
-        //     .exec_iter(sql, (group_id.get(), year, month))
-        //     .await?
-        //     .map_and_drop(from_row::<usize>)
-        //     .await?
-        //     .first()
-        //     .ok_or_else(|| anyhow!("No group_status.id for group {group_id} in {year}-{month}"))?
-        //     .to_owned();
-        // let ret = self
-        //     .group_status_id
-        //     .get_or_init(|| async { group_status_id })
-        //     .await;
-        // Ok(*ret)
+        unimplemented!()
     }
 
     // tested
@@ -665,10 +622,7 @@ impl DbTrait for DbMySql {
 
     // tested
     async fn delete_all_files(&self) -> Result<()> {
-        // let group_status_id = self.get_group_status_id().await?;
-        // let sql = format!("DELETE FROM `tmp_files` WHERE `group_status_id`={group_status_id}");
-        // self.execute(&sql).await
-        todo!()
+        unimplemented!()
     }
 
     fn delete_views(&self) -> Result<()> {
@@ -756,12 +710,7 @@ impl DbTrait for DbMySql {
 
     // components tested
     async fn initialize(&self) -> Result<()> {
-        todo!()
-        // self.baglama2()
-        //     .set_group_status(self.group_id.to_owned(), &self.ym, "", 0, "")
-        //     .await?;
-        // self.delete_all_files().await?;
-        // Ok(())
+        Ok(())
     }
 
     // tested
