@@ -2621,8 +2621,9 @@ checksum = "fd1446b1d6956ef67bd6c1b5a6e3007acde22561418627e6b30da991ee0ef198"
 
 [[package]]
 name = "tools_interface"
-version = "0.1.14"
-source = "git+https://github.com/magnusmanske/tools_interface#b2cf8bebc944a7ff40ee16d0702ca9085966d5e1"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c07a892872d68e58156925e3d5ecbc1b9ec7b92e49d3da5831611a6278c18371"
 dependencies = [
  "async-trait",
  "chrono",

@@ -18,7 +18,7 @@ chrono = "*"
 regex = "*"
 lazy_static = "^1"
 anyhow = "*"
-tools_interface = { git = "https://github.com/magnusmanske/tools_interface" }
+tools_interface = "*"
 wikimisc = { git = "https://github.com/magnusmanske/wikimisc" }
 log = "*"
 base64 = "^0.22"

@@ -7,9 +7,8 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-// use futures::future::try_join_all;
 use log::{error, warn};
-use mysql_async::{from_row, from_row_opt, prelude::*};
+use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -22,6 +21,7 @@ use tools_interface::{Pageviews, PageviewsAccess, PageviewsAgent, PageviewsGranu
 const FILES_CHUNK_SIZE: usize = 1000;
 const PAGES_CHUNK_SIZE: usize = 500;
 const MATCH_EXISTING_FILES_CHUNK_SIZE: usize = 10000;
+const VIEWDATA_BATCH_SIZE: usize = 100;
 
 struct PageFile {
     page: Page,
@@ -66,27 +66,31 @@ impl DbMySql {
             PageviewsAgent::User,          // Get views from humans only
         );
         let sql = format!(
-            "SELECT vd.id,`server`,`title`
-			        FROM {table_name} AS vd,pages,sites
-			        WHERE page_views IS NULL
-			        AND pages_id=pages.id
-			        AND pages.site=sites.id
-			        LIMIT 100"
+            "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
+			        FROM `{table_name}` AS `vd`,`pages`,`sites`
+			        WHERE `page_views` IS NULL
+			        AND `pages_id`=`pages`.`id`
+			        AND `pages`.`site`=`sites`.`id`
+			        LIMIT {VIEWDATA_BATCH_SIZE}"
         );
         loop {
-            // Get next 100 rows with missing view data from database
+            // Get next VIEWDATA_BATCH_SIZE rows with missing view data from database
             let rows = self
                 .baglama
                 .get_tooldb_conn()
                 .await?
                 .exec_iter(&sql, ())
                 .await?
-                .map_and_drop(from_row::<(usize, String, String)>)
-                .await?;
+                .map_and_drop(from_row_opt::<(usize, String, String)>)
+                .await?
+                .into_iter()
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
             if rows.is_empty() {
                 // All done
                 break;
             }
+            println!("Got {} rows, starting with id {}", rows.len(), rows[0].0);
 
             // Prepare getting view data from API
             let page2id = rows
@@ -103,8 +107,8 @@ impl DbMySql {
             let results = pv
                 .get_multiple_articles(
                     &project_pages,
-                    &Pageviews::month_start(2016, 1).unwrap(),
-                    &Pageviews::month_end(2016, 12).unwrap(),
+                    &Pageviews::month_start(self.ym.year(), self.ym.month()).unwrap(),
+                    &Pageviews::month_end(self.ym.year(), self.ym.month()).unwrap(),
                     5,
                 )
                 .await;
@@ -144,7 +148,11 @@ impl DbMySql {
                 .map(|(id, views)| format!("WHEN {id} THEN {views}"))
                 .collect::<Vec<String>>()
                 .join("\n");
-            let sql = format!("UPDATE {table_name} SET page_views = CASE id {sql} ELSE page_views END WHERE id IN ({ids})");
+            let sql = format!(
+                "UPDATE {table_name}
+            	SET page_views = CASE pages_id {sql} ELSE page_views END
+             	WHERE pages_id IN ({ids})"
+            );
 
             // Update page_views column
             self.baglama2()
@@ -152,6 +160,8 @@ impl DbMySql {
                 .await?
                 .exec_drop(sql, ())
                 .await?;
+
+            self.finalize_group_status().await?;
         }
         Ok(())
     }
@@ -598,20 +608,19 @@ impl DbMySql {
 
     // tested
     /// Sets the group_status to 'VIEW DATA COMPLETE' and updates the `total_views` field
-    async fn update_group_status(&self, group_status_id: DbId) -> Result<()> {
+    async fn finalize_group_status(&self) -> Result<()> {
+        let table_name = self.table_name();
         let sql = format!(
                 "UPDATE group_status
-                	SET status='VIEW DATA COMPLETE',
-                 	total_views=(SELECT sum(views) FROM gs2site WHERE `group_status_id`={group_status_id})
-                  	WHERE id={group_status_id}"
+                SET `status`='VIEW DATA COMPLETE',
+                total_views=(SELECT sum(page_views) FROM `{table_name}` WHERE group_status_id=group_status.id)
+                WHERE `year`={year} AND `month`={month}
+                AND `status`='SCANNED'
+                AND NOT EXISTS (SELECT * FROM `{table_name}` WHERE group_status_id=group_status.id AND page_views IS NULL);",
+                year=self.ym.year(),month=self.ym.month()
             );
         self.execute(&sql).await?;
         Ok(())
-    }
-
-    // tested
-    async fn update_gs2site(&self, _group_status_id: DbId) -> Result<()> {
-        unimplemented!("update_gs2site")
     }
 
     /// Used for internal testing only
@@ -738,39 +747,26 @@ impl DbTrait for DbMySql {
     }
 
     // tested
-    async fn load_files_batch(&self, offset: usize, batch_size: usize) -> Result<Vec<String>> {
-        let group_status_id = self.get_group_status_id().await?;
-        let sql = format!("SELECT `name` FROM `tmp_files` WHERE `group_status_id`={group_status_id} LIMIT {batch_size} OFFSET {offset}");
-        let ret = self
-            .baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, ())
-            .await?
-            .map_and_drop(from_row_opt::<String>)
-            .await?
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(ret)
+    async fn load_files_batch(&self, _offset: usize, _batch_size: usize) -> Result<Vec<String>> {
+        unimplemented!()
     }
 
     // tested
     async fn reset_main_page_view_count(&self) -> Result<()> {
-        // TODO for all wikis?
-        let main_page_id = 47751469;
-        let enwiki = 158;
-        let group_status_id = self.get_group_status_id().await?;
-        let sql = format!("SELECT `view_id` FROM `group2view` WHERE `group_status_id`={group_status_id} AND `view_id`=`views`.`id`");
-        let sql =
-            format!("UPDATE views SET views=0 WHERE page_id={main_page_id} AND site={enwiki} AND views.id IN ({sql})");
-        self.execute(&sql).await
+        // // TODO for all wikis?
+        // let main_page_id = 47751469;
+        // let enwiki = 158;
+        // let group_status_id = self.get_group_status_id().await?;
+        // let sql = format!("SELECT `view_id` FROM `group2view` WHERE `group_status_id`={group_status_id} AND `view_id`=`views`.`id`");
+        // let sql =
+        //     format!("UPDATE views SET views=0 WHERE page_id={main_page_id} AND site={enwiki} AND views.id IN ({sql})");
+        // self.execute(&sql).await
+        unimplemented!()
     }
 
     // components are tested
-    async fn add_summary_statistics(&self, group_status_id: DbId) -> Result<()> {
-        self.update_gs2site(group_status_id).await?;
-        self.update_group_status(group_status_id).await?;
+    async fn add_summary_statistics(&self, _group_status_id: DbId) -> Result<()> {
+        self.finalize_group_status().await?;
         Ok(())
     }
 
