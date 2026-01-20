@@ -248,10 +248,13 @@ impl DbMySql {
 
     async fn get_next_group_id_to_process(&self) -> Option<(DbId, GroupId)> {
         let sql = format!(
-	        "SELECT id,group_id FROM `group_status` WHERE `year`={} AND `month`={} AND `status`='STARTED' LIMIT 1",
-	        self.ym.year(),
-	        self.ym.month()
-	    );
+            "SELECT id,group_id FROM `group_status`
+				WHERE `year`={} AND `month`={} AND `status`='STARTED'
+				ORDER BY rand()
+				LIMIT 1",
+            self.ym.year(),
+            self.ym.month()
+        );
         let groups = self
             .baglama
             .get_tooldb_conn()
