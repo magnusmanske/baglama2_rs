@@ -22,37 +22,39 @@ impl GlobalImageLinks {
         let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,gil_page_namespace,gil_page_title,gil_to FROM `globalimagelinks` WHERE `gil_to` IN ({})",&placeholders);
 
         let max_attempts = 5;
-        let mut current_attempt = 0;
-        let mut ret = vec![];
-        loop {
-            if current_attempt >= max_attempts {
-                break; // TODO error?
-            }
-            if current_attempt > 0 {
+        let mut last_error: Option<String> = None;
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
                 baglama.hold_on().await;
             }
-            current_attempt += 1;
             let mut mysql_commons_conn = match baglama.get_commons_conn().await {
                 Ok(conn) => conn,
-                _ => continue,
+                Err(e) => {
+                    last_error = Some(format!("Connection error: {e}"));
+                    continue;
+                }
             };
             let res = match mysql_commons_conn.exec_iter(&sql, files.to_owned()).await {
                 Ok(res) => res,
-                _ => {
+                Err(e) => {
+                    last_error = Some(format!("Query error: {e}"));
                     drop(mysql_commons_conn);
                     continue;
                 }
             };
-            ret = match res.map_and_drop(from_row::<GlobalImageLinks>).await {
-                Ok(ret) => ret,
-                _ => {
+            match res.map_and_drop(from_row::<GlobalImageLinks>).await {
+                Ok(ret) => return Ok(ret),
+                Err(e) => {
+                    last_error = Some(format!("Mapping error: {e}"));
                     drop(mysql_commons_conn);
                     continue;
                 }
-            };
-            break;
+            }
         }
-        Ok(ret)
+        Err(anyhow::anyhow!(
+            "GlobalImageLinks::load failed after {max_attempts} attempts. Last error: {}",
+            last_error.unwrap_or_else(|| "Unknown".to_string())
+        ))
     }
 }
 

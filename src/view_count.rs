@@ -36,8 +36,7 @@ impl FromRow for ViewCount {
     {
         let title = row
             .as_ref(1)
-            .ok_or_else(|| mysql_async::FromRowError(row.clone()))
-            .unwrap();
+            .ok_or_else(|| mysql_async::FromRowError(row.clone()))?;
         let title = Baglama2::value2opt_string(title)
             .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?;
         Ok(Self {

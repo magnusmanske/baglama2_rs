@@ -281,9 +281,9 @@ impl GroupDate {
 
         let batch_size = ADD_VIEW_COUNTS_BATCH_SIZE;
         let mut found = true;
-        let mut views_todo = vec![];
         while found {
             found = false;
+            let mut views_todo = vec![];
             debug!("add_view_counts: getting {batch_size} view counts");
             let rows = self.get_view_counts_todo(db, batch_size).await?;
             debug!("add_view_counts: view counts retrieved");

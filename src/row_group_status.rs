@@ -6,6 +6,7 @@ use mysql_async::prelude::*;
 pub enum StorageType {
     File,
     Mysql,
+    Mysql2,
     Sqlite3,
 }
 
@@ -16,6 +17,7 @@ impl TryFrom<&str> for StorageType {
         match value {
             "file" => Ok(StorageType::File),
             "mysql" => Ok(StorageType::Mysql),
+            "mysql2" => Ok(StorageType::Mysql2),
             "sqlite3" => Ok(StorageType::Sqlite3),
             _ => Err("Invalid storage type!"),
         }

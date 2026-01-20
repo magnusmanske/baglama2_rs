@@ -22,11 +22,11 @@ impl MonthViews {
             return Ok(());
         }
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS `{}` {{
+            "CREATE TABLE IF NOT EXISTS `{}` (
         	`page_id` int(11) unsigned NOT NULL AUTO_INCREMENT,
          	`views` int(11) unsigned DEFAULT NULL,
           	PRIMARY KEY (`page_id`)
-        }}",
+        )",
             self.table
         );
         println!("{sql}");
