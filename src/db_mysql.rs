@@ -209,7 +209,8 @@ impl DbMySql {
               `page_views` int(10) unsigned DEFAULT NULL,
               PRIMARY KEY (`id`),
               UNIQUE KEY `{table_name}_idx1` (`group_status_id`,`files_id`,`pages_id`),
-              KEY `{table_name}_idx2` (`pages_id`)
+              KEY `{table_name}_idx2` (`pages_id`),
+              KEY `{table_name}_idx3` (`page_views`)
             ) ENGINE=InnoDB DEFAULT CHARSET=ascii;"
         );
         self.execute(&sql).await?;
@@ -249,7 +250,7 @@ impl DbMySql {
     async fn get_next_group_id_to_process(&self) -> Option<(DbId, GroupId)> {
         let sql = format!(
             "SELECT id,group_id FROM `group_status`
-				WHERE `year`={} AND `month`={} AND `status`='STARTED' AND `is_active`=1
+				WHERE `year`={} AND `month`={} AND `status`='STARTED'
 				ORDER BY rand()
 				LIMIT 1",
             self.ym.year(),
