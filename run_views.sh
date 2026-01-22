@@ -1,6 +1,6 @@
 #!/bin/bash
 # parameters: year month
-toolforge jobs delete single 2> /dev/null
+toolforge jobs delete views 2> /dev/null
 
 rm ~/views.*
 
