@@ -1,6 +1,7 @@
 use crate::baglama2::*;
 use crate::DbId;
 use futures::prelude::*;
+use wikimisc::mediawiki::reqwest::Client;
 // use crate::db_sqlite::DbSqlite as DatabaseType;
 use crate::db_mysql::DbMySql as DatabaseType;
 use crate::db_trait::DbTrait;
@@ -488,9 +489,9 @@ impl GroupDate {
         // Ok(())
     }
 
-    fn get_reqwest_client() -> Arc<reqwest::Client> {
+    fn get_reqwest_client() -> Arc<Client> {
         lazy_static! {
-            static ref CLIENT: Arc<reqwest::Client> = {
+            static ref CLIENT: Arc<Client> = {
                 let mut wd = Wikidata::new();
                 wd.set_user_agent(USER_AGENT);
                 wd.set_timeout(Duration::from_secs(URL_LOAD_TIMEOUT_SEC));

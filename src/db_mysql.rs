@@ -189,7 +189,7 @@ impl DbMySql {
         let year = self.ym.year();
         let month = self.ym.month();
         let sql = format!(
-            "INSERT INTO group_status(`group_id`,`year`,`month`,`status`,`storage`)
+            "INSERT IGNORE INTO group_status(`group_id`,`year`,`month`,`status`,`storage`)
             SELECT id,{year},{month},'STARTED','mysql2' FROM groups
             WHERE is_active=1
             AND NOT EXISTS (SELECT * FROM group_status WHERE group_id=groups.id AND year={year} AND month={month})"
@@ -302,6 +302,10 @@ impl DbMySql {
         group_status_id: DbId,
     ) -> Result<()> {
         if all_files.is_empty() {
+            // Nothing to do, call it done.
+            self.baglama2()
+                .set_group_status(group_id, &self.ym, "VIEW DATA COMPLETE", 0, "")
+                .await?;
             return Ok(());
         }
         // let mut futures = Vec::new();
@@ -610,20 +614,30 @@ impl DbMySql {
         }
     }
 
-    // tested
     /// Sets the group_status to 'VIEW DATA COMPLETE' and updates the `total_views` field
     async fn finalize_group_status(&self) -> Result<()> {
+        let year = self.ym.year();
+        let month = self.ym.month();
         let table_name = self.table_name();
+
+        // Fix group_status.status for finished groups
         let sql = format!(
                 "UPDATE group_status
                 SET `status`='VIEW DATA COMPLETE',
                 total_views=(SELECT sum(page_views) FROM `{table_name}` WHERE group_status_id=group_status.id)
                 WHERE `year`={year} AND `month`={month}
                 AND `status`='SCANNED'
-                AND NOT EXISTS (SELECT * FROM `{table_name}` WHERE group_status_id=group_status.id AND page_views IS NULL);",
-                year=self.ym.year(),month=self.ym.month()
+                AND NOT EXISTS (SELECT * FROM `{table_name}` WHERE group_status_id=group_status.id AND page_views IS NULL);"
+
             );
         self.execute(&sql).await?;
+
+        // Calculate total_views
+        let sql2 = format!("UPDATE group_status
+        	SET total_views=(SELECT COALESCE(sum(page_views),0) FROM `{table_name}` WHERE group_status_id=group_status.id)
+         WHERE `year`={year} AND `month`={month} AND status='VIEW DATA COMPLETE' AND total_views IS NULL"
+        );
+        self.execute(&sql2).await?;
         Ok(())
     }
 
