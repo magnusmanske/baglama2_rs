@@ -21,7 +21,7 @@ use tools_interface::{Pageviews, PageviewsAccess, PageviewsAgent, PageviewsGranu
 const FILES_CHUNK_SIZE: usize = 1000;
 const PAGES_CHUNK_SIZE: usize = 500;
 const MATCH_EXISTING_FILES_CHUNK_SIZE: usize = 10000;
-const VIEWDATA_BATCH_SIZE: usize = 100;
+const VIEWDATA_BATCH_SIZE: usize = 1000;
 
 struct PageFile {
     page: Page,
