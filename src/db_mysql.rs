@@ -66,7 +66,7 @@ impl DbMySql {
             PageviewsAgent::User,          // Get views from humans only
         );
         let sql = format!(
-            "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
+            "SELECT DISTINCT `vd`.`pages_id`,`server`,COALESCE(CONVERT(`title` USING utf8),'') AS `title`
 			        FROM `{table_name}` AS `vd`,`pages`,`sites`
 			        WHERE `page_views` IS NULL
 			        AND `pages_id`=`pages`.`id`
@@ -90,11 +90,16 @@ impl DbMySql {
                 // All done
                 break;
             }
-            println!("Got {} rows, starting with id {}", rows.len(), rows[0].0);
+            println!(
+                "Got {} rows, starting with page_id {}",
+                rows.len(),
+                rows[0].0
+            );
 
             // Prepare getting view data from API
             let page2id = rows
                 .into_iter()
+                .filter(|(_id, _server, title)| !title.is_empty())
                 .filter_map(|(id, server, title)| {
                     let title_with_underscores = title.replace(' ', "_");
                     let project = server.strip_suffix(".org")?.to_string();
