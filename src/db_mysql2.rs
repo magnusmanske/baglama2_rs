@@ -35,7 +35,7 @@ impl PageFile {
 }
 
 #[derive(Debug, Clone)]
-pub struct DbMySql {
+pub struct DbMySql2 {
     baglama: Arc<Baglama2>,
     ym: YearMonth,
     testing: bool,
@@ -44,7 +44,7 @@ pub struct DbMySql {
     wiki2site_id: HashMap<String, DbId>,
 }
 
-impl DbMySql {
+impl DbMySql2 {
     pub async fn new(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<Self> {
         let mut ret = Self {
             baglama,
@@ -66,7 +66,7 @@ impl DbMySql {
             PageviewsAgent::User,          // Get views from humans only
         );
         let sql = format!(
-            "SELECT DISTINCT `vd`.`pages_id`,`server`,COALESCE(CONVERT(`title` USING utf8),'') AS `title`
+            "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
 			        FROM `{table_name}` AS `vd`,`pages`,`sites`
 			        WHERE `page_views` IS NULL
 			        AND `pages_id`=`pages`.`id`
@@ -694,7 +694,7 @@ impl DbMySql {
 }
 
 #[async_trait]
-impl DbTrait for DbMySql {
+impl DbTrait for DbMySql2 {
     fn path_final(&self) -> &str {
         "" // Not needed for MySQL
     }

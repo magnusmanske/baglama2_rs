@@ -3,7 +3,7 @@ use crate::DbId;
 use futures::prelude::*;
 use wikimisc::mediawiki::reqwest::Client;
 // use crate::db_sqlite::DbSqlite as DatabaseType;
-use crate::db_mysql::DbMySql as DatabaseType;
+use crate::db_mysql2::DbMySql2 as DatabaseType;
 use crate::db_trait::DbTrait;
 use crate::db_trait::FilePart;
 use crate::global_image_links::GlobalImageLinks;

@@ -1,3 +1,4 @@
+use crate::db_mysql2::DbMySql2;
 use anyhow::Result;
 use baglama2::*;
 use chrono::{DateTime, Datelike, Months, Utc};
@@ -9,8 +10,6 @@ use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
-
-use crate::db_mysql::DbMySql;
 
 pub type DbId = usize;
 
@@ -31,7 +30,7 @@ pub type DbId = usize;
 */
 
 pub mod baglama2;
-pub mod db_mysql;
+pub mod db_mysql2;
 pub mod db_sqlite;
 pub mod db_trait;
 pub mod file;
@@ -154,7 +153,7 @@ async fn process_all_groups(
 }
 
 async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
-    let db = DbMySql::new(ym, baglama.clone()).await?;
+    let db = DbMySql2::new(ym, baglama.clone()).await?;
     db.start_missing_groups().await?;
     db.ensure_table_exists().await?;
     db.add_pages().await?;
@@ -162,7 +161,7 @@ async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
 }
 
 async fn process_mysql2_views(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
-    let db = DbMySql::new(ym, baglama.clone()).await?;
+    let db = DbMySql2::new(ym, baglama.clone()).await?;
     db.ensure_table_exists().await?;
     db.load_missing_views().await?;
     Ok(())

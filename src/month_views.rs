@@ -1,4 +1,4 @@
-use crate::{db_mysql::DbMySql, YearMonth};
+use crate::{db_mysql2::DbMySql2, YearMonth};
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
@@ -17,7 +17,7 @@ impl MonthViews {
         }
     }
 
-    pub async fn create_table_if_not_exists(&mut self, db: &DbMySql) -> Result<()> {
+    pub async fn create_table_if_not_exists(&mut self, db: &DbMySql2) -> Result<()> {
         if self.table_exists {
             return Ok(());
         }
