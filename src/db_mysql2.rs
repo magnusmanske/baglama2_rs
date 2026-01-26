@@ -66,7 +66,7 @@ impl DbMySql2 {
             PageviewsAgent::User,          // Get views from humans only
         );
         let sql = format!(
-            "SELECT DISTINCT `vd`.`pages_id`,`server`,coalesce(CONVERT(`title` USING utf8),'') AS `title`
+            "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
 			        FROM `{table_name}` AS `vd`,`pages`,`sites`
 			        WHERE `page_views` IS NULL
 			        AND `pages_id`=`pages`.`id`
