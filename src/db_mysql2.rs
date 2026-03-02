@@ -76,12 +76,11 @@ impl DbMySql2 {
 			        AND `pages`.`site`=`sites`.`id`
 			        LIMIT {VIEWDATA_BATCH_SIZE}"
         );
+        // Acquire one connection for the entire outer loop instead of once per iteration.
+        let mut conn = self.baglama.get_tooldb_conn().await?;
         loop {
             // Get next VIEWDATA_BATCH_SIZE rows with missing view data from database
-            let rows = self
-                .baglama
-                .get_tooldb_conn()
-                .await?
+            let rows = conn
                 .exec_iter(&sql, ())
                 .await?
                 .map_and_drop(from_row_opt::<(usize, String, String)>)
@@ -163,11 +162,7 @@ impl DbMySql2 {
             );
 
             // Update page_views column
-            self.baglama2()
-                .get_tooldb_conn()
-                .await?
-                .exec_drop(sql, ())
-                .await?;
+            conn.exec_drop(sql, ()).await?;
 
             self.finalize_group_status().await?;
         }
@@ -391,14 +386,12 @@ impl DbMySql2 {
         if all_files.is_empty() {
             return Ok(());
         }
+        // Acquire one connection for all chunks rather than one per chunk.
+        let mut conn = self.baglama2().get_tooldb_conn().await?;
         for files in all_files.chunks(1000) {
             let placeholders = Self::get_placeholders("(?),", files.len())?;
             let sql = format!("INSERT IGNORE INTO `files` (`name`) VALUES {placeholders}");
-            self.baglama2()
-                .get_tooldb_conn()
-                .await?
-                .exec_drop(sql, files.to_owned())
-                .await?;
+            conn.exec_drop(sql, files.to_owned()).await?;
         }
         Ok(())
     }
@@ -415,14 +408,13 @@ impl DbMySql2 {
         // Use a HashSet so each missing name is only returned once, regardless of how
         // many PageFile entries reference the same file.
         let mut files_to_create: HashSet<String> = HashSet::new();
+        // Acquire one connection for all chunks rather than one per chunk.
+        let mut conn = self.baglama2().get_tooldb_conn().await?;
         for files in all_files.chunks(MATCH_EXISTING_FILES_CHUNK_SIZE) {
             let files = files.iter().collect::<Vec<_>>();
             let placeholders = Self::get_placeholders("?,", files.len())?;
             let sql = format!("SELECT `id`,`name` FROM `files` WHERE `name` IN ({placeholders})");
-            let file2id: HashMap<String, DbId> = self
-                .baglama2()
-                .get_tooldb_conn()
-                .await?
+            let file2id: HashMap<String, DbId> = conn
                 .exec_iter(sql, &files)
                 .await?
                 .map_and_drop(File::from_row_opt)
@@ -470,17 +462,18 @@ impl DbMySql2 {
         if all_pages.is_empty() {
             return Ok(());
         }
-        // let mut futures = vec![];
+        // Acquire one connection for all chunks rather than one per chunk.
+        let mut conn = self.baglama2().get_tooldb_conn().await?;
         for pages in all_pages.chunks(2000) {
-            self.create_page_chunks(pages).await?;
-            // let future = self.create_page_chunks(pages);
-            // futures.push(future);
+            Self::create_page_chunks_with_conn(&mut conn, pages).await?;
         }
-        // try_join_all(futures).await?;
         Ok(())
     }
 
-    async fn create_page_chunks(&self, pages: &[Page]) -> Result<()> {
+    async fn create_page_chunks_with_conn(
+        conn: &mut mysql_async::Conn,
+        pages: &[Page],
+    ) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
@@ -498,11 +491,7 @@ impl DbMySql2 {
         let sql = format!(
             "INSERT IGNORE INTO `pages` (`site`,`title`,`namespace_id`) VALUES {placeholders}"
         );
-        self.baglama2()
-            .get_tooldb_conn()
-            .await?
-            .exec_drop(sql, params)
-            .await?;
+        conn.exec_drop(sql, params).await?;
         Ok(())
     }
 
@@ -514,6 +503,8 @@ impl DbMySql2 {
         all_pages: Vec<Page>,
     ) -> Result<Vec<Page>> {
         let mut pages_to_create = HashSet::new();
+        // Acquire one connection for all chunks rather than one per chunk.
+        let mut conn = self.baglama2().get_tooldb_conn().await?;
         for pages in all_pages.chunks(PAGES_CHUNK_SIZE) {
             let placeholders =
                 vec!["(site=? AND title=? AND namespace_id=?)"; pages.len()].join(" OR ");
@@ -532,10 +523,7 @@ impl DbMySql2 {
             let sql = format!(
                 "SELECT `id`,`site`,`title`,`namespace_id` FROM `pages` WHERE {placeholders}"
             );
-            let page2id: HashMap<(usize, String, i32), DbId> = self
-                .baglama2()
-                .get_tooldb_conn()
-                .await?
+            let page2id: HashMap<(usize, String, i32), DbId> = conn
                 .exec_iter(sql, &params)
                 .await?
                 .map_and_drop(Page::from_row_opt)
@@ -568,20 +556,25 @@ impl DbMySql2 {
         all_page_files: &[PageFile],
         group_status_id: usize,
     ) -> Result<()> {
-        // let mut futures = vec![];
+        // Acquire one connection for all chunks rather than one per chunk.
+        let mut conn = self.baglama.get_tooldb_conn().await?;
         for page_files in all_page_files.chunks(PAGES_CHUNK_SIZE) {
-            self.insert_file_pages_chunk(group_status_id, page_files)
-                .await?;
-            // futures.push(self.insert_file_pages_chunk(group_status_id, page_files));
+            Self::insert_file_pages_chunk_with_conn(
+                &mut conn,
+                group_status_id,
+                page_files,
+                self.table_name(),
+            )
+            .await?;
         }
-        // try_join_all(futures).await?;
         Ok(())
     }
 
-    async fn insert_file_pages_chunk(
-        &self,
+    async fn insert_file_pages_chunk_with_conn(
+        conn: &mut mysql_async::Conn,
         group_status_id: usize,
         page_files: &[PageFile],
+        table_name: &str,
     ) -> Result<()> {
         let params = page_files
             .iter()
@@ -594,14 +587,9 @@ impl DbMySql2 {
         let number_of_valid_page_files = params.len() / 3;
         let placeholders = Self::get_placeholders("(?,?,?),", number_of_valid_page_files)?;
         let sql = format!(
-            "INSERT IGNORE INTO {} (group_status_id, files_id, pages_id) VALUES {placeholders}",
-            self.table_name()
+            "INSERT IGNORE INTO {table_name} (group_status_id, files_id, pages_id) VALUES {placeholders}"
         );
-        self.baglama
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, params)
-            .await?;
+        conn.exec_iter(sql, params).await?;
         Ok(())
     }
 
