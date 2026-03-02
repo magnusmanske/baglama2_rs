@@ -400,8 +400,8 @@ impl DbMySql2 {
         Ok(())
     }
 
-    /// Finds existing files.
-    /// Returns missing files.
+    /// Finds existing files in the DB, sets their IDs on the matching PageFile entries.
+    /// Returns a deduplicated list of file names that are missing and need to be created.
     async fn match_existing_files(
         &self,
         page_files: &mut [PageFile],
@@ -409,7 +409,9 @@ impl DbMySql2 {
     ) -> Result<Vec<String>> {
         all_files.sort();
         all_files.dedup();
-        let mut file_to_create = Vec::new();
+        // Use a HashSet so each missing name is only returned once, regardless of how
+        // many PageFile entries reference the same file.
+        let mut files_to_create: HashSet<String> = HashSet::new();
         for files in all_files.chunks(MATCH_EXISTING_FILES_CHUNK_SIZE) {
             let files = files.iter().collect::<Vec<_>>();
             let placeholders = Self::get_placeholders("?,", files.len())?;
@@ -431,13 +433,13 @@ impl DbMySql2 {
                     match file2id.get(&pf.file.name) {
                         Some(id) => pf.file.id = Some(*id),
                         None => {
-                            file_to_create.push(pf.file.name.to_owned());
+                            files_to_create.insert(pf.file.name.to_owned());
                         }
                     }
                 }
             }
         }
-        Ok(file_to_create)
+        Ok(files_to_create.into_iter().collect())
     }
 
     async fn ensure_pages_exist(&self, page_files: &mut [PageFile]) -> Result<()> {
@@ -884,5 +886,68 @@ impl DbTrait for DbMySql2 {
             self.exec_vec(&sql, images).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::File;
+    use crate::page::Page;
+
+    /// Build a PageFile with no DB ids assigned yet.
+    fn make_page_file(file_name: &str) -> PageFile {
+        PageFile {
+            page: Page::new(1, "SomePage".to_string(), 0),
+            file: File::new_no_id(file_name),
+        }
+    }
+
+    /// `match_existing_files` must return each missing file name exactly once,
+    /// even when multiple PageFile entries reference the same missing file.
+    #[test]
+    fn test_match_existing_files_no_duplicates_in_returned_list() {
+        // Simulate the interior logic: given a file2id map that does NOT contain
+        // "missing.jpg", three PageFile entries all referencing "missing.jpg" should
+        // produce exactly one entry in the returned Vec, not three.
+        let file2id: HashMap<String, DbId> = [("existing.jpg".to_string(), 42usize)]
+            .into_iter()
+            .collect();
+
+        let mut page_files = vec![
+            make_page_file("missing.jpg"),
+            make_page_file("missing.jpg"),
+            make_page_file("missing.jpg"),
+            make_page_file("existing.jpg"),
+        ];
+
+        let mut files_to_create: HashSet<String> = HashSet::new();
+        for pf in page_files.iter_mut() {
+            if pf.file.id.is_none() {
+                match file2id.get(&pf.file.name) {
+                    Some(id) => pf.file.id = Some(*id),
+                    None => {
+                        files_to_create.insert(pf.file.name.to_owned());
+                    }
+                }
+            }
+        }
+        let result: Vec<String> = files_to_create.into_iter().collect();
+
+        // Exactly one distinct missing file name must be returned.
+        assert_eq!(
+            result.len(),
+            1,
+            "Expected 1 unique missing file, got {}",
+            result.len()
+        );
+        assert_eq!(result[0], "missing.jpg");
+
+        // The existing file's id must have been set on its PageFile entry.
+        assert_eq!(page_files[3].file.id, Some(42));
+        // The missing entries must still have no id.
+        assert!(page_files[0].file.id.is_none());
+        assert!(page_files[1].file.id.is_none());
+        assert!(page_files[2].file.id.is_none());
     }
 }
