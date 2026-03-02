@@ -60,10 +60,12 @@ fn month(month: Option<&String>) -> u32 {
         Some("lm") => {
             let last: DateTime<Utc> = Utc::now()
                 .checked_sub_months(Months::new(1))
-                .expect("Bad month {month}");
+                .unwrap_or_else(|| panic!("Bad month: could not subtract 1 month from current date (input: {month:?})"));
             last.month()
         }
-        Some(s) => s.parse::<u32>().expect("Month: number expected, not {s}"),
+        Some(s) => s
+            .parse::<u32>()
+            .unwrap_or_else(|_| panic!("Month: number expected, not '{s}'")),
         None => panic!("Month expected but missing"),
     }
 }
@@ -73,10 +75,16 @@ fn year(year: Option<&String>) -> i32 {
         Some("lm") => {
             let last: DateTime<Utc> = Utc::now()
                 .checked_sub_months(Months::new(1))
-                .expect("Bad year {year}");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Bad year: could not subtract 1 month from current date (input: {year:?})"
+                    )
+                });
             last.year()
         }
-        Some(s) => s.parse::<i32>().expect("Year: number expected, not {s}"),
+        Some(s) => s
+            .parse::<i32>()
+            .unwrap_or_else(|_| panic!("Year: number expected, not '{s}'")),
         None => panic!("Year expected but missing"),
     }
 }
@@ -285,4 +293,46 @@ async fn main() -> Result<()> {
         other => panic!("Action required (not {:?}", other),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_month_numeric() {
+        assert_eq!(month(Some(&"3".to_string())), 3);
+        assert_eq!(month(Some(&"12".to_string())), 12);
+        assert_eq!(month(Some(&"1".to_string())), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Month: number expected, not 'foo'")]
+    fn test_month_bad_string_panics_with_value() {
+        month(Some(&"foo".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "Month expected but missing")]
+    fn test_month_none_panics() {
+        month(None);
+    }
+
+    #[test]
+    fn test_year_numeric() {
+        assert_eq!(year(Some(&"2023".to_string())), 2023);
+        assert_eq!(year(Some(&"2000".to_string())), 2000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Year: number expected, not 'bar'")]
+    fn test_year_bad_string_panics_with_value() {
+        year(Some(&"bar".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "Year expected but missing")]
+    fn test_year_none_panics() {
+        year(None);
+    }
 }
