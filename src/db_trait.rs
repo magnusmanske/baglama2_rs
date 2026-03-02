@@ -1,6 +1,6 @@
 use crate::{Baglama2, DbId, Site, ViewCount, YearMonth};
 use anyhow::Result;
-use async_trait::async_trait;
+
 use mysql_async::prelude::FromRow;
 use std::sync::Arc;
 
@@ -72,7 +72,6 @@ impl FromRow for ViewIdSiteIdTitle {
     }
 }
 
-#[async_trait]
 pub trait DbTrait {
     fn path_final(&self) -> &str;
     async fn finalize(&self) -> Result<()>;

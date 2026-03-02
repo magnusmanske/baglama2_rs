@@ -1,7 +1,7 @@
 use crate::db_trait::{DbTrait, FilePart, ViewIdSiteIdTitle};
 use crate::{Baglama2, DbId, GroupDate, GroupId, Site, ViewCount, YearMonth};
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
+
 use log::debug;
 use rusqlite::params_from_iter;
 use rusqlite::Connection;
@@ -138,7 +138,6 @@ impl DbSqlite {
     }
 }
 
-#[async_trait]
 impl DbTrait for DbSqlite {
     fn path_final(&self) -> &str {
         &self.path_final

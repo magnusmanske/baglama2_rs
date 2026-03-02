@@ -6,7 +6,7 @@ use crate::{
     Baglama2, DbId, GroupId, Site, ViewCount, YearMonth,
 };
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
+
 use log::{error, info, warn};
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
@@ -706,7 +706,6 @@ impl DbMySql2 {
     }
 }
 
-#[async_trait]
 impl DbTrait for DbMySql2 {
     fn path_final(&self) -> &str {
         "" // Not needed for MySQL
