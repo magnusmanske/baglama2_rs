@@ -323,22 +323,6 @@ impl GroupDate {
             let _ = db.update_view_count(vt.view_id, view_id).await;
         }
 
-        // for views_todo_batch in views_todo.chunks(API_CALLS_IN_PARALLEL) {
-        //     debug!("Processing {views_todo_batch:?}");
-        //     let futures: Vec<_> = views_todo_batch
-        //         .iter()
-        //         .map(|x| self.get_total_monthly_page_views(x))
-        //         .collect();
-        //     let results: Vec<u64> = join_all(futures)
-        //         .await
-        //         .iter()
-        //         .map(|r| r.unwrap_or(0))
-        //         .collect();
-        //     debug!("Futures complete");
-        //     for (view_count, vt) in results.into_iter().zip(views_todo_batch.iter()) {
-        //         let _ = db.update_view_count(vt.view_id, view_count).await;
-        //     }
-        // }
         debug!("View updates complete");
     }
 
@@ -355,9 +339,8 @@ impl GroupDate {
         }
         debug!("add_views_batch_for_files: {} parts", parts.len());
         db.create_views_in_db(&parts, &sql_values).await?;
-        debug!("B");
         let viewid_site_id_title = db.get_viewid_site_id_title(&parts).await?;
-        debug!("C: {viewid_site_id_title:?}");
+        debug!("add_views_batch_for_files: viewid_site_id_title={viewid_site_id_title:?}");
 
         let siteid_title_viewid: HashMap<(usize, String), usize> = viewid_site_id_title
             .into_iter()
@@ -433,15 +416,6 @@ impl GroupDate {
         db.add_summary_statistics(group_status_id).await
     }
 
-    // async fn finalize(&self, db: &DatabaseType) -> Result<()> {
-    //     let group_status_id = db.get_group_status_id().await?;
-    //     let total_views = db.get_total_views(group_status_id).await?;
-    //     db.create_final_indices()?;
-    //     let sqlite_filename = db.path_final();
-    //     self.set_group_status("VIEW DATA COMPLETE", total_views as DbId, sqlite_filename)
-    //         .await
-    // }
-
     /// Convenience wrapper around Baglama2.set_group_status
     pub async fn set_group_status(
         &self,
@@ -462,31 +436,10 @@ impl GroupDate {
 
     pub async fn create_mysql2(&mut self) -> Result<()> {
         todo!()
-        // let _mv = crate::month_views::MonthViews::new(self.ym().to_owned());
-        // let db = crate::db_mysql::DbMySql::new(self, self.baglama.clone())?;
-        // debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
-        // db.initialize().await?;
-        // debug!("{}-{}: add_files", self.group_id, self.ym);
-        // // self.add_files(&db).await?;
-        // Ok(())
     }
 
     pub async fn create_sqlite(&mut self) -> Result<()> {
         todo!()
-        // let db = DatabaseType::new(self, self.baglama.clone())?;
-        // debug!("{}-{}: seed_sqlite_file", self.group_id, self.ym);
-        // db.initialize().await?;
-        // debug!("{}-{}: add_files", self.group_id, self.ym);
-        // self.add_files(&db).await?;
-        // debug!("{}-{}: add_pages", self.group_id, self.ym);
-        // self.add_pages(&db).await?;
-        // debug!("{}-{}: add_view_counts", self.group_id, self.ym);
-        // self.add_view_counts(&db).await?;
-        // debug!("{}-{}: finalize_sqlite", self.group_id, self.ym);
-        // self.finalize(&db).await?;
-        // debug!("{}-{}: done!", self.group_id, self.ym);
-        // db.finalize().await?;
-        // Ok(())
     }
 
     fn get_reqwest_client() -> Arc<Client> {

@@ -14,22 +14,6 @@ pub use year_month::YearMonth;
 
 pub type DbId = usize;
 
-/* TODO
-2023-09
-2023-10
-2023-11
-2023-12
-2024-01
-2024-02
-2024-03
-2024-04
-2024-05
-2024-06
-2024-07
-2024-08
-2024-09
-*/
-
 pub mod baglama2;
 pub mod db_mysql2;
 pub mod db_sqlite;
@@ -46,15 +30,6 @@ pub mod view_count;
 pub mod year_month;
 
 pub type GroupId = NonZero<DbId>;
-
-/*
-ssh magnus@tools-login.wmflabs.org -L 3307:commonswiki.web.db.svc.eqiad.wmflabs:3306 -N &
-ssh magnus@tools-login.wmflabs.org -L 3308:oxztsldqokc.svc.trove.eqiad1.wikimedia.cloud:3306 -N &
-#ssh magnus@tools-login.wmflabs.org -L 3308:tools-db:3306 -N &
-
-git pull && ./build.sh && toolforge-jobs delete manual && rm ~/manual.* && \
-toolforge-jobs run --image tf-php74 --mem 1500Mi --command '/data/project/glamtools/baglama2_rs/run_all.sh lm lm' monthly
-*/
 
 fn month(month: Option<&String>) -> u32 {
     match month.map(|s| s.as_str()) {
