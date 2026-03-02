@@ -72,6 +72,7 @@ impl FromRow for ViewIdSiteIdTitle {
     }
 }
 
+#[allow(async_fn_in_trait)]
 pub trait DbTrait {
     fn path_final(&self) -> &str;
     async fn finalize(&self) -> Result<()>;
