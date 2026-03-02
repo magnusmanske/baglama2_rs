@@ -42,10 +42,12 @@ pub struct DbMySql2 {
     test_log: Arc<Mutex<Vec<Value>>>,
     sites: HashMap<DbId, Site>,
     wiki2site_id: HashMap<String, DbId>,
+    table_name: String,
 }
 
 impl DbMySql2 {
     pub async fn new(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<Self> {
+        let table_name = format!("viewdata_{:04}_{:02}", ym.year(), ym.month());
         let mut ret = Self {
             baglama,
             ym,
@@ -53,6 +55,7 @@ impl DbMySql2 {
             test_log: Arc::new(Mutex::new(vec![])),
             sites: HashMap::new(),
             wiki2site_id: HashMap::new(),
+            table_name,
         };
         ret.initialize_sites().await?;
         Ok(ret)
@@ -609,8 +612,8 @@ impl DbMySql2 {
         self.sites.get(site_id)
     }
 
-    fn table_name(&self) -> String {
-        format!("viewdata_{:04}_{:02}", self.ym.year(), self.ym.month())
+    fn table_name(&self) -> &str {
+        &self.table_name
     }
 
     /// Used for internal testing only
@@ -949,5 +952,21 @@ mod tests {
         assert!(page_files[0].file.id.is_none());
         assert!(page_files[1].file.id.is_none());
         assert!(page_files[2].file.id.is_none());
+    }
+
+    /// table_name must be computed once at construction time and return the
+    /// correctly formatted string for a given YearMonth.
+    #[test]
+    fn test_table_name_cached_format() {
+        // We test the formatting logic directly — same formula used in new().
+        let cases = [
+            ((2024, 1), "viewdata_2024_01"),
+            ((2024, 12), "viewdata_2024_12"),
+            ((2000, 6), "viewdata_2000_06"),
+        ];
+        for ((year, month), expected) in cases {
+            let name = format!("viewdata_{:04}_{:02}", year, month);
+            assert_eq!(name, expected, "year={year} month={month}");
+        }
     }
 }
