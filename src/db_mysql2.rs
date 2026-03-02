@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use log::{error, warn};
+use log::{error, info, warn};
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
@@ -92,7 +92,7 @@ impl DbMySql2 {
                 // All done
                 break;
             }
-            println!(
+            info!(
                 "Got {} rows, starting with page_id {}",
                 rows.len(),
                 rows[0].0
@@ -282,15 +282,15 @@ impl DbMySql2 {
 
     pub async fn add_pages(&self) -> Result<()> {
         loop {
-            println!("Looking for next group");
+            info!("Looking for next group");
             let (group_status_id, group_id) = match self.get_next_group_id_to_process().await {
                 Some(id) => id,
                 None => break,
             };
-            println!("Processing group ID: {}", group_id);
+            info!("Processing group ID: {}", group_id);
             let files = self.get_files_for_group(group_id).await?;
-            println!("Group ID: {}", group_id);
-            println!("Files: {}", files.len());
+            info!("Group ID: {}", group_id);
+            info!("Files: {}", files.len());
             self.add_files_and_pages_for_group(&files, group_id, group_status_id)
                 .await?;
         }
@@ -335,7 +335,7 @@ impl DbMySql2 {
             let site = match self.get_site_for_wiki(&gil.wiki) {
                 Some(site) => site,
                 None => {
-                    println!("add_views_for_files: Unknown wiki: {}", &gil.wiki);
+                    warn!("add_views_for_files: Unknown wiki: {}", &gil.wiki);
                     continue;
                 }
             };

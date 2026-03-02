@@ -1,5 +1,6 @@
 use crate::{db_mysql2::DbMySql2, YearMonth};
 use anyhow::Result;
+use log::info;
 
 #[derive(Debug, Clone)]
 pub struct MonthViews {
@@ -29,9 +30,9 @@ impl MonthViews {
         )",
             self.table
         );
-        println!("{sql}");
+        info!("Creating table if not exists: {sql}");
         db.execute(&sql).await?;
-        println!("Table `{}` created (or ignored) successfully", self.table);
+        info!("Table `{}` created (or ignored) successfully", self.table);
         self.table_exists = true;
         Ok(())
     }
