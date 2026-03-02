@@ -7,7 +7,8 @@ use log::{info, LevelFilter};
 pub use site::Site;
 use std::env;
 use std::num::NonZero;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
@@ -98,39 +99,49 @@ async fn process_all_groups(
     baglama.clear_incomplete_group_status(year, month).await?;
     let max_concurrent = baglama.config()["max_concurrent_jobs"]
         .as_u64()
-        .unwrap_or(4);
-    let concurrent: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        .unwrap_or(4) as usize;
+
+    // A Semaphore is the idiomatic async primitive for bounding concurrency.
+    // It replaces the previous std::sync::Mutex<u64> busy-loop, which held a
+    // blocking lock across .await points and polled in a spin loop.
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+
+    let mut join_set = tokio::task::JoinSet::new();
+
     loop {
-        if *concurrent
-            .lock()
-            .expect("main: concurrent lock poisoned [1]")
-            >= max_concurrent
-        {
-            baglama.hold_on().await;
-            continue;
+        // Drain any completed tasks so the JoinSet doesn't grow unboundedly.
+        while let Some(res) = join_set.try_join_next() {
+            if let Err(e) = res {
+                info!("Spawned task panicked: {:?}", e);
+            }
         }
+
         let group_id_opt = baglama
             .get_next_group_id(year, month, requires_previous_date)
             .await;
+
         if let Some(group_id) = group_id_opt {
-            let concurrent = concurrent.clone();
-            let baglama = baglama.clone();
-            *concurrent
-                .lock()
-                .expect("main: concurrent lock poisoned [2]") += 1;
+            // Acquire a permit *before* spawning so we never exceed the limit.
+            // clone() gives the spawned task its own permit that releases on drop.
+            let permit = Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("Semaphore closed unexpectedly");
+
             info!(
-                "Now {} jobs running",
-                concurrent
-                    .lock()
-                    .expect("main: concurrent lock poisoned [3]")
+                "Now ~{} jobs running",
+                max_concurrent - semaphore.available_permits()
             );
+
+            let baglama = baglama.clone();
             let mut gd = GroupDate::new(
                 group_id.try_into()?,
-                YearMonth::new(year, month).expect("Bad year/month {year}/{month}"),
+                YearMonth::new(year, month)
+                    .unwrap_or_else(|_| panic!("Bad year/month: {year}/{month}")),
                 baglama.clone(),
             );
             let _ = gd.set_group_status("GENERATING PAGE LIST", 0, "").await;
-            tokio::spawn(async move {
+            join_set.spawn(async move {
                 match gd.create_sqlite().await {
                     Ok(_) => {}
                     Err(err) => {
@@ -138,21 +149,12 @@ async fn process_all_groups(
                         info!("{group_id} failed: {:?}", &err);
                     }
                 }
-                drop(gd);
-                *concurrent
-                    .lock()
-                    .expect("main: concurrent lock poisoned [4]") -= 1;
+                // Dropping the permit here releases the semaphore slot.
+                drop(permit);
             });
         } else {
-            // Wait for threads to finish
-            if *concurrent
-                .lock()
-                .expect("main: concurrent lock poisoned [5]")
-                > 0
-            {
-                baglama.hold_on().await;
-                continue;
-            }
+            // No more groups to schedule; wait for all in-flight tasks to finish.
+            join_set.join_all().await;
             info!("Complete");
             break;
         }
