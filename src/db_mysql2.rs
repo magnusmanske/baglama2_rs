@@ -915,7 +915,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let mut page_files = vec![
+        let mut page_files = [
             make_page_file("missing.jpg"),
             make_page_file("missing.jpg"),
             make_page_file("missing.jpg"),

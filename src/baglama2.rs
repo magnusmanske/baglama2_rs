@@ -407,7 +407,9 @@ impl Baglama2 {
         namespace: isize,
     ) -> Result<Vec<String>> {
         let category = category.replace(" ", "_");
-        let categories = self.find_subcats(&vec![category.clone()], depth).await?;
+        let categories = self
+            .find_subcats(std::slice::from_ref(&category), depth)
+            .await?;
         if namespace == 14 {
             return Ok(categories);
         }
@@ -512,8 +514,8 @@ mod tests {
     #[test]
     fn test_find_subcats_dedup_logic() {
         // Simulate two discovery rounds where "Cat:A" appears in both.
-        let round1 = vec!["Cat:A".to_string(), "Cat:B".to_string()];
-        let round2 = vec!["Cat:A".to_string(), "Cat:C".to_string()];
+        let round1 = ["Cat:A".to_string(), "Cat:B".to_string()];
+        let round2 = ["Cat:A".to_string(), "Cat:C".to_string()];
 
         let mut seen: HashSet<String> = HashSet::new();
         for item in round1.iter().chain(round2.iter()) {
