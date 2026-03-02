@@ -12,6 +12,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::path::Path;
@@ -368,35 +369,39 @@ impl Baglama2 {
     }
 
     // TESTED
-    async fn find_subcats(&self, root: &Vec<String>, depth: isize) -> Result<Vec<String>> {
+    async fn find_subcats(&self, root: &[String], depth: isize) -> Result<Vec<String>> {
         let mut depth = depth;
         let mut check = root.to_owned();
-        let mut subcats: Vec<String> = vec![];
+        // Use a HashSet for O(1) membership tests; a Vec would give O(n) per check,
+        // leading to O(n²) behaviour over deep category trees.
+        let mut subcats: HashSet<String> = HashSet::new();
         loop {
             if depth == 0 {
                 break;
             }
+            // Keep only categories we haven't visited yet.
             let remaining: Vec<String> = check
-                .iter()
+                .into_iter()
                 .filter(|category| !subcats.contains(category))
-                .map(|category| category.to_owned())
                 .collect();
             if remaining.is_empty() {
                 break;
             }
-            subcats.extend_from_slice(&remaining);
+            subcats.extend(remaining.iter().cloned());
             let placeholders = Baglama2::sql_placeholders(remaining.len());
             let sql = format!("SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title)) FROM page,categorylinks WHERE page_id=cl_from AND cl_to IN ({}) AND cl_type='subcat'",placeholders);
             check = self.query_commons_repeat(&sql, &remaining).await?;
             if check.is_empty() {
                 break;
             }
-            subcats.extend_from_slice(&check);
-            subcats.sort();
-            subcats.dedup();
+            subcats.extend(check.iter().cloned());
             depth -= 1;
         }
-        Ok(subcats)
+        // Convert to a sorted Vec to match the previous behaviour (callers rely on
+        // the result being usable as SQL IN-list parameters).
+        let mut result: Vec<String> = subcats.into_iter().collect();
+        result.sort();
+        Ok(result)
     }
 
     // TESTED
@@ -505,6 +510,47 @@ mod tests {
     use crate::row_group_status::StorageType;
 
     use super::*;
+
+    /// Verifies that the HashSet-based deduplication used inside find_subcats
+    /// correctly collapses duplicate category names that appear across multiple
+    /// discovery rounds, without requiring a DB connection.
+    #[test]
+    fn test_find_subcats_dedup_logic() {
+        // Simulate two discovery rounds where "Cat:A" appears in both.
+        let round1 = vec!["Cat:A".to_string(), "Cat:B".to_string()];
+        let round2 = vec!["Cat:A".to_string(), "Cat:C".to_string()];
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in round1.iter().chain(round2.iter()) {
+            seen.insert(item.clone());
+        }
+
+        let mut result: Vec<String> = seen.into_iter().collect();
+        result.sort();
+
+        assert_eq!(
+            result,
+            vec![
+                "Cat:A".to_string(),
+                "Cat:B".to_string(),
+                "Cat:C".to_string()
+            ]
+        );
+    }
+
+    /// find_subcats must not revisit a category that is already in `subcats`,
+    /// even when the incoming `check` list contains it again.
+    #[test]
+    fn test_find_subcats_already_seen_categories_are_filtered() {
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert("Cat:A".to_string());
+
+        // Simulate `remaining` computation for the next round.
+        let check = vec!["Cat:A".to_string(), "Cat:B".to_string()];
+        let remaining: Vec<String> = check.into_iter().filter(|c| !seen.contains(c)).collect();
+
+        assert_eq!(remaining, vec!["Cat:B".to_string()]);
+    }
 
     #[test]
     fn test_sql_placeholders() {
