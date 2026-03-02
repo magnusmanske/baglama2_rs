@@ -6,7 +6,6 @@ use crate::Site;
 use crate::YearMonth;
 use anyhow::Result;
 use core::time::Duration;
-use lazy_static::lazy_static;
 use mysql_async::{from_row, prelude::*, Conn};
 use regex::Regex;
 use serde_json::Value;
@@ -17,15 +16,16 @@ use std::env;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use wikimisc::mediawiki::Api;
 use wikimisc::site_matrix::SiteMatrix;
 use wikimisc::toolforge_db::ToolforgeDB;
 
-lazy_static! {
-    static ref RE_WEBSERVER_WIKIPEDIA: Regex = Regex::new(r"^(.+)wiki$").expect("Regex error");
-    static ref RE_WEBSERVER_WIKI: Regex = Regex::new(r"^(.+)(wik.+)$").expect("Regex error");
-}
+static RE_WEBSERVER_WIKIPEDIA: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+)wiki$").expect("Regex error"));
+static RE_WEBSERVER_WIKI: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+)(wik.+)$").expect("Regex error"));
 
 #[derive(Debug)]
 pub struct Baglama2 {

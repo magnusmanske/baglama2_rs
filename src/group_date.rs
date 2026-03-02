@@ -12,12 +12,12 @@ use crate::Site;
 use crate::ViewCount;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
-use lazy_static::lazy_static;
 use log::debug;
 use log::warn;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use wikimisc::wikidata::Wikidata;
 
@@ -443,17 +443,15 @@ impl GroupDate {
     }
 
     fn get_reqwest_client() -> Arc<Client> {
-        lazy_static! {
-            static ref CLIENT: Arc<Client> = {
-                let mut wd = Wikidata::new();
-                wd.set_user_agent(USER_AGENT);
-                wd.set_timeout(Duration::from_secs(URL_LOAD_TIMEOUT_SEC));
-                let client = wd
-                    .reqwest_client()
-                    .expect("Could not create reqwest client");
-                Arc::new(client)
-            };
-        }
+        static CLIENT: LazyLock<Arc<Client>> = LazyLock::new(|| {
+            let mut wd = Wikidata::new();
+            wd.set_user_agent(USER_AGENT);
+            wd.set_timeout(Duration::from_secs(URL_LOAD_TIMEOUT_SEC));
+            let client = wd
+                .reqwest_client()
+                .expect("Could not create reqwest client");
+            Arc::new(client)
+        });
         CLIENT.clone()
     }
 }

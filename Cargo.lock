@@ -187,7 +187,6 @@ dependencies = [
  "chrono",
  "chronoutil",
  "futures",
- "lazy_static",
  "log",
  "mysql_async",
  "regex",
