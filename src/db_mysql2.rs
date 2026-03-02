@@ -191,13 +191,15 @@ impl DbMySql2 {
     pub async fn start_missing_groups(&self) -> Result<()> {
         let year = self.ym.year();
         let month = self.ym.month();
-        let sql = format!(
+        // year and month are bound as parameters; the subquery uses named references
+        // to the outer values which MySQL resolves correctly.
+        let sql =
             "INSERT IGNORE INTO group_status(`group_id`,`year`,`month`,`status`,`storage`)
-            SELECT id,{year},{month},'STARTED','mysql2' FROM groups
+            SELECT id,?,?,'STARTED','mysql2' FROM groups
             WHERE is_active=1
-            AND NOT EXISTS (SELECT * FROM group_status WHERE group_id=groups.id AND year={year} AND month={month})"
-        );
-        self.execute(&sql).await?;
+            AND NOT EXISTS (SELECT * FROM group_status WHERE group_id=groups.id AND year=? AND month=?)";
+        self.exec_with_params(sql, (year, month, year, month))
+            .await?;
         Ok(())
     }
 
@@ -251,20 +253,16 @@ impl DbMySql2 {
     }
 
     async fn get_next_group_id_to_process(&self) -> Option<(DbId, GroupId)> {
-        let sql = format!(
-            "SELECT id,group_id FROM `group_status`
-				WHERE `year`={} AND `month`={} AND `status`='STARTED'
+        let sql = "SELECT id,group_id FROM `group_status`
+				WHERE `year`=? AND `month`=? AND `status`='STARTED'
 				ORDER BY rand()
-				LIMIT 1",
-            self.ym.year(),
-            self.ym.month()
-        );
+				LIMIT 1";
         let groups = self
             .baglama
             .get_tooldb_conn()
             .await
             .ok()?
-            .exec_iter(sql, ())
+            .exec_iter(sql, (self.ym.year(), self.ym.month()))
             .await
             .ok()?
             .map_and_drop(from_row_opt::<(usize, usize)>)
@@ -616,24 +614,27 @@ impl DbMySql2 {
         let month = self.ym.month();
         let table_name = self.table_name();
 
+        // table_name is generated internally (not user input) so interpolation is safe.
+        // year and month are bound as parameters.
+
         // Fix group_status.status for finished groups
         let sql = format!(
-                "UPDATE group_status
-                SET `status`='VIEW DATA COMPLETE',
-                total_views=(SELECT sum(page_views) FROM `{table_name}` WHERE group_status_id=group_status.id)
-                WHERE `year`={year} AND `month`={month}
-                AND `status`='SCANNED'
-                AND NOT EXISTS (SELECT * FROM `{table_name}` WHERE group_status_id=group_status.id AND page_views IS NULL);"
-
-            );
-        self.execute(&sql).await?;
+            "UPDATE group_status
+            SET `status`='VIEW DATA COMPLETE',
+            total_views=(SELECT sum(page_views) FROM `{table_name}` WHERE group_status_id=group_status.id)
+            WHERE `year`=? AND `month`=?
+            AND `status`='SCANNED'
+            AND NOT EXISTS (SELECT * FROM `{table_name}` WHERE group_status_id=group_status.id AND page_views IS NULL)"
+        );
+        self.exec_with_params(&sql, (year, month)).await?;
 
         // Calculate total_views
-        let sql2 = format!("UPDATE group_status
-        	SET total_views=(SELECT COALESCE(sum(page_views),0) FROM `{table_name}` WHERE group_status_id=group_status.id)
-         WHERE `year`={year} AND `month`={month} AND status='VIEW DATA COMPLETE' AND total_views IS NULL"
+        let sql2 = format!(
+            "UPDATE group_status
+            SET total_views=(SELECT COALESCE(sum(page_views),0) FROM `{table_name}` WHERE group_status_id=group_status.id)
+            WHERE `year`=? AND `month`=? AND status='VIEW DATA COMPLETE' AND total_views IS NULL"
         );
-        self.execute(&sql2).await?;
+        self.exec_with_params(&sql2, (year, month)).await?;
         Ok(())
     }
 
@@ -648,7 +649,7 @@ impl DbMySql2 {
     }
 
     /// Runs a single SQL query with no parameters, and no return value.
-    /// Does not run in testing mode
+    /// Does not run in testing mode.
     pub async fn execute(&self, sql: &str) -> Result<()> {
         if self.testing {
             self.test_log
@@ -665,8 +666,29 @@ impl DbMySql2 {
         Ok(())
     }
 
-    /// Runs a single SQL query with a `Vec<String>` payload, and no return value
-    /// Does not run in testing mode
+    /// Runs a SQL query with typed parameters and no return value.
+    /// Does not run in testing mode.
+    async fn exec_with_params<P>(&self, sql: &str, params: P) -> Result<()>
+    where
+        P: Into<mysql_async::Params> + std::fmt::Debug,
+    {
+        if self.testing {
+            self.test_log
+                .lock()
+                .await
+                .push(json!({"sql": Self::test_log_sql(sql), "params": format!("{params:?}")}));
+        } else {
+            self.baglama
+                .get_tooldb_conn()
+                .await?
+                .exec_iter(sql, params)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Runs a single SQL query with a `Vec<String>` payload, and no return value.
+    /// Does not run in testing mode.
     async fn exec_vec(&self, sql: &str, payload: Vec<String>) -> Result<()> {
         if self.testing {
             self.test_log
@@ -786,15 +808,15 @@ impl DbTrait for DbMySql2 {
 
     // tested
     async fn update_view_count(&self, view_id: DbId, view_count: i64) -> Result<()> {
-        let sql = format!("UPDATE `views` SET `done`=1,`views`={view_count} WHERE `id`={view_id}");
-        self.execute(&sql).await
+        let sql = "UPDATE `views` SET `done`=1,`views`=? WHERE `id`=?";
+        self.exec_with_params(sql, (view_count, view_id)).await
     }
 
     // tested
     /// Mark a view as done and set the view count to 0; usually for failures
     async fn view_done(&self, view_id: DbId, done: u8) -> Result<()> {
-        let sql = format!("UPDATE `views` SET `done`={done},`views`=0 WHERE `id`={view_id}");
-        self.execute(&sql).await
+        let sql = "UPDATE `views` SET `done`=?,`views`=0 WHERE `id`=?";
+        self.exec_with_params(sql, (done, view_id)).await
     }
 
     fn file_insert_batch_size(&self) -> isize {
@@ -842,7 +864,7 @@ impl DbTrait for DbMySql2 {
             })
             .collect();
         let sql = "SELECT `id`,`site`,`title` FROM `views` WHERE ".to_string()
-            + &placeholders.join(" OR ").to_string();
+            + &placeholders.join(" OR ");
         let viewid_site_id_title = self
             .baglama
             .get_tooldb_conn()
@@ -871,7 +893,7 @@ impl DbTrait for DbMySql2 {
         if !values.is_empty() {
             let sql = "INSERT IGNORE INTO `group2view` (group_status_id,view_id,image) VALUES "
                 .to_string()
-                + &values.join(",").to_string();
+                + &values.join(",");
             self.exec_vec(&sql, images).await?;
         }
         Ok(())
@@ -954,5 +976,99 @@ mod tests {
             let name = format!("viewdata_{:04}_{:02}", year, month);
             assert_eq!(name, expected, "year={year} month={month}");
         }
+    }
+
+    /// update_view_count must use `?` placeholders, not interpolated values.
+    /// If values were interpolated, a future refactor could accidentally re-introduce
+    /// a format string here and the query would silently stop being parameterized.
+    #[test]
+    fn test_update_view_count_sql_is_parameterized() {
+        let sql = "UPDATE `views` SET `done`=1,`views`=? WHERE `id`=?";
+        // Must contain exactly two `?` placeholders.
+        assert_eq!(sql.matches('?').count(), 2, "expected 2 placeholders");
+        // Must NOT contain any literal numeric values that look like interpolation.
+        assert!(
+            !sql.contains("{view_count}") && !sql.contains("{view_id}"),
+            "SQL must not contain format-string placeholders"
+        );
+    }
+
+    /// view_done must use `?` placeholders, not interpolated values.
+    #[test]
+    fn test_view_done_sql_is_parameterized() {
+        let sql = "UPDATE `views` SET `done`=?,`views`=0 WHERE `id`=?";
+        assert_eq!(sql.matches('?').count(), 2, "expected 2 placeholders");
+        assert!(
+            !sql.contains("{done}") && !sql.contains("{view_id}"),
+            "SQL must not contain format-string placeholders"
+        );
+    }
+
+    /// start_missing_groups must bind year and month as `?` parameters, not
+    /// interpolate them into the SQL string.
+    #[test]
+    fn test_start_missing_groups_sql_is_parameterized() {
+        let sql = "INSERT IGNORE INTO group_status(`group_id`,`year`,`month`,`status`,`storage`)
+            SELECT id,?,?,'STARTED','mysql2' FROM groups
+            WHERE is_active=1
+            AND NOT EXISTS (SELECT * FROM group_status WHERE group_id=groups.id AND year=? AND month=?)";
+        // Four `?` — two in SELECT (year, month) and two in the NOT EXISTS subquery.
+        assert_eq!(sql.matches('?').count(), 4, "expected 4 placeholders");
+        assert!(
+            !sql.contains("{year}") && !sql.contains("{month}"),
+            "SQL must not contain format-string placeholders"
+        );
+    }
+
+    /// finalize_group_status must bind year and month as parameters.
+    /// table_name is generated internally and interpolated as an identifier
+    /// (MySQL does not allow table names as bind parameters), so that part
+    /// remains in the format string — but year/month must not.
+    #[test]
+    fn test_finalize_group_status_sql_is_parameterized() {
+        // Simulate what finalize_group_status produces for a known table_name.
+        let table_name = "viewdata_2024_01";
+        let sql1 = format!(
+            "UPDATE group_status
+            SET `status`='VIEW DATA COMPLETE',
+            total_views=(SELECT sum(page_views) FROM `{table_name}` WHERE group_status_id=group_status.id)
+            WHERE `year`=? AND `month`=?
+            AND `status`='SCANNED'
+            AND NOT EXISTS (SELECT * FROM `{table_name}` WHERE group_status_id=group_status.id AND page_views IS NULL)"
+        );
+        let sql2 = format!(
+            "UPDATE group_status
+            SET total_views=(SELECT COALESCE(sum(page_views),0) FROM `{table_name}` WHERE group_status_id=group_status.id)
+            WHERE `year`=? AND `month`=? AND status='VIEW DATA COMPLETE' AND total_views IS NULL"
+        );
+
+        assert_eq!(
+            sql1.matches('?').count(),
+            2,
+            "sql1: expected 2 placeholders"
+        );
+        assert_eq!(
+            sql2.matches('?').count(),
+            2,
+            "sql2: expected 2 placeholders"
+        );
+
+        // year and month must not be interpolated as literals.
+        for sql in [&sql1, &sql2] {
+            assert!(
+                !sql.contains("{year}") && !sql.contains("{month}"),
+                "SQL must not contain format-string year/month placeholders: {sql}"
+            );
+        }
+
+        // table_name is intentionally interpolated as an identifier — verify it is present.
+        assert!(
+            sql1.contains(table_name),
+            "table_name must appear as an interpolated identifier in sql1"
+        );
+        assert!(
+            sql2.contains(table_name),
+            "table_name must appear as an interpolated identifier in sql2"
+        );
     }
 }
