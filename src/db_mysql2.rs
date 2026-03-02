@@ -720,7 +720,7 @@ impl DbTrait for DbMySql2 {
     }
 
     async fn finalize(&self) -> Result<()> {
-        self.delete_all_files().await?;
+        // Nothing to finalise for the mysql2 pipeline.
         Ok(())
     }
 
@@ -729,14 +729,12 @@ impl DbTrait for DbMySql2 {
         Ok(sites)
     }
 
-    // tested
     async fn get_view_counts_todo(&self, _batch_size: usize) -> Result<Vec<ViewCount>> {
-        unimplemented!()
+        Err(anyhow!("get_view_counts_todo is not supported by DbMySql2"))
     }
 
-    // tested
     async fn get_group_status_id(&self) -> Result<usize> {
-        unimplemented!()
+        Err(anyhow!("get_group_status_id is not supported by DbMySql2"))
     }
 
     // tested
@@ -766,9 +764,8 @@ impl DbTrait for DbMySql2 {
         Ok(())
     }
 
-    // tested
     async fn delete_all_files(&self) -> Result<()> {
-        unimplemented!()
+        Err(anyhow!("delete_all_files is not supported by DbMySql2"))
     }
 
     fn delete_views(&self) -> Result<()> {
@@ -781,22 +778,16 @@ impl DbTrait for DbMySql2 {
         Ok(())
     }
 
-    // tested
     async fn load_files_batch(&self, _offset: usize, _batch_size: usize) -> Result<Vec<String>> {
-        unimplemented!()
+        Err(anyhow!("load_files_batch is not supported by DbMySql2"))
     }
 
-    // tested
     async fn reset_main_page_view_count(&self) -> Result<()> {
-        // // TODO for all wikis?
-        // let main_page_id = 47751469;
-        // let enwiki = 158;
-        // let group_status_id = self.get_group_status_id().await?;
-        // let sql = format!("SELECT `view_id` FROM `group2view` WHERE `group_status_id`={group_status_id} AND `view_id`=`views`.`id`");
-        // let sql =
-        //     format!("UPDATE views SET views=0 WHERE page_id={main_page_id} AND site={enwiki} AND views.id IN ({sql})");
-        // self.execute(&sql).await
-        unimplemented!()
+        // Not implemented for MySQL: per-wiki Main Page reset is not needed
+        // in the mysql2 pipeline (view counts are fetched fresh from the API).
+        Err(anyhow!(
+            "reset_main_page_view_count is not supported by DbMySql2"
+        ))
     }
 
     // components are tested
