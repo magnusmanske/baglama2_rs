@@ -446,14 +446,14 @@ impl DbMySql2 {
     }
 
     async fn ensure_pages_exist(&self, page_files: &mut [PageFile]) -> Result<()> {
+        // Collect unique pages to look up; pass ownership directly to match_existing_pages
+        // so no extra clone is needed.
         let pages = page_files
             .iter()
             .map(|pf| pf.page.to_owned())
             .collect::<Vec<_>>();
 
-        let pages_to_create = self
-            .match_existing_pages(page_files, pages.to_owned())
-            .await?;
+        let pages_to_create = self.match_existing_pages(page_files, pages).await?;
         if !pages_to_create.is_empty() {
             self.create_pages(&pages_to_create).await?;
             let failed_to_create = self
@@ -515,10 +515,8 @@ impl DbMySql2 {
     ) -> Result<Vec<Page>> {
         let mut pages_to_create = HashSet::new();
         for pages in all_pages.chunks(PAGES_CHUNK_SIZE) {
-            let placeholder = "(site=? AND title=? AND namespace_id=?)".to_string();
-            let mut placeholders: Vec<String> = Vec::new();
-            placeholders.resize(pages.len(), placeholder);
-            let placeholders = placeholders.join(" OR ");
+            let placeholders =
+                vec!["(site=? AND title=? AND namespace_id=?)"; pages.len()].join(" OR ");
 
             let params = pages
                 .iter()
