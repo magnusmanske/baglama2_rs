@@ -23,6 +23,7 @@ pub mod global_image_links;
 pub mod group_date;
 pub mod month_views;
 pub mod page;
+pub mod pageviews;
 pub mod row_group;
 pub mod row_group_status;
 pub mod site;

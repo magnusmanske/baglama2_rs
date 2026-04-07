@@ -3,90 +3,26 @@ use crate::{
     file::File,
     global_image_links::GlobalImageLinks,
     page::Page,
+    pageviews::dump_reader,
     Baglama2, DbId, GroupId, Site, ViewCount, YearMonth,
 };
 use anyhow::{anyhow, Result};
-use log::{error, info, warn};
+use log::{info, warn};
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    io::BufRead,
-    path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 use tokio::sync::Mutex;
-use tools_interface::{Pageviews, PageviewsAccess, PageviewsAgent, PageviewsGranularity};
 
 const FILES_CHUNK_SIZE: usize = 1000;
 const PAGES_CHUNK_SIZE: usize = 500;
 const MATCH_EXISTING_FILES_CHUNK_SIZE: usize = 10000;
-const VIEWDATA_BATCH_SIZE: usize = 1000;
 
 /// Number of UPDATE statements to batch together when writing back
 /// view counts obtained from the dump file.
 const DUMP_UPDATE_BATCH_SIZE: usize = 5000;
-
-/// Capacity of the bounded byte-channel used to pipe the HTTP download
-/// stream into the blocking decompression thread.  Each slot holds one
-/// `Bytes` chunk (~16-64 KiB typically), so 256 slots ≈ 4-16 MiB of
-/// buffering — enough to absorb network bursts without unbounded growth.
-const DOWNLOAD_CHANNEL_CAPACITY: usize = 256;
-
-/// Well-known Toolforge path where Wikimedia dumps are mirrored locally.
-const TOOLFORGE_DUMP_ROOT: &str = "/public/dumps";
-
-/// Two-level lookup: wiki_code → (title → Vec<pages_id>).
-///
-/// This structure allows the hot scanning loop to test the first level
-/// with a borrowed `&str` (zero allocation for the >99% of lines whose
-/// wiki code is irrelevant) and only proceed to the second level for
-/// the handful of wikis we actually care about.
-type DumpLookup = HashMap<String, HashMap<String, Vec<usize>>>;
-
-/// Adapter that implements `std::io::Read` by pulling `bytes::Bytes`
-/// chunks from a `std::sync::mpsc::Receiver`.  This bridges the async
-/// HTTP download (which sends chunks into the channel) with the
-/// synchronous `BzDecoder` running on a blocking thread.
-struct ChannelReader {
-    rx: std::sync::mpsc::Receiver<bytes::Bytes>,
-    /// Leftover bytes from the last chunk that weren't fully consumed.
-    buf: bytes::Bytes,
-}
-
-impl ChannelReader {
-    fn new(rx: std::sync::mpsc::Receiver<bytes::Bytes>) -> Self {
-        Self {
-            rx,
-            buf: bytes::Bytes::new(),
-        }
-    }
-}
-
-impl std::io::Read for ChannelReader {
-    fn read(&mut self, dest: &mut [u8]) -> std::io::Result<usize> {
-        // If we have leftover bytes from a previous chunk, serve from those first.
-        if !self.buf.is_empty() {
-            let n = std::cmp::min(dest.len(), self.buf.len());
-            dest[..n].copy_from_slice(&self.buf[..n]);
-            self.buf = self.buf.slice(n..);
-            return Ok(n);
-        }
-        // Block until the next chunk arrives (or the sender is dropped → EOF).
-        match self.rx.recv() {
-            Ok(chunk) => {
-                let n = std::cmp::min(dest.len(), chunk.len());
-                dest[..n].copy_from_slice(&chunk[..n]);
-                if n < chunk.len() {
-                    self.buf = chunk.slice(n..);
-                }
-                Ok(n)
-            }
-            Err(_) => Ok(0), // channel closed → EOF
-        }
-    }
-}
 
 struct PageFile {
     page: Page,
@@ -149,79 +85,17 @@ impl DbMySql2 {
     }
 
     // ------------------------------------------------------------------
-    // Dump-based bulk path
+    // Dump-based bulk path (delegates to pageviews::dump_reader)
     // ------------------------------------------------------------------
 
-    /// URL of the monthly pageview-complete dump for human ("user") traffic.
-    fn dump_url(&self) -> String {
-        let y = self.ym.year();
-        let m = self.ym.month();
-        format!(
-            "https://dumps.wikimedia.org/other/pageview_complete/\
-             monthly/{y}/{y}-{m:02}/pageviews-{y}{m:02}-user.bz2"
-        )
-    }
-
-    /// Return the local filesystem path to the dump if it is mirrored on
-    /// this host (e.g. Toolforge's `/public/dumps/`).  Returns `None` if
-    /// the file doesn't exist locally.
-    fn local_dump_path(&self) -> Option<PathBuf> {
-        let y = self.ym.year();
-        let m = self.ym.month();
-        let path = PathBuf::from(format!(
-            "{TOOLFORGE_DUMP_ROOT}/other/pageview_complete/\
-             monthly/{y}/{y}-{m:02}/pageviews-{y}{m:02}-user.bz2"
-        ));
-        if path.is_file() {
-            Some(path)
-        } else {
-            None
-        }
-    }
-
-    /// Build the two-level lookup from DB rows.
-    ///
-    /// Returns `(lookup, all_ids)` where `lookup` is wiki→title→ids and
-    /// `all_ids` is the full set of pages_ids we need to resolve.
-    fn build_dump_lookup(rows: Vec<(usize, String, String)>) -> (DumpLookup, HashSet<usize>) {
-        let mut lookup: DumpLookup = HashMap::new();
-        let mut all_ids: HashSet<usize> = HashSet::with_capacity(rows.len());
-
-        for (pages_id, server, title) in rows {
-            if title.is_empty() {
-                continue;
-            }
-            let wiki_code = match server.strip_suffix(".org") {
-                Some(w) => w,
-                None => continue,
-            };
-            let title_underscored = title.replace(' ', "_");
-            lookup
-                .entry(wiki_code.to_owned())
-                .or_default()
-                .entry(title_underscored)
-                .or_default()
-                .push(pages_id);
-            all_ids.insert(pages_id);
-        }
-        (lookup, all_ids)
-    }
-
-    /// Load **all** missing page-view counts in one pass over the monthly
+    /// Load all missing page-view counts in one pass over the monthly
     /// Wikimedia pageview dump.
-    ///
-    /// 1. Query the DB for every `(pages_id, server, title)` that still
-    ///    needs a view count (`page_views IS NULL`).
-    /// 2. Build a two-level `DumpLookup` (wiki → title → ids) so the
-    ///    scanning loop can reject irrelevant lines with zero allocation.
-    /// 3. Open the dump from a local mirror (if available) or stream it
-    ///    over HTTP while decompressing concurrently on a blocking thread.
-    /// 4. Flush the accumulated `pages_id → views` map to the DB.
-    /// 5. Any pages_ids not found in the dump get their count set to 0.
     async fn load_views_from_dump(&self) -> Result<()> {
         let table_name = self.table_name().to_owned();
+        let year = self.ym.year();
+        let month = self.ym.month();
 
-        // ---- step 1: load ALL rows that still need a view count --------
+        // Load all rows that still need a view count.
         let sql = format!(
             "SELECT `vd`.`pages_id`, `server`, `title`
              FROM `{table_name}` AS `vd`
@@ -245,42 +119,45 @@ impl DbMySql2 {
         }
         info!("load_views_from_dump: {} rows need view counts", rows.len());
 
-        // ---- step 2: build two-level look-up ---------------------------
-        let (lookup, all_ids) = Self::build_dump_lookup(rows);
+        // Build two-level lookup via the dump_reader module.
+        let (lookup, all_ids) = dump_reader::build_dump_lookup(rows);
         info!(
             "load_views_from_dump: {} wiki codes, {} unique (wiki, title) pairs",
             lookup.len(),
             lookup.values().map(|m| m.len()).sum::<usize>()
         );
 
-        // ---- step 3: open the dump (local mirror or streaming HTTP) ----
-        let (id2views, unmatched_ids) = if let Some(local_path) = self.local_dump_path() {
+        // Open the dump (local mirror or streaming HTTP).
+        let result = if let Some(local_path) = dump_reader::local_dump_path(year, month) {
             info!(
                 "load_views_from_dump: using local mirror at {}",
                 local_path.display()
             );
-            Self::scan_dump_from_local_file(&local_path, lookup, all_ids).await?
+            dump_reader::scan_dump_from_local_file(&local_path, lookup, all_ids).await?
         } else {
-            let dump_url = self.dump_url();
-            info!("load_views_from_dump: streaming from {}", &dump_url);
-            Self::scan_dump_from_http(&dump_url, lookup, all_ids).await?
+            let url = dump_reader::dump_url(year, month);
+            info!("load_views_from_dump: streaming from {}", &url);
+            dump_reader::scan_dump_from_http(&url, lookup, all_ids).await?
         };
 
         info!(
             "load_views_from_dump: found view data for {} pages_ids, \
              {} pages_ids had no dump entry (will be set to 0)",
-            id2views.len(),
-            unmatched_ids.len()
+            result.id2views.len(),
+            result.unmatched_ids.len()
         );
 
-        // ---- step 4: flush matched results to DB in batches -------------
-        self.flush_view_counts_to_db(&table_name, &id2views, &mut conn)
+        // Flush matched results to DB.
+        self.flush_view_counts_to_db(&table_name, &result.id2views, &mut conn)
             .await?;
 
-        // ---- step 5: pages not found in the dump → 0 views -------------
-        if !unmatched_ids.is_empty() {
-            let zeros: HashMap<usize, u64> =
-                unmatched_ids.into_iter().map(|id| (id, 0u64)).collect();
+        // Pages not found in the dump → 0 views.
+        if !result.unmatched_ids.is_empty() {
+            let zeros: HashMap<usize, u64> = result
+                .unmatched_ids
+                .into_iter()
+                .map(|id| (id, 0u64))
+                .collect();
             self.flush_view_counts_to_db(&table_name, &zeros, &mut conn)
                 .await?;
         }
@@ -289,220 +166,13 @@ impl DbMySql2 {
         Ok(())
     }
 
-    /// Scan the dump from a local file.  Runs the bz2 decompression +
-    /// line scan on a blocking thread to avoid starving the tokio runtime.
-    async fn scan_dump_from_local_file(
-        path: &PathBuf,
-        lookup: DumpLookup,
-        all_ids: HashSet<usize>,
-    ) -> Result<(HashMap<usize, u64>, HashSet<usize>)> {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&path)?;
-            let reader = std::io::BufReader::with_capacity(512 * 1024, file);
-            Self::scan_dump_reader(reader, &lookup, &all_ids)
-        })
-        .await?
-    }
-
-    /// Stream-download the dump over HTTP and decompress + scan it
-    /// concurrently on a blocking thread.
-    ///
-    /// Instead of downloading the entire ~4 GB file into memory first,
-    /// we pipe response chunks through a bounded `sync_channel` into the
-    /// blocking decompression thread.  This overlaps network I/O with
-    /// CPU-bound decompression so that wall-clock time ≈
-    /// `max(download_time, decompress_time)` rather than their sum, and
-    /// peak memory usage drops from ~4 GB to a small channel buffer.
-    async fn scan_dump_from_http(
-        dump_url: &str,
-        lookup: DumpLookup,
-        all_ids: HashSet<usize>,
-    ) -> Result<(HashMap<usize, u64>, HashSet<usize>)> {
-        use futures::StreamExt;
-
-        let response = reqwest::get(dump_url).await?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Dump download failed: HTTP {} for {}",
-                response.status(),
-                dump_url
-            ));
-        }
-
-        // Bounded channel: the async download task sends byte chunks, the
-        // blocking scanner thread receives them via a ChannelReader adapter.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(DOWNLOAD_CHANNEL_CAPACITY);
-
-        // Spawn the blocking scanner thread *first* so it's ready to
-        // consume bytes as soon as the download starts producing them.
-        let scan_handle = tokio::task::spawn_blocking(move || {
-            let reader = ChannelReader::new(rx);
-            let buf_reader = std::io::BufReader::with_capacity(512 * 1024, reader);
-            Self::scan_dump_reader(buf_reader, &lookup, &all_ids)
-        });
-
-        // Stream response body chunks into the channel.
-        let mut stream = response.bytes_stream();
-        let mut downloaded_bytes: u64 = 0;
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    downloaded_bytes += chunk.len() as u64;
-                    // If the scanner thread panicked / finished early the
-                    // send will fail — that's fine, we'll catch the error
-                    // from scan_handle below.
-                    if tx.send(chunk).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    // Drop the sender so the scanner sees EOF and can
-                    // report whatever partial results it has (or error).
-                    drop(tx);
-                    return Err(anyhow!(
-                        "HTTP stream error after {} MiB: {}",
-                        downloaded_bytes / (1024 * 1024),
-                        e
-                    ));
-                }
-            }
-        }
-        // Drop the sender to signal EOF to the scanner.
-        drop(tx);
-        info!(
-            "load_views_from_dump: download complete ({} MiB), waiting for scanner…",
-            downloaded_bytes / (1024 * 1024)
-        );
-
-        scan_handle.await?
-    }
-
-    /// Core scanning logic shared by the local-file and streaming-HTTP
-    /// paths.  Accepts any `Read` source (a local `BzDecoder<File>` or a
-    /// `BzDecoder<ChannelReader>`).
-    ///
-    /// Uses a **two-level lookup** (`wiki → title → ids`) so that lines
-    /// whose wiki code is not in our lookup are rejected with a single
-    /// `HashMap::get` on a borrowed `&str` — zero allocation for the vast
-    /// majority of the ~400 M lines in the dump.
-    ///
-    /// Uses `read_line` into a **reusable `String` buffer** instead of
-    /// the `.lines()` iterator, avoiding a fresh allocation per line.
-    fn scan_dump_reader<R: std::io::Read>(
-        raw_reader: std::io::BufReader<R>,
-        lookup: &DumpLookup,
-        all_ids: &HashSet<usize>,
-    ) -> Result<(HashMap<usize, u64>, HashSet<usize>)> {
-        use bzip2::read::BzDecoder;
-
-        let decompressor = BzDecoder::new(raw_reader);
-        let mut buf_reader = std::io::BufReader::with_capacity(256 * 1024, decompressor);
-
-        let mut id2views: HashMap<usize, u64> = HashMap::new();
-        let mut lines_scanned: u64 = 0;
-        let mut matched_count: u64 = 0;
-        let mut line_buf = String::with_capacity(512);
-
-        loop {
-            line_buf.clear();
-            match buf_reader.read_line(&mut line_buf) {
-                Ok(0) => break, // EOF
-                Ok(_) => {}
-                Err(e) => {
-                    if lines_scanned > 0 {
-                        eprintln!(
-                            "load_views_from_dump: I/O error at line {}: {}",
-                            lines_scanned, e
-                        );
-                    }
-                    continue;
-                }
-            }
-            lines_scanned += 1;
-            if lines_scanned % 50_000_000 == 0 {
-                eprintln!(
-                    "load_views_from_dump: scanned {} M lines, {} matches so far",
-                    lines_scanned / 1_000_000,
-                    matched_count
-                );
-            }
-
-            // Strip trailing newline for clean field splitting.
-            let line = line_buf.trim_end_matches('\n').trim_end_matches('\r');
-
-            // Format: wiki_code  title  page_id  access_type  monthly_total  hourly
-            // Fields are space-separated.  Titles already use underscores.
-            // We only need columns 0, 1, and 4.
-            let mut cols = line.splitn(6, ' ');
-            let wiki_code = match cols.next() {
-                Some(w) if !w.is_empty() => w,
-                _ => continue,
-            };
-
-            // --- first-level check: do we care about this wiki at all? ---
-            // This is a HashMap::get with a borrowed &str, zero allocation.
-            let title_map = match lookup.get(wiki_code) {
-                Some(m) => m,
-                None => continue,
-            };
-
-            let title = match cols.next() {
-                Some(t) if !t.is_empty() => t,
-                _ => continue,
-            };
-
-            // --- second-level check: do we care about this title? --------
-            let pages_ids = match title_map.get(title) {
-                Some(ids) => ids,
-                None => continue,
-            };
-
-            // Skip page_id (col 2) and access_type (col 3).
-            let _page_id = cols.next();
-            let _access = cols.next();
-            let monthly_total: u64 = match cols.next().and_then(|s| s.parse().ok()) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            // The dump may contain multiple rows per (wiki, title) — one
-            // per access type (desktop / mobile-web / mobile-app).  We
-            // need to **sum** them all.
-            matched_count += 1;
-            for &pid in pages_ids {
-                *id2views.entry(pid).or_insert(0) += monthly_total;
-            }
-        }
-
-        eprintln!(
-            "load_views_from_dump: finished scanning {} lines, \
-             {} matching rows, {} unique pages_ids with views",
-            lines_scanned,
-            matched_count,
-            id2views.len()
-        );
-
-        // Determine which pages_ids were never touched.
-        let unmatched: HashSet<usize> = all_ids
-            .iter()
-            .filter(|id| !id2views.contains_key(id))
-            .copied()
-            .collect();
-
-        Ok((id2views, unmatched))
-    }
-
     /// Write a batch of `pages_id → views` pairs into the viewdata table.
-    ///
-    /// Also used by the per-page API fallback path.
     async fn flush_view_counts_to_db(
         &self,
         table_name: &str,
         id2views: &HashMap<usize, u64>,
         conn: &mut mysql_async::Conn,
     ) -> Result<()> {
-        // Process in chunks to avoid building a single enormous SQL string.
         let entries: Vec<_> = id2views.iter().collect();
         for chunk in entries.chunks(DUMP_UPDATE_BATCH_SIZE) {
             let ids = chunk
@@ -526,93 +196,51 @@ impl DbMySql2 {
     }
 
     // ------------------------------------------------------------------
-    // Per-page REST API fallback  (original approach)
+    // Per-page REST API fallback (delegates to pageviews::api_fallback)
     // ------------------------------------------------------------------
 
     /// Fall-back method that fetches view counts one page at a time via the
-    /// Wikimedia per-article pageview REST API.  This is much slower than
-    /// the dump-based path but works for months whose dump has not been
-    /// published yet.
+    /// Wikimedia per-article pageview REST API.
     async fn load_views_from_api(&self) -> Result<()> {
-        let table_name = self.table_name();
-        let pv = Pageviews::new(
-            PageviewsGranularity::Monthly,
-            PageviewsAccess::All,
-            PageviewsAgent::User,
-        );
-        let sql = format!(
-            "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
-			        FROM `{table_name}` AS `vd`,`pages`,`sites`
-			        WHERE `page_views` IS NULL
-			        AND `pages_id`=`pages`.`id`
-			        AND `pages`.`site`=`sites`.`id`
-			        LIMIT {VIEWDATA_BATCH_SIZE}"
-        );
-        let mut conn = self.baglama.get_tooldb_conn().await?;
-        loop {
-            let rows = conn
-                .exec_iter(&sql, ())
-                .await?
-                .map_and_drop(from_row_opt::<(usize, String, String)>)
-                .await?
-                .into_iter()
-                .filter_map(|row| row.ok())
-                .collect::<Vec<_>>();
-            if rows.is_empty() {
-                break;
-            }
-            info!(
-                "load_views_from_api: {} rows, starting with page_id {}",
-                rows.len(),
-                rows[0].0
-            );
+        let table_name = self.table_name().to_owned();
+        let baglama = self.baglama.clone();
 
-            let page2id = rows
-                .into_iter()
-                .filter(|(_id, _server, title)| !title.is_empty())
-                .filter_map(|(id, server, title)| {
-                    let title_with_underscores = title.replace(' ', "_");
-                    let project = server.strip_suffix(".org")?.to_string();
-                    Some(((project, title_with_underscores), id))
-                })
-                .collect::<HashMap<(String, String), usize>>();
-            let project_pages = page2id.keys().cloned().collect::<Vec<_>>();
-
-            let results = pv
-                .get_multiple_articles(
-                    &project_pages,
-                    &Pageviews::month_start(self.ym.year(), self.ym.month()).unwrap(),
-                    &Pageviews::month_end(self.ym.year(), self.ym.month()).unwrap(),
-                    5,
-                )
-                .await;
-            let results = match results {
-                Ok(results) => results,
-                Err(e) => {
-                    error!("Error getting pageviews: {}. Waiting 5 seconds.", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            let mut id2views: HashMap<usize, u64> = page2id.values().map(|id| (*id, 0)).collect();
-            for result in results {
-                let key = (result.project.to_owned(), result.article.to_owned());
-                match page2id.get(&key) {
-                    Some(id) => {
-                        id2views.insert(*id, result.total_views());
+        crate::pageviews::api_fallback::load_views_from_api(
+            &baglama,
+            &self.ym,
+            &table_name,
+            |id2views| {
+                let this_table = table_name.clone();
+                let this_baglama = baglama.clone();
+                async move {
+                    // Acquire a connection for each batch flush.
+                    let mut conn = this_baglama.get_tooldb_conn().await?;
+                    let entries: Vec<_> = id2views.iter().collect();
+                    for chunk in entries.chunks(DUMP_UPDATE_BATCH_SIZE) {
+                        let ids = chunk
+                            .iter()
+                            .map(|(id, _)| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let cases = chunk
+                            .iter()
+                            .map(|(id, views)| format!("WHEN {} THEN {}", id, views))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let sql = format!(
+                            "UPDATE `{this_table}` \
+                             SET `page_views` = CASE `pages_id` {cases} ELSE `page_views` END \
+                             WHERE `pages_id` IN ({ids})"
+                        );
+                        conn.exec_drop(&sql, ()).await?;
                     }
-                    None => {
-                        error!("Page not found: {:?}", key);
-                    }
+                    Ok(())
                 }
-            }
+            },
+        )
+        .await?;
 
-            self.flush_view_counts_to_db(table_name, &id2views, &mut conn)
-                .await?;
-
-            self.finalize_group_status().await?;
-        }
+        self.finalize_group_status().await?;
         Ok(())
     }
 
@@ -1355,9 +983,6 @@ mod tests {
     /// even when multiple PageFile entries reference the same missing file.
     #[test]
     fn test_match_existing_files_no_duplicates_in_returned_list() {
-        // Simulate the interior logic: given a file2id map that does NOT contain
-        // "missing.jpg", three PageFile entries all referencing "missing.jpg" should
-        // produce exactly one entry in the returned Vec, not three.
         let file2id: HashMap<String, DbId> = [("existing.jpg".to_string(), 42usize)]
             .into_iter()
             .collect();
@@ -1382,7 +1007,6 @@ mod tests {
         }
         let result: Vec<String> = files_to_create.into_iter().collect();
 
-        // Exactly one distinct missing file name must be returned.
         assert_eq!(
             result.len(),
             1,
@@ -1390,170 +1014,10 @@ mod tests {
             result.len()
         );
         assert_eq!(result[0], "missing.jpg");
-
-        // The existing file's id must have been set on its PageFile entry.
         assert_eq!(page_files[3].file.id, Some(42));
-        // The missing entries must still have no id.
         assert!(page_files[0].file.id.is_none());
         assert!(page_files[1].file.id.is_none());
         assert!(page_files[2].file.id.is_none());
-    }
-
-    /// dump_url must produce the correct Wikimedia dump URL for a given year/month.
-    #[test]
-    fn test_dump_url_format() {
-        let url = format!(
-            "https://dumps.wikimedia.org/other/pageview_complete/\
-             monthly/{y}/{y}-{m:02}/pageviews-{y}{m:02}-user.bz2",
-            y = 2025,
-            m = 1
-        );
-        assert_eq!(
-            url,
-            "https://dumps.wikimedia.org/other/pageview_complete/monthly/2025/2025-01/pageviews-202501-user.bz2"
-        );
-    }
-
-    /// Helper to compress text and run scan_dump_reader against it.
-    fn compress_and_scan(
-        dump_text: &str,
-        lookup: &DumpLookup,
-        all_ids: &HashSet<usize>,
-    ) -> (HashMap<usize, u64>, HashSet<usize>) {
-        use bzip2::write::BzEncoder;
-        use bzip2::Compression;
-        use std::io::Write;
-
-        let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(dump_text.as_bytes()).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let buf_reader = std::io::BufReader::new(compressed.as_slice());
-        DbMySql2::scan_dump_reader(buf_reader, lookup, all_ids).unwrap()
-    }
-
-    /// scan_dump_reader must correctly parse a bz2-compressed pageview
-    /// dump fragment, summing across access types and returning unmatched
-    /// ids, using the two-level DumpLookup.
-    #[test]
-    fn test_scan_dump_reader_basic() {
-        // Build a tiny fake dump with two access-type rows for one page
-        // and one row for an unrelated page that is NOT in our lookup.
-        let dump_text = "\
-en.wikipedia Barack_Obama null desktop 100 A100\n\
-en.wikipedia Barack_Obama null mobile-web 50 A50\n\
-de.wikipedia Trude_Herr null desktop 30 A30\n\
-fr.wikipedia Unrelated_Page null desktop 999 A999\n";
-
-        // Two-level lookup
-        let mut lookup: DumpLookup = HashMap::new();
-        lookup
-            .entry("en.wikipedia".into())
-            .or_default()
-            .insert("Barack_Obama".into(), vec![1, 2]);
-        lookup
-            .entry("de.wikipedia".into())
-            .or_default()
-            .insert("Trude_Herr".into(), vec![3]);
-
-        let all_ids: HashSet<usize> = [1, 2, 3, 4].into_iter().collect();
-
-        let (id2views, unmatched) = compress_and_scan(dump_text, &lookup, &all_ids);
-
-        // Barack_Obama: desktop(100) + mobile-web(50) = 150 for both ids 1 and 2
-        assert_eq!(id2views.get(&1), Some(&150));
-        assert_eq!(id2views.get(&2), Some(&150));
-        // Trude_Herr: desktop(30) for id 3
-        assert_eq!(id2views.get(&3), Some(&30));
-        // id 4 was never in any lookup entry
-        assert!(unmatched.contains(&4));
-        assert_eq!(unmatched.len(), 1);
-    }
-
-    /// scan_dump_reader with an empty lookup must return all ids as unmatched.
-    #[test]
-    fn test_scan_dump_reader_empty_lookup() {
-        let dump_text = "en.wikipedia Some_Page null desktop 42 A42\n";
-
-        let lookup: DumpLookup = HashMap::new();
-        let all_ids: HashSet<usize> = [10].into_iter().collect();
-
-        let (id2views, unmatched) = compress_and_scan(dump_text, &lookup, &all_ids);
-
-        assert!(id2views.is_empty());
-        assert_eq!(unmatched.len(), 1);
-        assert!(unmatched.contains(&10));
-    }
-
-    /// build_dump_lookup must produce a correct two-level structure.
-    #[test]
-    fn test_build_dump_lookup() {
-        let rows = vec![
-            (1, "en.wikipedia.org".to_string(), "Foo Bar".to_string()),
-            (2, "en.wikipedia.org".to_string(), "Foo Bar".to_string()),
-            (3, "de.wikipedia.org".to_string(), "Baz".to_string()),
-            (4, "bad-no-dot-org".to_string(), "Ignored".to_string()),
-            (5, "en.wikipedia.org".to_string(), "".to_string()),
-        ];
-        let (lookup, all_ids) = DbMySql2::build_dump_lookup(rows);
-
-        // Only ids 1,2,3 should appear (4 has bad server, 5 has empty title).
-        assert_eq!(all_ids.len(), 3);
-        assert!(all_ids.contains(&1));
-        assert!(all_ids.contains(&2));
-        assert!(all_ids.contains(&3));
-
-        // Two wiki codes.
-        assert_eq!(lookup.len(), 2);
-
-        // en.wikipedia → Foo_Bar → [1, 2]  (spaces → underscores)
-        let en = lookup.get("en.wikipedia").unwrap();
-        assert_eq!(en.get("Foo_Bar").unwrap(), &vec![1, 2]);
-
-        // de.wikipedia → Baz → [3]
-        let de = lookup.get("de.wikipedia").unwrap();
-        assert_eq!(de.get("Baz").unwrap(), &vec![3]);
-    }
-
-    /// The two-level lookup must skip lines for irrelevant wikis without
-    /// allocating, and only match when both wiki AND title are present.
-    #[test]
-    fn test_scan_dump_two_level_selectivity() {
-        // Lookup only cares about en.wikipedia / Page_A.
-        let mut lookup: DumpLookup = HashMap::new();
-        lookup
-            .entry("en.wikipedia".into())
-            .or_default()
-            .insert("Page_A".into(), vec![1]);
-
-        let all_ids: HashSet<usize> = [1].into_iter().collect();
-
-        // Dump has en.wikipedia/Page_A (match), en.wikipedia/Page_B (miss
-        // at title level), and de.wikipedia/Page_A (miss at wiki level).
-        let dump_text = "\
-en.wikipedia Page_A null desktop 10 A10\n\
-en.wikipedia Page_B null desktop 20 A20\n\
-de.wikipedia Page_A null desktop 30 A30\n";
-
-        let (id2views, unmatched) = compress_and_scan(dump_text, &lookup, &all_ids);
-
-        // Only the en.wikipedia/Page_A row (10 views) should match.
-        assert_eq!(id2views.get(&1), Some(&10));
-        assert!(unmatched.is_empty());
-    }
-
-    /// ChannelReader must bridge sync reads from an mpsc channel.
-    #[test]
-    fn test_channel_reader() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(4);
-        tx.send(bytes::Bytes::from_static(b"hello ")).unwrap();
-        tx.send(bytes::Bytes::from_static(b"world")).unwrap();
-        drop(tx);
-
-        let mut reader = ChannelReader::new(rx);
-        let mut out = String::new();
-        std::io::Read::read_to_string(&mut reader, &mut out).unwrap();
-        assert_eq!(out, "hello world");
     }
 
     /// table_name must be computed once at construction time and return the
