@@ -6,12 +6,12 @@ use crate::{
     Baglama2, DbId, GroupId, Site, ViewCount, YearMonth,
 };
 use anyhow::{anyhow, Result};
-
 use log::{error, info, warn};
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    io::BufRead,
     sync::Arc,
     time::Duration,
 };
@@ -22,6 +22,10 @@ const FILES_CHUNK_SIZE: usize = 1000;
 const PAGES_CHUNK_SIZE: usize = 500;
 const MATCH_EXISTING_FILES_CHUNK_SIZE: usize = 10000;
 const VIEWDATA_BATCH_SIZE: usize = 1000;
+
+/// Number of UPDATE statements to batch together when writing back
+/// view counts obtained from the dump file.
+const DUMP_UPDATE_BATCH_SIZE: usize = 5000;
 
 struct PageFile {
     page: Page,
@@ -61,12 +65,311 @@ impl DbMySql2 {
         Ok(ret)
     }
 
+    /// Load missing page-view counts.
+    ///
+    /// Tries the fast dump-based path first (a single streaming scan of the
+    /// monthly Wikimedia pageview dump file).  If the dump is not yet
+    /// available for the requested month, falls back to the per-page REST
+    /// API which is slower but works for the current/recent month.
     pub async fn load_missing_views(&self) -> Result<()> {
+        match self.load_views_from_dump().await {
+            Ok(()) => {
+                info!("Pageview dump processed successfully — all views loaded from dump");
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    "Dump-based view loading failed ({}), falling back to per-page API",
+                    e
+                );
+            }
+        }
+        self.load_views_from_api().await
+    }
+
+    // ------------------------------------------------------------------
+    // Dump-based bulk path
+    // ------------------------------------------------------------------
+
+    /// URL of the monthly pageview-complete dump for human ("user") traffic.
+    fn dump_url(&self) -> String {
+        let y = self.ym.year();
+        let m = self.ym.month();
+        format!(
+            "https://dumps.wikimedia.org/other/pageview_complete/\
+             monthly/{y}/{y}-{m:02}/pageviews-{y}{m:02}-user.bz2"
+        )
+    }
+
+    /// Load **all** missing page-view counts in one pass over the monthly
+    /// Wikimedia pageview dump.
+    ///
+    /// 1. Query the DB for every `(pages_id, server, title)` that still
+    ///    needs a view count (`page_views IS NULL`).
+    /// 2. Build a `HashMap<(wiki_code, title), Vec<pages_id>>` look-up
+    ///    (multiple viewdata rows can map to the same wiki+title pair).
+    /// 3. Stream-download + decompress the bz2 dump; for every line whose
+    ///    `(wiki_code, title)` is in the look-up, record the view total.
+    /// 4. Flush the accumulated `pages_id → views` map to the DB in
+    ///    batches.
+    /// 5. Any pages_ids that were in the look-up but NOT found in the dump
+    ///    get their count set to 0 (the page simply had zero views that
+    ///    month).
+    async fn load_views_from_dump(&self) -> Result<()> {
+        let table_name = self.table_name().to_owned();
+
+        // ---- step 1: load ALL rows that still need a view count --------
+        let sql = format!(
+            "SELECT `vd`.`pages_id`, `server`, `title`
+             FROM `{table_name}` AS `vd`
+             JOIN `pages`  ON `pages_id`  = `pages`.`id`
+             JOIN `sites`  ON `pages`.`site` = `sites`.`id`
+             WHERE `page_views` IS NULL"
+        );
+        let mut conn = self.baglama.get_tooldb_conn().await?;
+        let rows = conn
+            .exec_iter(&sql, ())
+            .await?
+            .map_and_drop(from_row_opt::<(usize, String, String)>)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+
+        if rows.is_empty() {
+            info!("load_views_from_dump: nothing to do (no NULL page_views)");
+            return Ok(());
+        }
+        info!("load_views_from_dump: {} rows need view counts", rows.len());
+
+        // ---- step 2: build look-up keyed by (wiki_code, title) ---------
+        //
+        // wiki_code in the dump is the `server` column minus the trailing
+        // ".org", e.g. "en.wikipedia".  Titles in the dump use underscores
+        // instead of spaces.
+        //
+        // Multiple pages_ids may map to the same (wiki_code, title) when the
+        // same page appears in several groups, so we collect into Vecs.
+        let mut lookup: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        // Collect all pages_ids so we can later detect which ones had zero
+        // views (never appeared in the dump).
+        let mut all_ids: HashSet<usize> = HashSet::with_capacity(rows.len());
+
+        for (pages_id, server, title) in rows {
+            if title.is_empty() {
+                continue;
+            }
+            let wiki_code = match server.strip_suffix(".org") {
+                Some(w) => w.to_owned(),
+                None => continue,
+            };
+            let title_underscored = title.replace(' ', "_");
+            lookup
+                .entry((wiki_code, title_underscored))
+                .or_default()
+                .push(pages_id);
+            all_ids.insert(pages_id);
+        }
+
+        info!(
+            "load_views_from_dump: {} unique (wiki, title) pairs to look up",
+            lookup.len()
+        );
+
+        // ---- step 3: download the dump ---------------------------------
+        let dump_url = self.dump_url();
+        info!("load_views_from_dump: downloading {}", &dump_url);
+
+        let response = reqwest::get(&dump_url).await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Dump download failed: HTTP {} for {}",
+                response.status(),
+                dump_url
+            ));
+        }
+
+        let body_bytes = response.bytes().await?;
+        info!(
+            "load_views_from_dump: downloaded {} MiB, decompressing + scanning…",
+            body_bytes.len() / (1024 * 1024)
+        );
+
+        // CPU-heavy bz2 decompression + line scanning runs on a blocking
+        // thread so we don't starve the tokio runtime.
+        let (id2views, unmatched_ids) = tokio::task::spawn_blocking(
+            move || -> Result<(HashMap<usize, u64>, HashSet<usize>)> {
+                Self::scan_dump_bytes(&body_bytes, &lookup, &all_ids)
+            },
+        )
+        .await??;
+
+        info!(
+            "load_views_from_dump: found view data for {} pages_ids, \
+             {} pages_ids had no dump entry (will be set to 0)",
+            id2views.len(),
+            unmatched_ids.len()
+        );
+
+        // ---- step 4: flush matched results to DB in batches -------------
+        self.flush_view_counts_to_db(&table_name, &id2views, &mut conn)
+            .await?;
+
+        // ---- step 5: pages not found in the dump → 0 views -------------
+        if !unmatched_ids.is_empty() {
+            let zeros: HashMap<usize, u64> =
+                unmatched_ids.into_iter().map(|id| (id, 0u64)).collect();
+            self.flush_view_counts_to_db(&table_name, &zeros, &mut conn)
+                .await?;
+        }
+
+        self.finalize_group_status().await?;
+        Ok(())
+    }
+
+    /// Synchronously decompress a bz2 byte buffer and scan every line
+    /// against the look-up map.  Returns a `pages_id → total_views` map
+    /// for every page that was found, plus the set of `pages_id`s that
+    /// were never matched (zero views).
+    fn scan_dump_bytes(
+        compressed: &[u8],
+        lookup: &HashMap<(String, String), Vec<usize>>,
+        all_ids: &HashSet<usize>,
+    ) -> Result<(HashMap<usize, u64>, HashSet<usize>)> {
+        use bzip2::read::BzDecoder;
+
+        let decompressor = BzDecoder::new(compressed);
+        let buf_reader = std::io::BufReader::with_capacity(256 * 1024, decompressor);
+
+        let mut id2views: HashMap<usize, u64> = HashMap::new();
+        let mut lines_scanned: u64 = 0;
+        // Track how many unique lookup keys we have matched so far.
+        let mut matched_keys: HashSet<(String, String)> = HashSet::new();
+
+        for line_result in buf_reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    // A handful of malformed lines in a multi-GB file are
+                    // tolerable; log and skip.
+                    if lines_scanned > 0 {
+                        eprintln!(
+                            "load_views_from_dump: I/O error at line {}: {}",
+                            lines_scanned, e
+                        );
+                    }
+                    continue;
+                }
+            };
+            lines_scanned += 1;
+            if lines_scanned % 50_000_000 == 0 {
+                eprintln!(
+                    "load_views_from_dump: scanned {} M lines, {} key-matches so far",
+                    lines_scanned / 1_000_000,
+                    matched_keys.len()
+                );
+            }
+
+            // Format: wiki_code  title  page_id  access_type  monthly_total  hourly
+            // Fields are separated by spaces.  Titles may NOT contain
+            // spaces (they are already underscored in the dump).
+            // We only need columns 0, 1, and 4.
+            let mut cols = line.splitn(6, ' ');
+            let wiki_code = match cols.next() {
+                Some(w) => w,
+                None => continue,
+            };
+            let title = match cols.next() {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Check the look-up *before* parsing the remaining columns so
+            // the vast majority of non-matching lines are skipped cheaply.
+            let key = (wiki_code.to_owned(), title.to_owned());
+            let pages_ids = match lookup.get(&key) {
+                Some(ids) => ids,
+                None => continue,
+            };
+
+            // Skip page_id (col 2) and access_type (col 3).
+            let _page_id = cols.next();
+            let _access = cols.next();
+            let monthly_total: u64 = match cols.next().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // The dump may contain multiple rows per (wiki, title) — one
+            // per access type (desktop / mobile-web / mobile-app).  We
+            // need to **sum** them all.
+            matched_keys.insert(key);
+            for &pid in pages_ids {
+                *id2views.entry(pid).or_insert(0) += monthly_total;
+            }
+        }
+
+        eprintln!(
+            "load_views_from_dump: finished scanning {} lines total, \
+             matched {} unique keys",
+            lines_scanned,
+            matched_keys.len()
+        );
+
+        // Determine which pages_ids were never touched.
+        let unmatched: HashSet<usize> = all_ids
+            .iter()
+            .filter(|id| !id2views.contains_key(id))
+            .copied()
+            .collect();
+
+        Ok((id2views, unmatched))
+    }
+
+    /// Write a batch of `pages_id → views` pairs into the viewdata table.
+    async fn flush_view_counts_to_db(
+        &self,
+        table_name: &str,
+        id2views: &HashMap<usize, u64>,
+        conn: &mut mysql_async::Conn,
+    ) -> Result<()> {
+        // Process in chunks to avoid building a single enormous SQL string.
+        let entries: Vec<_> = id2views.iter().collect();
+        for chunk in entries.chunks(DUMP_UPDATE_BATCH_SIZE) {
+            let ids = chunk
+                .iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let cases = chunk
+                .iter()
+                .map(|(id, views)| format!("WHEN {} THEN {}", id, views))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let sql = format!(
+                "UPDATE `{table_name}` \
+                 SET `page_views` = CASE `pages_id` {cases} ELSE `page_views` END \
+                 WHERE `pages_id` IN ({ids})"
+            );
+            conn.exec_drop(&sql, ()).await?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Per-page REST API fallback  (original approach)
+    // ------------------------------------------------------------------
+
+    /// Fall-back method that fetches view counts one page at a time via the
+    /// Wikimedia per-article pageview REST API.  This is much slower than
+    /// the dump-based path but works for months whose dump has not been
+    /// published yet.
+    async fn load_views_from_api(&self) -> Result<()> {
         let table_name = self.table_name();
         let pv = Pageviews::new(
-            PageviewsGranularity::Monthly, // Get monthly views
-            PageviewsAccess::All,          // Get all-access views
-            PageviewsAgent::User,          // Get views from humans only
+            PageviewsGranularity::Monthly,
+            PageviewsAccess::All,
+            PageviewsAgent::User,
         );
         let sql = format!(
             "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
@@ -76,10 +379,8 @@ impl DbMySql2 {
 			        AND `pages`.`site`=`sites`.`id`
 			        LIMIT {VIEWDATA_BATCH_SIZE}"
         );
-        // Acquire one connection for the entire outer loop instead of once per iteration.
         let mut conn = self.baglama.get_tooldb_conn().await?;
         loop {
-            // Get next VIEWDATA_BATCH_SIZE rows with missing view data from database
             let rows = conn
                 .exec_iter(&sql, ())
                 .await?
@@ -89,16 +390,14 @@ impl DbMySql2 {
                 .filter_map(|row| row.ok())
                 .collect::<Vec<_>>();
             if rows.is_empty() {
-                // All done
                 break;
             }
             info!(
-                "Got {} rows, starting with page_id {}",
+                "load_views_from_api: {} rows, starting with page_id {}",
                 rows.len(),
                 rows[0].0
             );
 
-            // Prepare getting view data from API
             let page2id = rows
                 .into_iter()
                 .filter(|(_id, _server, title)| !title.is_empty())
@@ -110,7 +409,6 @@ impl DbMySql2 {
                 .collect::<HashMap<(String, String), usize>>();
             let project_pages = page2id.keys().cloned().collect::<Vec<_>>();
 
-            // Get view data from API
             let results = pv
                 .get_multiple_articles(
                     &project_pages,
@@ -128,12 +426,9 @@ impl DbMySql2 {
                 }
             };
 
-            // Map results back to viewdata_*.id
             let mut id2views: HashMap<usize, u64> = page2id.values().map(|id| (*id, 0)).collect();
             for result in results {
-                let project = result.project.to_owned();
-                let page = result.article.to_owned();
-                let key = (project, page);
+                let key = (result.project.to_owned(), result.article.to_owned());
                 match page2id.get(&key) {
                     Some(id) => {
                         id2views.insert(*id, result.total_views());
@@ -144,25 +439,8 @@ impl DbMySql2 {
                 }
             }
 
-            // Construct SQL query
-            let ids = id2views
-                .keys()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = id2views
-                .into_iter()
-                .map(|(id, views)| format!("WHEN {id} THEN {views}"))
-                .collect::<Vec<String>>()
-                .join("\n");
-            let sql = format!(
-                "UPDATE {table_name}
-            	SET page_views = CASE pages_id {sql} ELSE page_views END
-             	WHERE pages_id IN ({ids})"
-            );
-
-            // Update page_views column
-            conn.exec_drop(sql, ()).await?;
+            self.flush_view_counts_to_db(&table_name, &id2views, &mut conn)
+                .await?;
 
             self.finalize_group_status().await?;
         }
@@ -950,6 +1228,84 @@ mod tests {
         assert!(page_files[0].file.id.is_none());
         assert!(page_files[1].file.id.is_none());
         assert!(page_files[2].file.id.is_none());
+    }
+
+    /// dump_url must produce the correct Wikimedia dump URL for a given year/month.
+    #[test]
+    fn test_dump_url_format() {
+        let url = format!(
+            "https://dumps.wikimedia.org/other/pageview_complete/\
+             monthly/{y}/{y}-{m:02}/pageviews-{y}{m:02}-user.bz2",
+            y = 2025,
+            m = 1
+        );
+        assert_eq!(
+            url,
+            "https://dumps.wikimedia.org/other/pageview_complete/monthly/2025/2025-01/pageviews-202501-user.bz2"
+        );
+    }
+
+    /// scan_dump_bytes must correctly parse a bz2-compressed pageview dump
+    /// fragment, summing across access types and returning unmatched ids.
+    #[test]
+    fn test_scan_dump_bytes_basic() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        // Build a tiny fake dump with two access-type rows for one page
+        // and one row for an unrelated page that is NOT in our lookup.
+        let dump_text = "\
+en.wikipedia Barack_Obama null desktop 100 A100\n\
+en.wikipedia Barack_Obama null mobile-web 50 A50\n\
+de.wikipedia Trude_Herr null desktop 30 A30\n\
+fr.wikipedia Unrelated_Page null desktop 999 A999\n";
+
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(dump_text.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Lookup: en.wikipedia/Barack_Obama → [1, 2], de.wikipedia/Trude_Herr → [3]
+        let mut lookup: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        lookup.insert(("en.wikipedia".into(), "Barack_Obama".into()), vec![1, 2]);
+        lookup.insert(("de.wikipedia".into(), "Trude_Herr".into()), vec![3]);
+
+        let all_ids: HashSet<usize> = [1, 2, 3, 4].into_iter().collect();
+
+        let (id2views, unmatched) =
+            DbMySql2::scan_dump_bytes(&compressed, &lookup, &all_ids).unwrap();
+
+        // Barack_Obama: desktop(100) + mobile-web(50) = 150 for both ids 1 and 2
+        assert_eq!(id2views.get(&1), Some(&150));
+        assert_eq!(id2views.get(&2), Some(&150));
+        // Trude_Herr: desktop(30) for id 3
+        assert_eq!(id2views.get(&3), Some(&30));
+        // id 4 was never in any lookup entry
+        assert!(unmatched.contains(&4));
+        assert_eq!(unmatched.len(), 1);
+    }
+
+    /// scan_dump_bytes with an empty lookup must return all ids as unmatched.
+    #[test]
+    fn test_scan_dump_bytes_empty_lookup() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let dump_text = "en.wikipedia Some_Page null desktop 42 A42\n";
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(dump_text.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let lookup: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        let all_ids: HashSet<usize> = [10].into_iter().collect();
+
+        let (id2views, unmatched) =
+            DbMySql2::scan_dump_bytes(&compressed, &lookup, &all_ids).unwrap();
+
+        assert!(id2views.is_empty());
+        assert_eq!(unmatched.len(), 1);
+        assert!(unmatched.contains(&10));
     }
 
     /// table_name must be computed once at construction time and return the
