@@ -12,7 +12,8 @@ mysql_async = "0.36"
 tokio = { version = "^1", features = ["full", "rt-multi-thread"] }
 futures = "0.3"
 serde_json = "^1"
-reqwest = { version = "0.13", features = ["gzip", "deflate", "brotli"] }
+reqwest = { version = "0.13", features = ["gzip", "deflate", "brotli", "stream"] }
+bytes = "1"
 chronoutil = "0.2"
 chrono = "0.4"
 regex = "1"
