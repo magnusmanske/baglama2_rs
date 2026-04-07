@@ -262,7 +262,7 @@ impl DbMySql2 {
                 }
             };
             lines_scanned += 1;
-            if lines_scanned % 50_000_000 == 0 {
+            if lines_scanned.is_multiple_of(50_000_000) {
                 eprintln!(
                     "load_views_from_dump: scanned {} M lines, {} key-matches so far",
                     lines_scanned / 1_000_000,
@@ -439,7 +439,7 @@ impl DbMySql2 {
                 }
             }
 
-            self.flush_view_counts_to_db(&table_name, &id2views, &mut conn)
+            self.flush_view_counts_to_db(table_name, &id2views, &mut conn)
                 .await?;
 
             self.finalize_group_status().await?;
