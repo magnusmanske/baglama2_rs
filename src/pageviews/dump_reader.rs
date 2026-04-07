@@ -274,7 +274,7 @@ pub fn scan_dump_reader<R: std::io::Read>(
             }
         }
         lines_scanned += 1;
-        if lines_scanned % 50_000_000 == 0 {
+        if lines_scanned.is_multiple_of(50_000_000) {
             eprintln!(
                 "scan_dump_reader: scanned {} M lines, {} matches so far",
                 lines_scanned / 1_000_000,

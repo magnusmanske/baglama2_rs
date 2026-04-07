@@ -19,7 +19,7 @@ impl GlobalImageLinks {
             return Ok(vec![]);
         }
         let placeholders = Baglama2::sql_placeholders(files.len());
-        let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,gil_page_namespace,gil_page_title,gil_to FROM `globalimagelinks` WHERE `gil_to` IN ({})",&placeholders);
+        let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,gil_page_namespace,FROM_BASE64(TO_BASE64(gil_page_title)),FROM_BASE64(TO_BASE64(gil_to)) FROM `globalimagelinks` WHERE `gil_to` IN ({})",&placeholders);
 
         let max_attempts = 5;
         let mut last_error: Option<String> = None;

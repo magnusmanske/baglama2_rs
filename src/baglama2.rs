@@ -201,10 +201,9 @@ impl Baglama2 {
         Ok(self.sites_cache.clone())
     }
 
-    // UNTESTED
     pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
         match value {
-            mysql_async::Value::Bytes(bytes) => String::from_utf8(bytes.to_owned()).ok(),
+            mysql_async::Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
             _ => None,
         }
     }
@@ -507,6 +506,46 @@ mod tests {
     use crate::row_group_status::StorageType;
 
     use super::*;
+
+    #[test]
+    fn test_value2opt_string_valid_utf8() {
+        let value = mysql_async::Value::Bytes(b"k\xc3\xa9pe".to_vec()); // "képe" in UTF-8
+        assert_eq!(Baglama2::value2opt_string(&value), Some("képe".to_string()));
+    }
+
+    #[test]
+    fn test_value2opt_string_ascii() {
+        let value = mysql_async::Value::Bytes(b"hello".to_vec());
+        assert_eq!(
+            Baglama2::value2opt_string(&value),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value2opt_string_invalid_utf8_lossy() {
+        // 0xff is not valid in any UTF-8 sequence; from_utf8_lossy replaces it with U+FFFD.
+        let value = mysql_async::Value::Bytes(b"a\xffb".to_vec());
+        assert_eq!(
+            Baglama2::value2opt_string(&value),
+            Some("a\u{FFFD}b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_value2opt_string_non_bytes_returns_none() {
+        let value = mysql_async::Value::NULL;
+        assert_eq!(Baglama2::value2opt_string(&value), None);
+
+        let value = mysql_async::Value::Int(42);
+        assert_eq!(Baglama2::value2opt_string(&value), None);
+    }
+
+    #[test]
+    fn test_value2opt_string_empty_bytes() {
+        let value = mysql_async::Value::Bytes(vec![]);
+        assert_eq!(Baglama2::value2opt_string(&value), Some(String::new()));
+    }
 
     /// Verifies that the HashSet-based deduplication used inside find_subcats
     /// correctly collapses duplicate category names that appear across multiple
