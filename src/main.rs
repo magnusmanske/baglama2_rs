@@ -140,8 +140,8 @@ async fn process_all_groups(
 
 async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
     let db = DbMySql2::new(ym, baglama.clone()).await?;
-    db.start_missing_groups().await?;
     db.ensure_table_exists().await?;
+    db.start_missing_groups().await?;
     db.add_pages().await?;
     Ok(())
 }
