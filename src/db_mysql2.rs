@@ -81,6 +81,7 @@ impl DbMySql2 {
                 );
             }
         }
+        println!("Pageview strategy: per-page REST API (dump unavailable)");
         self.load_views_from_api().await
     }
 
@@ -129,14 +130,14 @@ impl DbMySql2 {
 
         // Open the dump (local mirror or streaming HTTP).
         let result = if let Some(local_path) = dump_reader::local_dump_path(year, month) {
-            info!(
-                "load_views_from_dump: using local mirror at {}",
+            println!(
+                "Pageview strategy: local dump file ({})",
                 local_path.display()
             );
             dump_reader::scan_dump_from_local_file(&local_path, lookup, all_ids).await?
         } else {
             let url = dump_reader::dump_url(year, month);
-            info!("load_views_from_dump: streaming from {}", &url);
+            println!("Pageview strategy: streaming HTTP dump ({})", &url);
             dump_reader::scan_dump_from_http(&url, lookup, all_ids).await?
         };
 
