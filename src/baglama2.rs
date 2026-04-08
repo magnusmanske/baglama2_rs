@@ -383,7 +383,15 @@ impl Baglama2 {
             }
             subcats.extend(remaining.iter().cloned());
             let placeholders = Baglama2::sql_placeholders(remaining.len());
-            let sql = format!("SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title)) FROM page,categorylinks WHERE page_id=cl_from AND cl_to IN ({}) AND cl_type='subcat'",placeholders);
+            let sql = format!(
+                "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
+	            FROM page,categorylinks,linktarget
+	            WHERE page_id=cl_from
+	            AND cl_target_id=lt_id AND lt_namespace=14
+	            AND lt_title IN ({})
+	            AND cl_type='subcat'",
+                placeholders
+            );
             check = self.query_commons_repeat(&sql, &remaining).await?;
             if check.is_empty() {
                 break;
@@ -415,7 +423,15 @@ impl Baglama2 {
         let mut ret = vec![];
         for cats in categories.chunks(1000) {
             let placeholders = Baglama2::sql_placeholders(cats.len());
-            let sql = format!("SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title)) FROM page,categorylinks WHERE cl_from=page_id AND page_namespace={namespace} AND cl_to IN ({}) AND page_is_redirect=0",placeholders);
+            let sql = format!(
+                "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
+                FROM page,categorylinks,linktarget
+                WHERE cl_from=page_id AND page_namespace={namespace}
+                AND cl_target_id=lt_id AND lt_namespace=14
+                AND lt_title IN ({})
+                AND page_is_redirect=0",
+                placeholders
+            );
             let mut result = self.query_commons_repeat(&sql, cats).await?;
             ret.append(&mut result);
         }
