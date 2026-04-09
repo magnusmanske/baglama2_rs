@@ -3,7 +3,7 @@ use crate::{
     file::File,
     global_image_links::GlobalImageLinks,
     page::Page,
-    pageviews::dump_reader,
+    pageviews::dump_reader::{self, SiteViewData, WikiFilter},
     Baglama2, DbId, GroupId, Site, ViewCount, YearMonth,
 };
 use anyhow::{anyhow, Result};
@@ -89,128 +89,166 @@ impl DbMySql2 {
     // Dump-based bulk path (delegates to pageviews::dump_reader)
     // ------------------------------------------------------------------
 
-    /// Load all missing page-view counts in one pass over the monthly
-    /// Wikimedia pageview dump.
+    /// Load all missing page-view counts by streaming the monthly Wikimedia
+    /// pageview dump, processing one wiki (site) at a time.
     ///
-    /// Instead of loading all 36M+ viewdata rows into memory, we:
-    /// 1. Cache the small `sites` table to map `server` → `site_id`.
-    /// 2. Query only the DISTINCT `(pages.id, sites.server, pages.title)`
-    ///    triples that are referenced by viewdata rows with NULL page_views,
-    ///    fetched in batches via LIMIT/OFFSET.
-    /// 3. Scan the dump once, matching against the two-level lookup.
-    /// 4. UPDATE viewdata rows by `pages_id` (the index makes this fast
-    ///    even though many viewdata rows share the same pages_id).
+    /// The dump file is sorted by wiki code, so all lines for `de.wikipedia`
+    /// appear before `en.wikipedia`, etc.  The scanner emits a
+    /// [`SiteViewData`] (wiki_code → title → views) each time the wiki code
+    /// changes.  For each emitted site we:
+    ///
+    /// 1. Map `wiki_code` → `site_id` via the cached `sites` table.
+    /// 2. Load the subset of `pages` for that site that are referenced by
+    ///    viewdata rows with `page_views IS NULL` — just one query per site.
+    /// 3. Match titles, build a `pages_id → views` map, and flush it to the
+    ///    viewdata table in batched UPDATEs.
+    ///
+    /// Peak memory is proportional to a single wiki's worth of pages (a few
+    /// hundred MB for the largest wikis) rather than the entire 24M+ distinct
+    /// pages across all wikis.
     async fn load_views_from_dump(&self) -> Result<()> {
         let table_name = self.table_name().to_owned();
         let year = self.ym.year();
         let month = self.ym.month();
 
-        // Build the site_id → server mapping from the already-cached sites.
-        // This avoids joining `sites` in the heavy query below; we resolve
-        // the server string from the site_id in Rust instead.
-        let site_id_to_server: HashMap<usize, String> = self
+        // Build wiki_code → site_id map from the cached sites table.
+        // wiki_code = server minus trailing ".org" (e.g. "en.wikipedia").
+        let wiki_to_site_id: HashMap<String, usize> = self
             .sites
             .iter()
             .filter_map(|(&id, site)| {
                 let server = site.server().as_ref()?;
-                Some((id, server.clone()))
+                let wiki_code = server.strip_suffix(".org")?;
+                Some((wiki_code.to_owned(), id))
             })
             .collect();
 
-        // Fetch DISTINCT pages referenced by viewdata rows that still need
-        // a view count.  This is dramatically smaller than the viewdata
-        // table itself because many viewdata rows share the same pages_id.
-        // We fetch in batches to bound memory even if the pages table is large.
-        let mut conn = self.baglama.get_tooldb_conn().await?;
-        let mut all_rows: Vec<(usize, String, String)> = Vec::new();
-        const PAGE_BATCH: usize = 500_000;
-        let mut offset: usize = 0;
-        loop {
-            let sql = format!(
-                "SELECT DISTINCT p.`id`, p.`site`, FROM_BASE64(TO_BASE64(p.`title`))
-                 FROM `pages` p
-                 JOIN `{table_name}` vd ON vd.`pages_id` = p.`id`
-                 WHERE vd.`page_views` IS NULL
-                 LIMIT {PAGE_BATCH} OFFSET {offset}"
-            );
-            let batch = conn
-                .exec_iter(&sql, ())
-                .await?
-                .map_and_drop(from_row_opt::<(usize, usize, String)>)
-                .await?
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .collect::<Vec<_>>();
-            let batch_len = batch.len();
-            info!(
-                "load_views_from_dump: fetched batch of {} distinct pages (offset {})",
-                batch_len, offset
-            );
-            // Map site_id → server string using the cached sites table,
-            // producing the (pages_id, server, title) triples that
-            // build_dump_lookup expects.
-            for (pages_id, site_id, title) in batch {
-                if let Some(server) = site_id_to_server.get(&site_id) {
-                    all_rows.push((pages_id, server.clone(), title));
-                }
-            }
-            if batch_len < PAGE_BATCH {
-                break; // last batch
-            }
-            offset += PAGE_BATCH;
-        }
-
-        if all_rows.is_empty() {
-            info!("load_views_from_dump: nothing to do (no NULL page_views)");
-            return Ok(());
-        }
+        // The WikiFilter tells the scanner which wiki codes to pay attention
+        // to.  Lines for wikis not in this set are skipped at zero cost.
+        let wiki_filter: WikiFilter = wiki_to_site_id.keys().cloned().collect();
         info!(
-            "load_views_from_dump: {} distinct pages need view counts",
-            all_rows.len()
+            "load_views_from_dump: {} wiki codes in filter",
+            wiki_filter.len()
         );
 
-        // Build two-level lookup via the dump_reader module.
-        let (lookup, all_ids) = dump_reader::build_dump_lookup(all_rows);
-        info!(
-            "load_views_from_dump: {} wiki codes, {} unique (wiki, title) pairs",
-            lookup.len(),
-            lookup.values().map(|m| m.len()).sum::<usize>()
-        );
+        // Channel to receive SiteViewData batches from the blocking scanner
+        // thread.  The scanner calls the callback synchronously; we use an
+        // unbounded channel so the callback never blocks the scanner.
+        let (svd_tx, mut svd_rx) = tokio::sync::mpsc::unbounded_channel::<SiteViewData>();
 
-        // Open the dump (local mirror or streaming HTTP).
-        let result = if let Some(local_path) = dump_reader::local_dump_path(year, month) {
+        // Launch the dump scanner (local file or streaming HTTP).
+        let scan_task = if let Some(local_path) = dump_reader::local_dump_path(year, month) {
             println!(
                 "Pageview strategy: local dump file ({})",
                 local_path.display()
             );
-            dump_reader::scan_dump_from_local_file(&local_path, lookup, all_ids).await?
+            tokio::spawn(async move {
+                dump_reader::stream_local_file_by_site(&local_path, wiki_filter, move |svd| {
+                    let _ = svd_tx.send(svd);
+                })
+                .await
+            })
         } else {
             let url = dump_reader::dump_url(year, month);
             println!("Pageview strategy: streaming HTTP dump ({})", &url);
-            dump_reader::scan_dump_from_http(&url, lookup, all_ids).await?
+            tokio::spawn(async move {
+                dump_reader::stream_http_by_site(&url, wiki_filter, move |svd| {
+                    let _ = svd_tx.send(svd);
+                })
+                .await
+            })
         };
 
-        info!(
-            "load_views_from_dump: found view data for {} pages_ids, \
-             {} pages_ids had no dump entry (will be set to 0)",
-            result.id2views.len(),
-            result.unmatched_ids.len()
-        );
+        // Process SiteViewData batches as they arrive from the scanner.
+        let mut conn = self.baglama.get_tooldb_conn().await?;
+        let mut total_updated: u64 = 0;
+        let mut total_zeroed: u64 = 0;
+        let mut sites_processed: u64 = 0;
 
-        // Flush matched results to DB.
-        self.flush_view_counts_to_db(&table_name, &result.id2views, &mut conn)
-            .await?;
+        while let Some(svd) = svd_rx.recv().await {
+            let site_id = match wiki_to_site_id.get(&svd.wiki_code) {
+                Some(&id) => id,
+                None => continue,
+            };
 
-        // Pages not found in the dump → 0 views.
-        if !result.unmatched_ids.is_empty() {
-            let zeros: HashMap<usize, u64> = result
-                .unmatched_ids
+            // Load the pages for this site that need view counts.
+            // Returns (pages.id, title) for pages referenced by viewdata
+            // rows with page_views IS NULL.
+            let sql = format!(
+                "SELECT DISTINCT p.`id`, FROM_BASE64(TO_BASE64(p.`title`))
+                 FROM `pages` p
+                 JOIN `{table_name}` vd ON vd.`pages_id` = p.`id`
+                 WHERE p.`site` = ? AND vd.`page_views` IS NULL"
+            );
+            let page_rows = conn
+                .exec_iter(&sql, (site_id,))
+                .await?
+                .map_and_drop(from_row_opt::<(usize, String)>)
+                .await?
                 .into_iter()
-                .map(|id| (id, 0u64))
-                .collect();
-            self.flush_view_counts_to_db(&table_name, &zeros, &mut conn)
-                .await?;
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+
+            if page_rows.is_empty() {
+                sites_processed += 1;
+                continue;
+            }
+
+            // Build title → Vec<pages_id> for this site.
+            // Titles from the DB use spaces; the dump uses underscores.
+            let mut title_to_ids: HashMap<String, Vec<usize>> = HashMap::new();
+            for (pages_id, title) in &page_rows {
+                let title_underscored = title.replace(' ', "_");
+                title_to_ids
+                    .entry(title_underscored)
+                    .or_default()
+                    .push(*pages_id);
+            }
+
+            // Match dump view data against our pages.
+            let mut id2views: HashMap<usize, u64> = HashMap::new();
+            let mut matched_ids: HashSet<usize> = HashSet::new();
+
+            for (title, views) in &svd.title_views {
+                if let Some(page_ids) = title_to_ids.get(title.as_str()) {
+                    for &pid in page_ids {
+                        *id2views.entry(pid).or_insert(0) += views;
+                        matched_ids.insert(pid);
+                    }
+                }
+            }
+
+            // Pages that exist in our DB but had no dump entry → 0 views.
+            for (pages_id, _title) in &page_rows {
+                if !matched_ids.contains(pages_id) {
+                    id2views.entry(*pages_id).or_insert(0);
+                }
+            }
+
+            let matched = matched_ids.len() as u64;
+            let zeroed = (id2views.len() as u64).saturating_sub(matched);
+            total_updated += matched;
+            total_zeroed += zeroed;
+
+            // Flush to DB.
+            Self::flush_view_counts_to_db(&table_name, &id2views, &mut conn).await?;
+            sites_processed += 1;
+
+            if sites_processed % 50 == 0 {
+                info!(
+                    "load_views_from_dump: {} sites processed, {} pages updated, {} zeroed",
+                    sites_processed, total_updated, total_zeroed
+                );
+            }
         }
+
+        // Wait for the scanner to finish and propagate any error.
+        scan_task.await??;
+
+        info!(
+            "load_views_from_dump: done — {} sites, {} pages with views, {} pages zeroed",
+            sites_processed, total_updated, total_zeroed
+        );
 
         self.finalize_group_status().await?;
         Ok(())
@@ -218,7 +256,6 @@ impl DbMySql2 {
 
     /// Write a batch of `pages_id → views` pairs into the viewdata table.
     async fn flush_view_counts_to_db(
-        &self,
         table_name: &str,
         id2views: &HashMap<usize, u64>,
         conn: &mut mysql_async::Conn,
@@ -255,36 +292,17 @@ impl DbMySql2 {
         let table_name = self.table_name().to_owned();
         let baglama = self.baglama.clone();
 
+        let table_for_flush = table_name.clone();
         crate::pageviews::api_fallback::load_views_from_api(
             &baglama,
             &self.ym,
             &table_name,
             |id2views| {
-                let this_table = table_name.clone();
+                let this_table = table_for_flush.clone();
                 let this_baglama = baglama.clone();
                 async move {
-                    // Acquire a connection for each batch flush.
                     let mut conn = this_baglama.get_tooldb_conn().await?;
-                    let entries: Vec<_> = id2views.iter().collect();
-                    for chunk in entries.chunks(DUMP_UPDATE_BATCH_SIZE) {
-                        let ids = chunk
-                            .iter()
-                            .map(|(id, _)| id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let cases = chunk
-                            .iter()
-                            .map(|(id, views)| format!("WHEN {} THEN {}", id, views))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let sql = format!(
-                            "UPDATE `{this_table}` \
-                             SET `page_views` = CASE `pages_id` {cases} ELSE `page_views` END \
-                             WHERE `pages_id` IN ({ids})"
-                        );
-                        conn.exec_drop(&sql, ()).await?;
-                    }
-                    Ok(())
+                    Self::flush_view_counts_to_db(&this_table, &id2views, &mut conn).await
                 }
             },
         )
