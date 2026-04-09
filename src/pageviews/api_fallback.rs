@@ -40,7 +40,7 @@ where
         PageviewsAgent::User,
     );
     let sql = format!(
-        "SELECT DISTINCT `vd`.`pages_id`,`server`,`title`
+        "SELECT DISTINCT `vd`.`pages_id`,`server`,FROM_BASE64(TO_BASE64(`title`))
          FROM `{table_name}` AS `vd`,`pages`,`sites`
          WHERE `page_views` IS NULL
          AND `pages_id`=`pages`.`id`

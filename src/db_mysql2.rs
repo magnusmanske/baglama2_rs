@@ -91,37 +91,86 @@ impl DbMySql2 {
 
     /// Load all missing page-view counts in one pass over the monthly
     /// Wikimedia pageview dump.
+    ///
+    /// Instead of loading all 36M+ viewdata rows into memory, we:
+    /// 1. Cache the small `sites` table to map `server` → `site_id`.
+    /// 2. Query only the DISTINCT `(pages.id, sites.server, pages.title)`
+    ///    triples that are referenced by viewdata rows with NULL page_views,
+    ///    fetched in batches via LIMIT/OFFSET.
+    /// 3. Scan the dump once, matching against the two-level lookup.
+    /// 4. UPDATE viewdata rows by `pages_id` (the index makes this fast
+    ///    even though many viewdata rows share the same pages_id).
     async fn load_views_from_dump(&self) -> Result<()> {
         let table_name = self.table_name().to_owned();
         let year = self.ym.year();
         let month = self.ym.month();
 
-        // Load all rows that still need a view count.
-        let sql = format!(
-            "SELECT `vd`.`pages_id`, `server`, `title`
-             FROM `{table_name}` AS `vd`
-             JOIN `pages`  ON `pages_id`  = `pages`.`id`
-             JOIN `sites`  ON `pages`.`site` = `sites`.`id`
-             WHERE `page_views` IS NULL"
-        );
-        let mut conn = self.baglama.get_tooldb_conn().await?;
-        let rows = conn
-            .exec_iter(&sql, ())
-            .await?
-            .map_and_drop(from_row_opt::<(usize, String, String)>)
-            .await?
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>();
+        // Build the site_id → server mapping from the already-cached sites.
+        // This avoids joining `sites` in the heavy query below; we resolve
+        // the server string from the site_id in Rust instead.
+        let site_id_to_server: HashMap<usize, String> = self
+            .sites
+            .iter()
+            .filter_map(|(&id, site)| {
+                let server = site.server().as_ref()?;
+                Some((id, server.clone()))
+            })
+            .collect();
 
-        if rows.is_empty() {
+        // Fetch DISTINCT pages referenced by viewdata rows that still need
+        // a view count.  This is dramatically smaller than the viewdata
+        // table itself because many viewdata rows share the same pages_id.
+        // We fetch in batches to bound memory even if the pages table is large.
+        let mut conn = self.baglama.get_tooldb_conn().await?;
+        let mut all_rows: Vec<(usize, String, String)> = Vec::new();
+        const PAGE_BATCH: usize = 500_000;
+        let mut offset: usize = 0;
+        loop {
+            let sql = format!(
+                "SELECT DISTINCT p.`id`, p.`site`, FROM_BASE64(TO_BASE64(p.`title`))
+                 FROM `pages` p
+                 JOIN `{table_name}` vd ON vd.`pages_id` = p.`id`
+                 WHERE vd.`page_views` IS NULL
+                 LIMIT {PAGE_BATCH} OFFSET {offset}"
+            );
+            let batch = conn
+                .exec_iter(&sql, ())
+                .await?
+                .map_and_drop(from_row_opt::<(usize, usize, String)>)
+                .await?
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            let batch_len = batch.len();
+            info!(
+                "load_views_from_dump: fetched batch of {} distinct pages (offset {})",
+                batch_len, offset
+            );
+            // Map site_id → server string using the cached sites table,
+            // producing the (pages_id, server, title) triples that
+            // build_dump_lookup expects.
+            for (pages_id, site_id, title) in batch {
+                if let Some(server) = site_id_to_server.get(&site_id) {
+                    all_rows.push((pages_id, server.clone(), title));
+                }
+            }
+            if batch_len < PAGE_BATCH {
+                break; // last batch
+            }
+            offset += PAGE_BATCH;
+        }
+
+        if all_rows.is_empty() {
             info!("load_views_from_dump: nothing to do (no NULL page_views)");
             return Ok(());
         }
-        info!("load_views_from_dump: {} rows need view counts", rows.len());
+        info!(
+            "load_views_from_dump: {} distinct pages need view counts",
+            all_rows.len()
+        );
 
         // Build two-level lookup via the dump_reader module.
-        let (lookup, all_ids) = dump_reader::build_dump_lookup(rows);
+        let (lookup, all_ids) = dump_reader::build_dump_lookup(all_rows);
         info!(
             "load_views_from_dump: {} wiki codes, {} unique (wiki, title) pairs",
             lookup.len(),
