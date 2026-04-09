@@ -7,7 +7,7 @@ use crate::{
     Baglama2, DbId, GroupId, Site, ViewCount, YearMonth,
 };
 use anyhow::{anyhow, Result};
-use log::{info, warn};
+use log::{error, info, warn};
 use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
@@ -143,19 +143,32 @@ impl DbMySql2 {
                 local_path.display()
             );
             tokio::spawn(async move {
-                dump_reader::stream_local_file_by_site(&local_path, wiki_filter, move |svd| {
-                    let _ = svd_tx.send(svd);
-                })
-                .await
+                let result =
+                    dump_reader::stream_local_file_by_site(&local_path, wiki_filter, move |svd| {
+                        if let Err(e) = svd_tx.send(svd) {
+                            error!("dump scanner: channel send failed: {e}");
+                        }
+                    })
+                    .await;
+                if let Err(ref e) = result {
+                    error!("dump scanner (local) finished with error: {e}");
+                }
+                result
             })
         } else {
             let url = dump_reader::dump_url(year, month);
             println!("Pageview strategy: streaming HTTP dump ({})", &url);
             tokio::spawn(async move {
-                dump_reader::stream_http_by_site(&url, wiki_filter, move |svd| {
-                    let _ = svd_tx.send(svd);
+                let result = dump_reader::stream_http_by_site(&url, wiki_filter, move |svd| {
+                    if let Err(e) = svd_tx.send(svd) {
+                        error!("dump scanner: channel send failed: {e}");
+                    }
                 })
-                .await
+                .await;
+                if let Err(ref e) = result {
+                    error!("dump scanner (http) finished with error: {e}");
+                }
+                result
             })
         };
 
@@ -168,26 +181,61 @@ impl DbMySql2 {
         while let Some(svd) = svd_rx.recv().await {
             let site_id = match wiki_to_site_id.get(&svd.wiki_code) {
                 Some(&id) => id,
-                None => continue,
+                None => {
+                    warn!(
+                        "load_views_from_dump: wiki_code '{}' not in site map, skipping",
+                        svd.wiki_code
+                    );
+                    continue;
+                }
             };
 
+            info!(
+                "load_views_from_dump: processing site '{}' (site_id={}, {} titles from dump)",
+                svd.wiki_code,
+                site_id,
+                svd.title_views.len()
+            );
+
             // Load the pages for this site that need view counts.
-            // Returns (pages.id, title) for pages referenced by viewdata
-            // rows with page_views IS NULL.
             let sql = format!(
                 "SELECT DISTINCT p.`id`, FROM_BASE64(TO_BASE64(p.`title`))
                  FROM `pages` p
                  JOIN `{table_name}` vd ON vd.`pages_id` = p.`id`
                  WHERE p.`site` = ? AND vd.`page_views` IS NULL"
             );
-            let page_rows = conn
-                .exec_iter(&sql, (site_id,))
-                .await?
-                .map_and_drop(from_row_opt::<(usize, String)>)
-                .await?
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .collect::<Vec<_>>();
+            let page_rows = match conn.exec_iter(&sql, (site_id,)).await {
+                Ok(result) => match result.map_and_drop(from_row_opt::<(usize, String)>).await {
+                    Ok(rows) => rows.into_iter().filter_map(|r| r.ok()).collect::<Vec<_>>(),
+                    Err(e) => {
+                        error!(
+                            "load_views_from_dump: failed to map page rows for site {}: {}",
+                            svd.wiki_code, e
+                        );
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        "load_views_from_dump: DB query failed for site {}: {}",
+                        svd.wiki_code, e
+                    );
+                    // Try to get a fresh connection in case the old one died.
+                    match self.baglama.get_tooldb_conn().await {
+                        Ok(new_conn) => conn = new_conn,
+                        Err(e2) => {
+                            error!("load_views_from_dump: reconnect also failed: {e2}");
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            info!(
+                "load_views_from_dump: site '{}': {} pages in DB need views",
+                svd.wiki_code,
+                page_rows.len()
+            );
 
             if page_rows.is_empty() {
                 sites_processed += 1;
@@ -230,20 +278,53 @@ impl DbMySql2 {
             total_updated += matched;
             total_zeroed += zeroed;
 
+            info!(
+                "load_views_from_dump: site '{}': {} matched, {} zeroed, flushing…",
+                svd.wiki_code, matched, zeroed
+            );
+
             // Flush to DB.
-            Self::flush_view_counts_to_db(&table_name, &id2views, &mut conn).await?;
+            if let Err(e) = Self::flush_view_counts_to_db(&table_name, &id2views, &mut conn).await {
+                error!(
+                    "load_views_from_dump: flush failed for site {}: {}",
+                    svd.wiki_code, e
+                );
+                // Try to get a fresh connection.
+                match self.baglama.get_tooldb_conn().await {
+                    Ok(new_conn) => conn = new_conn,
+                    Err(e2) => error!("load_views_from_dump: reconnect also failed: {e2}"),
+                }
+                continue;
+            }
             sites_processed += 1;
 
             if sites_processed % 50 == 0 {
                 info!(
-                    "load_views_from_dump: {} sites processed, {} pages updated, {} zeroed",
+                    "load_views_from_dump: progress — {} sites processed, {} pages updated, {} zeroed",
                     sites_processed, total_updated, total_zeroed
                 );
             }
         }
 
+        info!(
+            "load_views_from_dump: receiver loop ended — {} sites processed",
+            sites_processed
+        );
+
         // Wait for the scanner to finish and propagate any error.
-        scan_task.await??;
+        match scan_task.await {
+            Ok(Ok(())) => {
+                info!("load_views_from_dump: scanner finished successfully");
+            }
+            Ok(Err(e)) => {
+                error!("load_views_from_dump: scanner returned error: {e}");
+                return Err(e);
+            }
+            Err(e) => {
+                error!("load_views_from_dump: scanner task panicked: {e}");
+                return Err(anyhow!("dump scanner task panicked: {e}"));
+            }
+        }
 
         info!(
             "load_views_from_dump: done — {} sites, {} pages with views, {} pages zeroed",
