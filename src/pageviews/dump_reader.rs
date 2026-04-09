@@ -15,14 +15,27 @@ use std::path::PathBuf;
 
 /// Accumulated view data for a single wiki code (site).
 ///
-/// When the dump scanner encounters a transition from one wiki code to
-/// the next, it emits one of these for the just-finished wiki section.
-/// The `title_views` map contains `title → total_views` (summed across
-/// access types).
+/// When the dump scanner finishes a wiki-code section, it emits one of
+/// these.  The `title_views` map contains only titles that passed the
+/// caller-supplied filter — `title → total_views` (summed across access
+/// types).
 pub struct SiteViewData {
     pub wiki_code: String,
     pub title_views: HashMap<String, u64>,
 }
+
+/// Optional per-site title filter.
+///
+/// When the dump scanner enters a new wiki-code section, it calls the
+/// `on_site_enter` callback with the wiki code.  The callback returns:
+///
+/// - `Some(set)` — only accumulate titles that are in `set`.
+/// - `None` — skip this wiki entirely (don't accumulate anything).
+///
+/// This prevents OOM: instead of collecting all ~7M titles for
+/// `en.wikipedia` from the dump, we only keep the subset that exists in
+/// our `pages` table (typically a few hundred thousand).
+pub type TitleFilter = HashSet<String>;
 
 /// Two-level lookup: wiki_code → (title → Vec<pages_id>).
 ///
@@ -32,11 +45,6 @@ pub struct SiteViewData {
 /// Only lines matching a known wiki proceed to the second-level title
 /// lookup (also zero-alloc via `&str`).
 pub type DumpLookup = HashMap<String, HashMap<String, Vec<usize>>>;
-
-/// Set of wiki codes (e.g. `"en.wikipedia"`) that the scanner should
-/// pay attention to.  Lines for wikis not in this set are skipped with
-/// zero allocation.
-pub type WikiFilter = HashSet<String>;
 
 /// Result of scanning a dump file: a map from pages_id to its total
 /// view count, and the set of pages_ids that were not found in the dump
@@ -167,21 +175,22 @@ pub fn local_dump_path(year: i32, month: u32) -> Option<PathBuf> {
 
 /// Open a local dump file and stream it through `scan_dump_by_site`.
 ///
-/// Runs on a blocking thread.  Calls `site_callback` once per wiki code
-/// section found in the dump.
-pub async fn stream_local_file_by_site<F>(
+/// Runs on a blocking thread.  See [`scan_dump_by_site`] for the
+/// callback contract.
+pub async fn stream_local_file_by_site<E, S>(
     path: &PathBuf,
-    wiki_filter: WikiFilter,
-    site_callback: F,
+    on_site_enter: E,
+    site_callback: S,
 ) -> Result<()>
 where
-    F: FnMut(SiteViewData) + Send + 'static,
+    E: FnMut(&str) -> Option<TitleFilter> + Send + 'static,
+    S: FnMut(SiteViewData) + Send + 'static,
 {
     let path = path.clone();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
         let reader = std::io::BufReader::with_capacity(512 * 1024, file);
-        scan_dump_by_site(reader, &wiki_filter, site_callback)
+        scan_dump_by_site(reader, on_site_enter, site_callback)
     })
     .await?
 }
@@ -190,14 +199,15 @@ where
 ///
 /// Pipes response chunks through a bounded channel into the blocking
 /// decompression thread, overlapping network I/O with decompression.
-/// Calls `site_callback` once per wiki code section.
-pub async fn stream_http_by_site<F>(
+/// See [`scan_dump_by_site`] for the callback contract.
+pub async fn stream_http_by_site<E, S>(
     dump_url: &str,
-    wiki_filter: WikiFilter,
-    site_callback: F,
+    on_site_enter: E,
+    site_callback: S,
 ) -> Result<()>
 where
-    F: FnMut(SiteViewData) + Send + 'static,
+    E: FnMut(&str) -> Option<TitleFilter> + Send + 'static,
+    S: FnMut(SiteViewData) + Send + 'static,
 {
     use anyhow::anyhow;
     use futures::StreamExt;
@@ -216,7 +226,7 @@ where
     let scan_handle = tokio::task::spawn_blocking(move || {
         let reader = ChannelReader::new(rx);
         let buf_reader = std::io::BufReader::with_capacity(512 * 1024, reader);
-        scan_dump_by_site(buf_reader, &wiki_filter, site_callback)
+        scan_dump_by_site(buf_reader, on_site_enter, site_callback)
     });
 
     let mut stream = response.bytes_stream();
@@ -328,25 +338,30 @@ pub async fn scan_dump_from_http(
 // Core scanner
 // -----------------------------------------------------------------------
 
-/// Streaming per-site scanner.
+/// Streaming per-site scanner with caller-supplied title filtering.
 ///
 /// Reads the bz2-compressed dump line by line.  Because the dump is
 /// sorted by wiki code, all lines for a given wiki appear consecutively.
-/// The scanner accumulates `title → total_views` for the current wiki
-/// section, and when the wiki code changes (or at EOF), it calls
-/// `site_callback` with the completed [`SiteViewData`] — but only if
-/// the wiki code is in `wiki_filter`.
 ///
-/// This design keeps memory proportional to a *single* wiki's worth of
-/// pages at a time (typically a few hundred MB for the largest wikis)
-/// rather than the entire dump or the entire viewdata table.
-pub fn scan_dump_by_site<R: std::io::Read, F>(
+/// **`on_site_enter`** is called each time the scanner encounters a new
+/// wiki code.  It receives the wiki code (`&str`) and must return:
+/// - `Some(title_filter)` — accumulate only titles in the filter.
+/// - `None` — skip this wiki entirely.
+///
+/// This prevents OOM: instead of collecting all ~7 M titles for a large
+/// wiki like `en.wikipedia`, we only keep the subset the caller cares
+/// about (typically a few hundred thousand pages that need view counts).
+///
+/// **`site_callback`** is called when a wiki-code section ends (or at
+/// EOF) with the accumulated [`SiteViewData`].
+pub fn scan_dump_by_site<R: std::io::Read, E, S>(
     raw_reader: std::io::BufReader<R>,
-    wiki_filter: &WikiFilter,
-    mut site_callback: F,
+    mut on_site_enter: E,
+    mut site_callback: S,
 ) -> Result<()>
 where
-    F: FnMut(SiteViewData),
+    E: FnMut(&str) -> Option<TitleFilter>,
+    S: FnMut(SiteViewData),
 {
     use bzip2::read::BzDecoder;
 
@@ -356,10 +371,13 @@ where
     let mut lines_scanned: u64 = 0;
     let mut matched_count: u64 = 0;
     let mut sites_emitted: u64 = 0;
+    let mut sites_skipped: u64 = 0;
     let mut line_buf = String::with_capacity(512);
 
     // State for the current wiki section.
     let mut current_wiki: Option<String> = None;
+    // Title filter for the current wiki; `None` means skip all lines.
+    let mut current_filter: Option<TitleFilter> = None;
     let mut current_titles: HashMap<String, u64> = HashMap::new();
 
     loop {
@@ -380,10 +398,11 @@ where
         lines_scanned += 1;
         if lines_scanned % 50_000_000 == 0 {
             eprintln!(
-                "scan_dump_by_site: scanned {} M lines, {} matches, {} sites emitted",
+                "scan_dump_by_site: scanned {} M lines, {} matches, {} sites emitted, {} skipped",
                 lines_scanned / 1_000_000,
                 matched_count,
                 sites_emitted,
+                sites_skipped,
             );
         }
 
@@ -396,8 +415,7 @@ where
             _ => continue,
         };
 
-        // Detect wiki-code transitions.  When the wiki changes, emit the
-        // accumulated data for the previous wiki (if any) and reset.
+        // Detect wiki-code transitions.
         let wiki_changed = match &current_wiki {
             Some(cw) => cw.as_str() != wiki_code,
             None => true,
@@ -413,11 +431,24 @@ where
                     });
                 }
             }
-            // Start tracking the new wiki (only if we care about it).
-            if wiki_filter.contains(wiki_code) {
-                current_wiki = Some(wiki_code.to_owned());
-            } else {
-                current_wiki = None;
+            current_filter = None;
+
+            // Ask the caller whether we should track this wiki, and if
+            // so, which titles to keep.
+            match on_site_enter(wiki_code) {
+                Some(filter) => {
+                    eprintln!(
+                        "scan_dump_by_site: entering '{}' ({} titles in filter)",
+                        wiki_code,
+                        filter.len()
+                    );
+                    current_filter = Some(filter);
+                    current_wiki = Some(wiki_code.to_owned());
+                }
+                None => {
+                    sites_skipped += 1;
+                    current_wiki = None;
+                }
             }
         }
 
@@ -430,6 +461,13 @@ where
             Some(t) if !t.is_empty() => t,
             _ => continue,
         };
+
+        // Only accumulate titles that pass the caller's filter.
+        if let Some(ref filter) = current_filter {
+            if !filter.contains(title) {
+                continue;
+            }
+        }
 
         // Skip page_id (col 2) and access_type (col 3).
         let _page_id = cols.next();
@@ -457,8 +495,8 @@ where
 
     eprintln!(
         "scan_dump_by_site: finished scanning {} lines, \
-         {} matching rows, {} sites emitted",
-        lines_scanned, matched_count, sites_emitted,
+         {} matching rows, {} sites emitted, {} skipped",
+        lines_scanned, matched_count, sites_emitted, sites_skipped,
     );
 
     Ok(())
@@ -599,7 +637,12 @@ mod tests {
 
     /// Compress text with bz2 and run scan_dump_by_site, collecting
     /// emitted SiteViewData into a Vec.
-    fn compress_and_scan_by_site(dump_text: &str, wiki_filter: &WikiFilter) -> Vec<SiteViewData> {
+    /// `wiki_titles`: wiki_code → set of titles to accept.  If a wiki
+    /// code is absent, that site is skipped entirely.
+    fn compress_and_scan_by_site(
+        dump_text: &str,
+        wiki_titles: HashMap<String, TitleFilter>,
+    ) -> Vec<SiteViewData> {
         use bzip2::write::BzEncoder;
         use bzip2::Compression;
         use std::io::Write;
@@ -610,9 +653,13 @@ mod tests {
 
         let buf_reader = std::io::BufReader::new(compressed.as_slice());
         let mut results = Vec::new();
-        scan_dump_by_site(buf_reader, wiki_filter, |svd| {
-            results.push(svd);
-        })
+        scan_dump_by_site(
+            buf_reader,
+            |wiki_code| wiki_titles.get(wiki_code).cloned(),
+            |svd| {
+                results.push(svd);
+            },
+        )
         .unwrap();
         results
     }
@@ -690,12 +737,22 @@ en.wikipedia Barack_Obama null mobile-web 50 A50\n\
 en.wikipedia Other_Page null desktop 7 A7\n\
 fr.wikipedia Ignored null desktop 999 A999\n";
 
-        let filter: WikiFilter = ["en.wikipedia".into(), "de.wikipedia".into()]
-            .into_iter()
-            .collect();
-        let sites = compress_and_scan_by_site(dump_text, &filter);
+        // de.wikipedia: accept Trude_Herr only
+        // en.wikipedia: accept Barack_Obama and Other_Page
+        // fr.wikipedia: not in the map at all → skipped
+        let mut wiki_titles: HashMap<String, TitleFilter> = HashMap::new();
+        wiki_titles.insert(
+            "de.wikipedia".into(),
+            ["Trude_Herr".into()].into_iter().collect(),
+        );
+        wiki_titles.insert(
+            "en.wikipedia".into(),
+            ["Barack_Obama".into(), "Other_Page".into()]
+                .into_iter()
+                .collect(),
+        );
+        let sites = compress_and_scan_by_site(dump_text, wiki_titles);
 
-        // Two sites emitted (de before en because the dump is sorted).
         assert_eq!(sites.len(), 2);
 
         assert_eq!(sites[0].wiki_code, "de.wikipedia");
@@ -703,10 +760,29 @@ fr.wikipedia Ignored null desktop 999 A999\n";
         assert_eq!(sites[0].title_views.len(), 1);
 
         assert_eq!(sites[1].wiki_code, "en.wikipedia");
-        // Barack_Obama: desktop(100) + mobile-web(50) = 150
         assert_eq!(sites[1].title_views.get("Barack_Obama"), Some(&150));
         assert_eq!(sites[1].title_views.get("Other_Page"), Some(&7));
         assert_eq!(sites[1].title_views.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_by_site_title_filter_excludes_unknown_titles() {
+        let dump_text = "\
+en.wikipedia Wanted_Page null desktop 10 A10\n\
+en.wikipedia Unwanted_Page null desktop 999 A999\n";
+
+        // Only accept Wanted_Page.
+        let mut wiki_titles: HashMap<String, TitleFilter> = HashMap::new();
+        wiki_titles.insert(
+            "en.wikipedia".into(),
+            ["Wanted_Page".into()].into_iter().collect(),
+        );
+        let sites = compress_and_scan_by_site(dump_text, wiki_titles);
+
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].title_views.len(), 1);
+        assert_eq!(sites[0].title_views.get("Wanted_Page"), Some(&10));
+        assert!(sites[0].title_views.get("Unwanted_Page").is_none());
     }
 
     #[test]
@@ -717,8 +793,9 @@ en.wikipedia Page null desktop 2 A2\n\
 zz.wikipedia Page null desktop 3 A3\n";
 
         // Only care about en.wikipedia.
-        let filter: WikiFilter = ["en.wikipedia".into()].into_iter().collect();
-        let sites = compress_and_scan_by_site(dump_text, &filter);
+        let mut wiki_titles: HashMap<String, TitleFilter> = HashMap::new();
+        wiki_titles.insert("en.wikipedia".into(), ["Page".into()].into_iter().collect());
+        let sites = compress_and_scan_by_site(dump_text, wiki_titles);
 
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].wiki_code, "en.wikipedia");
@@ -728,8 +805,8 @@ zz.wikipedia Page null desktop 3 A3\n";
     #[test]
     fn test_scan_by_site_empty_filter() {
         let dump_text = "en.wikipedia Page null desktop 42 A42\n";
-        let filter: WikiFilter = HashSet::new();
-        let sites = compress_and_scan_by_site(dump_text, &filter);
+        let wiki_titles: HashMap<String, TitleFilter> = HashMap::new();
+        let sites = compress_and_scan_by_site(dump_text, wiki_titles);
         assert!(sites.is_empty());
     }
 
@@ -740,11 +817,36 @@ en.wikipedia Page null desktop 10 A10\n\
 en.wikipedia Page null mobile-web 20 A20\n\
 en.wikipedia Page null mobile-app 5 A5\n";
 
-        let filter: WikiFilter = ["en.wikipedia".into()].into_iter().collect();
-        let sites = compress_and_scan_by_site(dump_text, &filter);
+        let mut wiki_titles: HashMap<String, TitleFilter> = HashMap::new();
+        wiki_titles.insert("en.wikipedia".into(), ["Page".into()].into_iter().collect());
+        let sites = compress_and_scan_by_site(dump_text, wiki_titles);
 
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].title_views.get("Page"), Some(&35));
+    }
+
+    #[test]
+    fn test_scan_by_site_on_site_enter_returns_none_skips() {
+        let dump_text = "\
+en.wikipedia Page null desktop 42 A42\n";
+
+        // on_site_enter returns None for all wikis → skip everything.
+        let compressed = {
+            use bzip2::write::BzEncoder;
+            use bzip2::Compression;
+            use std::io::Write;
+            let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(dump_text.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let mut results = Vec::new();
+        scan_dump_by_site(
+            std::io::BufReader::new(compressed.as_slice()),
+            |_wiki_code| None,
+            |svd| results.push(svd),
+        )
+        .unwrap();
+        assert!(results.is_empty());
     }
 
     // ----- other tests ---------------------------------------------------
