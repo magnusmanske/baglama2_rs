@@ -7,6 +7,7 @@ use log::{info, LevelFilter};
 pub use site::Site;
 use std::env;
 use std::num::NonZero;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 pub use view_count::ViewCount;
@@ -45,6 +46,13 @@ fn month(month: Option<&String>) -> u32 {
             .unwrap_or_else(|_| panic!("Month: number expected, not '{s}'")),
         None => panic!("Month expected but missing"),
     }
+}
+
+/// Extract an optional `--dump=PATH` flag from the command line.
+/// The flag may appear at any position; positional args are unaffected.
+fn dump_override(argv: &[String]) -> Option<PathBuf> {
+    argv.iter()
+        .find_map(|a| a.strip_prefix("--dump=").map(PathBuf::from))
 }
 
 fn year(year: Option<&String>) -> i32 {
@@ -146,10 +154,14 @@ async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
     Ok(())
 }
 
-async fn process_mysql2_views(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
+async fn process_mysql2_views(
+    ym: YearMonth,
+    baglama: Arc<Baglama2>,
+    dump_override: Option<PathBuf>,
+) -> Result<()> {
     let db = DbMySql2::new(ym, baglama.clone()).await?;
     db.ensure_table_exists().await?;
-    db.load_missing_views().await?;
+    db.load_missing_views(dump_override).await?;
     Ok(())
 }
 
@@ -179,6 +191,7 @@ async fn main() -> Result<()> {
             process_mysql2_views(
                 YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),
+                dump_override(&argv),
             )
             .await?;
         }

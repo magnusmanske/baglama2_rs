@@ -12,6 +12,7 @@ use mysql_async::{from_row_opt, prelude::*};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::sync::Mutex;
@@ -68,8 +69,11 @@ impl DbMySql2 {
     /// monthly Wikimedia pageview dump file).  If the dump is not yet
     /// available for the requested month, falls back to the per-page REST
     /// API which is slower but works for the current/recent month.
-    pub async fn load_missing_views(&self) -> Result<()> {
-        match self.load_views_from_dump().await {
+    ///
+    /// `dump_override`, if set, forces the dump-based path to read from that
+    /// local file instead of resolving the path from year/month.
+    pub async fn load_missing_views(&self, dump_override: Option<PathBuf>) -> Result<()> {
+        match self.load_views_from_dump(dump_override).await {
             Ok(()) => {
                 info!("Pageview dump processed successfully — all views loaded from dump");
                 return Ok(());
@@ -106,7 +110,7 @@ impl DbMySql2 {
     /// Peak memory is proportional to a single wiki's worth of pages (a few
     /// hundred MB for the largest wikis) rather than the entire 24M+ distinct
     /// pages across all wikis.
-    async fn load_views_from_dump(&self) -> Result<()> {
+    async fn load_views_from_dump(&self, dump_override: Option<PathBuf>) -> Result<()> {
         let table_name = self.table_name().to_owned();
         let year = self.ym.year();
         let month = self.ym.month();
@@ -168,8 +172,23 @@ impl DbMySql2 {
             }
         };
 
+        // Resolve the local dump path: an explicit --dump override takes
+        // precedence; otherwise fall back to the conventional per-month path.
+        let local_path = match dump_override {
+            Some(path) => {
+                if !path.is_file() {
+                    return Err(anyhow!(
+                        "--dump file does not exist: {}",
+                        path.display()
+                    ));
+                }
+                Some(path)
+            }
+            None => dump_reader::local_dump_path(year, month),
+        };
+
         // Launch the dump scanner (local file or streaming HTTP).
-        let scan_task = if let Some(local_path) = dump_reader::local_dump_path(year, month) {
+        let scan_task = if let Some(local_path) = local_path {
             println!(
                 "Pageview strategy: local dump file ({})",
                 local_path.display()
