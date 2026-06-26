@@ -6,6 +6,7 @@ use crate::Site;
 use crate::YearMonth;
 use anyhow::Result;
 use core::time::Duration;
+use log::info;
 use mysql_async::{from_row, prelude::*, Conn};
 
 use serde_json::Value;
@@ -39,7 +40,9 @@ impl Baglama2 {
                 Self::get_config_from_file("/data/project/glamtools/baglama2_rs/config.json")?
             }
         };
+        info!("Baglama2::new: connecting to Wikidata API");
         let wikidata_api = Api::new("https://www.wikidata.org/w/api.php").await?;
+        info!("Baglama2::new: building site matrix from Wikidata");
         let mut ret = Self {
             config: config.clone(),
             tfdb: ToolforgeDB::default(),
@@ -47,9 +50,12 @@ impl Baglama2 {
             sites_cache: vec![],
             site_matrix: SiteMatrix::new(&wikidata_api).await?,
         };
+        info!("Baglama2::new: adding tooldb + commons MySQL pools");
         ret.tfdb.add_mysql_pool("tooldb", &config["tooldb"])?;
         ret.tfdb.add_mysql_pool("commons", &config["commons"])?;
+        info!("Baglama2::new: populating sites cache from tool DB");
         ret.populate_sites().await?;
+        info!("Baglama2::new: ready");
         Ok(ret)
     }
 
@@ -101,6 +107,7 @@ impl Baglama2 {
             "{} WHERE is_user_name=0 AND is_active=1",
             RowGroup::sql_select()
         );
+        info!("deactivate_nonexistent_categories: querying active groups from tool DB");
         let groups = self
             .get_tooldb_conn()
             .await?
@@ -112,7 +119,16 @@ impl Baglama2 {
             .iter()
             .map(|group| group.category().to_owned())
             .collect::<Vec<String>>();
+        info!(
+            "deactivate_nonexistent_categories: {} active categories; checking existence on Commons",
+            active_categories.len()
+        );
         let existing_categories = self.get_existing_categories(&active_categories).await?;
+        info!(
+            "deactivate_nonexistent_categories: {} of {} categories exist on Commons",
+            existing_categories.len(),
+            active_categories.len()
+        );
         let non_existing_categories = active_categories
             .iter()
             .filter(|category| !existing_categories.contains(*category))
@@ -150,6 +166,10 @@ impl Baglama2 {
             .collect::<Vec<String>>();
         let placeholders = Baglama2::sql_placeholders(categories.len());
         let sql = format!("SELECT `page_title` FROM `page` WHERE `page_namespace`=14 AND `page_title` IN ({placeholders})");
+        info!(
+            "get_existing_categories: running single IN query against Commons `page` with {} placeholders",
+            categories.len()
+        );
         let results = self
             .get_commons_conn()
             .await?
@@ -157,6 +177,7 @@ impl Baglama2 {
             .await?
             .map_and_drop(from_row::<String>)
             .await?;
+        info!("get_existing_categories: Commons query returned {} rows", results.len());
         let results = results
             .iter()
             .map(|category| category.replace("_", " "))
@@ -210,8 +231,11 @@ impl Baglama2 {
 
     /// Updates sites in the tooldb from the Commons database
     pub async fn update_sites(&self) -> Result<()> {
+        info!("update_sites: fetching site list from Commons DB");
         let sites = self.get_sites_from_commons_db().await?;
+        info!("update_sites: got {} sites; upserting into tool DB", sites.len());
         self.ensure_sites_in_tooldb(sites).await?;
+        info!("update_sites: tool DB sites table updated");
         Ok(())
     }
 

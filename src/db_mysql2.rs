@@ -59,7 +59,9 @@ impl DbMySql2 {
             wiki2site_id: HashMap::new(),
             table_name,
         };
+        info!("DbMySql2::new: initializing sites for table `{}`", ret.table_name);
         ret.initialize_sites().await?;
+        info!("DbMySql2::new: sites initialized ({} sites)", ret.sites.len());
         Ok(ret)
     }
 
@@ -534,6 +536,7 @@ impl DbMySql2 {
 
     pub async fn ensure_table_exists(&self) -> Result<()> {
         let table_name = self.table_name();
+        info!("ensure_table_exists: CREATE TABLE IF NOT EXISTS `{table_name}`");
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS `{table_name}` (
               `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
@@ -548,6 +551,7 @@ impl DbMySql2 {
             ) ENGINE=InnoDB DEFAULT CHARSET=ascii;"
         );
         self.execute(&sql).await?;
+        info!("ensure_table_exists: `{table_name}` is present");
         Ok(())
     }
 

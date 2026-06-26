@@ -147,10 +147,15 @@ async fn process_all_groups(
 }
 
 async fn process_mysql2(ym: YearMonth, baglama: Arc<Baglama2>) -> Result<()> {
+    info!("process_mysql2: constructing DbMySql2 for {}", ym);
     let db = DbMySql2::new(ym, baglama.clone()).await?;
+    info!("process_mysql2: ensuring table exists");
     db.ensure_table_exists().await?;
+    info!("process_mysql2: starting missing groups");
     db.start_missing_groups().await?;
+    info!("process_mysql2: adding pages");
     db.add_pages().await?;
+    info!("process_mysql2: done");
     Ok(())
 }
 
@@ -174,13 +179,18 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = env::args_os()
         .map(|s| s.into_string().expect("Bad argv"))
         .collect();
+    info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
     let baglama = Arc::new(Baglama2::new().await?);
+    info!("Baglama2 initialized; deactivating nonexistent categories");
     baglama.deactivate_nonexistent_categories().await?;
+    info!("deactivate_nonexistent_categories complete; command = {:?}", argv.get(1));
     match argv.get(1).map(|s| s.as_str()) {
         Some("mysql2") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
+            info!("mysql2: updating sites for {year}-{month:02}");
             baglama.update_sites().await?;
+            info!("mysql2: update_sites complete, processing");
             process_mysql2(
                 YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),
