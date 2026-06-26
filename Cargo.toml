@@ -23,6 +23,7 @@ bzip2 = "0.5"
 tools_interface = "*"
 wikimisc = { git = "https://github.com/magnusmanske/wikimisc" }
 log = "0.4"
+env_logger = "0.11"
 base64 = "^0.22"
 
 [profile.release]

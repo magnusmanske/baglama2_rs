@@ -3,7 +3,7 @@ use anyhow::Result;
 use baglama2::*;
 use chrono::{DateTime, Datelike, Months, Utc};
 use group_date::*;
-use log::{info, LevelFilter};
+use log::info;
 pub use site::Site;
 use std::env;
 use std::num::NonZero;
@@ -167,7 +167,10 @@ async fn process_mysql2_views(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    log::set_max_level(LevelFilter::Trace);
+    // Install a logger backend. Without this, all log::{info,warn,error,trace}
+    // macros are silently discarded. Defaults to `info`; override per-module
+    // via the RUST_LOG env var (e.g. `RUST_LOG=baglama2=trace`).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let argv: Vec<String> = env::args_os()
         .map(|s| s.into_string().expect("Bad argv"))
         .collect();
