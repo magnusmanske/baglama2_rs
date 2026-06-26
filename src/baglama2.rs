@@ -4,9 +4,9 @@ use crate::DbId;
 use crate::GroupId;
 use crate::Site;
 use crate::YearMonth;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use core::time::Duration;
-use log::info;
+use log::{info, warn};
 use mysql_async::{from_row, prelude::*, Conn};
 
 use serde_json::Value;
@@ -33,6 +33,9 @@ pub struct Baglama2 {
 }
 
 impl Baglama2 {
+    /// Max time to wait for a pooled DB connection before failing fast.
+    const DB_CONN_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub async fn new() -> Result<Self> {
         let config = match Self::get_config_from_file("config.json") {
             Ok(config) => config,
@@ -197,12 +200,31 @@ impl Baglama2 {
         Ok(serde_json::from_reader(file)?)
     }
 
+    /// Acquire a pooled connection, failing fast if the pool/host is
+    /// unreachable instead of blocking forever (the prod-on-Toolforge
+    /// failure mode). See [`Baglama2::DB_CONN_TIMEOUT`].
+    async fn get_conn_with_timeout(&self, name: &'static str) -> Result<Conn> {
+        match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name)).await {
+            Ok(res) => res,
+            Err(_) => {
+                warn!(
+                    "get_conn_with_timeout: acquiring '{name}' connection timed out after {}s",
+                    Self::DB_CONN_TIMEOUT.as_secs()
+                );
+                Err(anyhow!(
+                    "Timed out after {}s acquiring '{name}' database connection",
+                    Self::DB_CONN_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
     pub async fn get_tooldb_conn(&self) -> Result<Conn> {
-        self.tfdb.get_connection("tooldb").await
+        self.get_conn_with_timeout("tooldb").await
     }
 
     pub async fn get_commons_conn(&self) -> Result<Conn> {
-        self.tfdb.get_connection("commons").await
+        self.get_conn_with_timeout("commons").await
     }
 
     async fn populate_sites(&mut self) -> Result<()> {

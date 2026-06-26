@@ -1,14 +1,16 @@
 use crate::db_mysql2::DbMySql2;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use baglama2::*;
 use chrono::{DateTime, Datelike, Months, Utc};
 use group_date::*;
-use log::info;
+use log::{error, info};
 pub use site::Site;
 use std::env;
+use std::future::Future;
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
@@ -45,6 +47,27 @@ fn month(month: Option<&String>) -> u32 {
             .parse::<u32>()
             .unwrap_or_else(|_| panic!("Month: number expected, not '{s}'")),
         None => panic!("Month expected but missing"),
+    }
+}
+
+/// Run an async step with a wall-clock timeout. On timeout, logs and
+/// returns an error so the process exits with a clear message instead of
+/// hanging silently (the prod-on-Toolforge failure mode). Wrapping a step
+/// also bounds any network/DB call inside it that has no timeout of its own.
+async fn with_timeout<F, T>(label: &str, secs: u64, fut: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    info!("[{label}] starting (timeout {secs}s)");
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(res) => {
+            info!("[{label}] finished");
+            res
+        }
+        Err(_) => {
+            error!("[{label}] TIMED OUT after {secs}s — aborting");
+            Err(anyhow!("Step '{label}' timed out after {secs}s"))
+        }
     }
 }
 
@@ -180,16 +203,21 @@ async fn main() -> Result<()> {
         .map(|s| s.into_string().expect("Bad argv"))
         .collect();
     info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
-    let baglama = Arc::new(Baglama2::new().await?);
+    let baglama = Arc::new(with_timeout("Baglama2::new", 180, Baglama2::new()).await?);
     info!("Baglama2 initialized; deactivating nonexistent categories");
-    baglama.deactivate_nonexistent_categories().await?;
+    with_timeout(
+        "deactivate_nonexistent_categories",
+        300,
+        baglama.deactivate_nonexistent_categories(),
+    )
+    .await?;
     info!("deactivate_nonexistent_categories complete; command = {:?}", argv.get(1));
     match argv.get(1).map(|s| s.as_str()) {
         Some("mysql2") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
             info!("mysql2: updating sites for {year}-{month:02}");
-            baglama.update_sites().await?;
+            with_timeout("update_sites", 180, baglama.update_sites()).await?;
             info!("mysql2: update_sites complete, processing");
             process_mysql2(
                 YearMonth::new(year, month).expect("bad year/month"),
@@ -200,7 +228,7 @@ async fn main() -> Result<()> {
         Some("mysql2_views") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
-            baglama.update_sites().await?;
+            with_timeout("update_sites", 180, baglama.update_sites()).await?;
             process_mysql2_views(
                 YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),
