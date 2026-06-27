@@ -585,7 +585,14 @@ impl DbMySql2 {
         Ok(files)
     }
 
-    async fn get_next_group_id_to_process(&self) -> Option<(DbId, GroupId)> {
+    /// Find the next group to process.
+    ///
+    /// Returns `Ok(None)` only when there genuinely are no more `STARTED`
+    /// groups for this month. Any DB error is propagated as `Err` instead of
+    /// being silently turned into "nothing to do" — otherwise a transient
+    /// connection/query failure makes the whole job exit successfully without
+    /// touching the database.
+    async fn get_next_group_id_to_process(&self) -> Result<Option<(DbId, GroupId)>> {
         let sql = "SELECT id,group_id FROM `group_status`
 				WHERE `year`=? AND `month`=? AND `status`='STARTED'
 				ORDER BY rand()
@@ -593,30 +600,31 @@ impl DbMySql2 {
         let groups = self
             .baglama
             .get_tooldb_conn()
-            .await
-            .ok()?
+            .await?
             .exec_iter(sql, (self.ym.year(), self.ym.month()))
-            .await
-            .ok()?
+            .await?
             .map_and_drop(from_row_opt::<(usize, usize)>)
-            .await
-            .ok()?;
-        match groups.first().as_ref() {
+            .await?;
+        match groups.into_iter().next() {
             Some(Ok((id, group_id))) => {
-                let id = *id;
-                let group_id = GroupId::try_from(*group_id).ok()?;
-                Some((id, group_id))
+                let group_id = GroupId::try_from(group_id)
+                    .map_err(|e| anyhow!("Invalid group_id {group_id} in group_status: {e}"))?;
+                Ok(Some((id, group_id)))
             }
-            _ => None,
+            Some(Err(e)) => Err(anyhow!("Failed to decode group_status row: {e}")),
+            None => Ok(None),
         }
     }
 
     pub async fn add_pages(&self) -> Result<()> {
         loop {
             info!("Looking for next group");
-            let (group_status_id, group_id) = match self.get_next_group_id_to_process().await {
+            let (group_status_id, group_id) = match self.get_next_group_id_to_process().await? {
                 Some(id) => id,
-                None => break,
+                None => {
+                    info!("No more STARTED groups for {}; add_pages done", self.ym);
+                    break;
+                }
             };
             info!("Processing group ID: {}", group_id);
             let files = self.get_files_for_group(group_id).await?;

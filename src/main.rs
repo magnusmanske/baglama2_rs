@@ -195,6 +195,17 @@ async fn process_mysql2_views(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Unconditional startup banner to STDOUT (line-buffered, flushes on
+    // newline). If this line does not appear in the captured output, the
+    // running binary is not this build, or output is not being captured —
+    // before debugging logic, fix that. Includes the build version so a
+    // stale deploy is obvious.
+    println!(
+        "baglama2 v{} starting — args: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        env::args().skip(1).collect::<Vec<_>>()
+    );
+
     // Install a logger backend. Without this, all log::{info,warn,error,trace}
     // macros are silently discarded. Defaults to `info`; override per-module
     // via the RUST_LOG env var (e.g. `RUST_LOG=baglama2=trace`).

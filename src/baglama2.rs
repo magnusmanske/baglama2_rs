@@ -36,6 +36,11 @@ impl Baglama2 {
     /// Max time to wait for a pooled DB connection before failing fast.
     const DB_CONN_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// Max time for a single Commons query (exec + fetch) before failing fast.
+    /// Generous, because deep category joins on the replicas are legitimately
+    /// slow — but bounded, so the job can't hang for hours on one query.
+    const DB_QUERY_TIMEOUT: Duration = Duration::from_secs(600);
+
     pub async fn new() -> Result<Self> {
         let config = match Self::get_config_from_file("config.json") {
             Ok(config) => config,
@@ -382,22 +387,27 @@ impl Baglama2 {
                     }
                 }
             };
-            let result = match conn.exec_iter(sql, remaining_queries.to_owned()).await {
-                Ok(res) => res,
-                Err(e) => {
-                    if attempts_left == 0 {
-                        return Err(e.into());
-                    } else {
-                        drop(conn);
-                        continue;
-                    }
-                }
+            // Bound the whole exec+fetch: a Commons replica can accept the
+            // connection and then never return on a heavy join, which would
+            // hang the job indefinitely with no error.
+            let query = async {
+                let result = conn.exec_iter(sql, remaining_queries.to_owned()).await?;
+                let rows = result.map_and_drop(from_row::<String>).await?;
+                Ok::<Vec<String>, mysql_async::Error>(rows)
             };
-            ret = match result.map_and_drop(from_row::<String>).await {
-                Ok(ret) => ret,
+            let query_result = match tokio::time::timeout(Self::DB_QUERY_TIMEOUT, query).await {
+                Ok(res) => res.map_err(anyhow::Error::from),
+                Err(_) => Err(anyhow!(
+                    "Commons query timed out after {}s",
+                    Self::DB_QUERY_TIMEOUT.as_secs()
+                )),
+            };
+            ret = match query_result {
+                Ok(rows) => rows,
                 Err(e) => {
+                    warn!("query_commons_repeat: attempt failed ({e}); {attempts_left} attempts left");
                     if attempts_left == 0 {
-                        return Err(e.into());
+                        return Err(e);
                     } else {
                         drop(conn);
                         continue;
