@@ -14,6 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::Mutex;
 
@@ -24,6 +25,11 @@ const MATCH_EXISTING_FILES_CHUNK_SIZE: usize = 10000;
 /// Number of UPDATE statements to batch together when writing back
 /// view counts obtained from the dump file.
 const DUMP_UPDATE_BATCH_SIZE: usize = 5000;
+
+/// Max time for a single per-site page-loading query before we skip the
+/// site. Generous (large sites legitimately return millions of rows) but
+/// bounded, so a pathological query can't stall the whole scan for hours.
+const PER_SITE_QUERY_TIMEOUT: Duration = Duration::from_secs(900);
 
 struct PageFile {
     page: Page,
@@ -242,6 +248,35 @@ impl DbMySql2 {
         // reuse it when the SiteViewData arrives.
         let mut pending_pages: HashMap<String, Vec<(usize, String)>> = HashMap::new();
 
+        // Decoupled flush writer. The consumer sends matched view counts here
+        // and immediately keeps servicing the scanner, so the DB writes for
+        // one wiki overlap with the scan + page-query work for the next.
+        // The writer owns a SEPARATE connection (so it doesn't contend with
+        // the per-site page queries on `conn`), and the bounded channel
+        // applies backpressure so we never buffer more than a few sites in
+        // memory if the DB falls behind.
+        let (flush_tx, mut flush_rx) =
+            tokio::sync::mpsc::channel::<(String, HashMap<usize, u64>)>(4);
+        let flush_table = table_name.clone();
+        let flush_baglama = self.baglama.clone();
+        let flush_task = tokio::spawn(async move {
+            let mut fconn = flush_baglama.get_tooldb_conn().await?;
+            let mut sites_flushed: u64 = 0;
+            while let Some((wiki_code, id2views)) = flush_rx.recv().await {
+                if let Err(e) =
+                    Self::flush_view_counts_to_db(&flush_table, &id2views, &mut fconn).await
+                {
+                    error!(
+                        "flush writer: flush failed for '{wiki_code}': {e}; reconnecting + retrying"
+                    );
+                    fconn = flush_baglama.get_tooldb_conn().await?;
+                    Self::flush_view_counts_to_db(&flush_table, &id2views, &mut fconn).await?;
+                }
+                sites_flushed += 1;
+            }
+            Ok::<u64, anyhow::Error>(sites_flushed)
+        });
+
         loop {
             tokio::select! {
                 // --- on_site_enter request from scanner ---
@@ -260,15 +295,26 @@ impl DbMySql2 {
                         wiki_code, site_id
                     );
 
-                    // Load distinct pages for this site that need view counts.
+                    // Load the pages for this site that still need view
+                    // counts. Uses a correlated EXISTS rather than
+                    // JOIN + DISTINCT: a page can have many viewdata rows, so
+                    // the old join multiplied rows and forced a sort/temp
+                    // table for DISTINCT — which on the 40M+ row viewdata
+                    // table effectively hung (the cause of the 13h stall).
+                    // EXISTS short-circuits on the first matching row via the
+                    // `pages_id` index and returns each page once.
                     let sql = format!(
-                        "SELECT DISTINCT p.`id`, FROM_BASE64(TO_BASE64(p.`title`))
+                        "SELECT p.`id`, FROM_BASE64(TO_BASE64(p.`title`))
                          FROM `pages` p
-                         JOIN `{table_name}` vd ON vd.`pages_id` = p.`id`
-                         WHERE p.`site` = ? AND vd.`page_views` IS NULL"
+                         WHERE p.`site` = ?
+                           AND EXISTS (
+                             SELECT 1 FROM `{table_name}` vd
+                             WHERE vd.`pages_id` = p.`id` AND vd.`page_views` IS NULL
+                           )"
                     );
-                    let page_rows = match conn.exec_iter(&sql, (site_id,)).await {
-                        Ok(result) => match result
+                    let query = conn.exec_iter(&sql, (site_id,));
+                    let page_rows = match tokio::time::timeout(PER_SITE_QUERY_TIMEOUT, query).await {
+                        Ok(Ok(result)) => match result
                             .map_and_drop(from_row_opt::<(usize, String)>)
                             .await
                         {
@@ -285,11 +331,28 @@ impl DbMySql2 {
                                 continue;
                             }
                         },
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             error!(
                                 "load_views_from_dump: DB query failed for '{}': {e}",
                                 wiki_code
                             );
+                            match self.baglama.get_tooldb_conn().await {
+                                Ok(new_conn) => conn = new_conn,
+                                Err(e2) => error!("load_views_from_dump: reconnect failed: {e2}"),
+                            }
+                            let _ = reply_tx.send(None);
+                            continue;
+                        }
+                        Err(_) => {
+                            error!(
+                                "load_views_from_dump: page query for '{}' (site_id={}) timed out \
+                                 after {}s — skipping site",
+                                wiki_code,
+                                site_id,
+                                PER_SITE_QUERY_TIMEOUT.as_secs()
+                            );
+                            // The timed-out query may have left the connection
+                            // in a bad state; get a fresh one.
                             match self.baglama.get_tooldb_conn().await {
                                 Ok(new_conn) => conn = new_conn,
                                 Err(e2) => error!("load_views_from_dump: reconnect failed: {e2}"),
@@ -314,12 +377,14 @@ impl DbMySql2 {
                         page_rows.len()
                     );
 
-                    // Build the TitleFilter — set of underscored titles the
-                    // scanner should keep.  Stash the full page_rows so we
-                    // can map titles→pages_ids when the SiteViewData arrives.
+                    // Build the TitleFilter — set of title keys the scanner
+                    // should keep. Each page contributes its normalized form
+                    // plus, if double-encoded, its repaired form (see
+                    // `title_match_keys`). Stash the full page_rows so we can
+                    // map titles→pages_ids when the SiteViewData arrives.
                     let filter: TitleFilter = page_rows
                         .iter()
-                        .map(|(_id, title)| title.replace(' ', "_"))
+                        .flat_map(|(_id, title)| Self::title_match_keys(title))
                         .collect();
 
                     pending_pages.insert(wiki_code.clone(), page_rows);
@@ -345,14 +410,13 @@ impl DbMySql2 {
                         }
                     };
 
-                    // Build title → Vec<pages_id>.
+                    // Build title → Vec<pages_id>, registering every match
+                    // key for each page (normalized + repaired-if-needed).
                     let mut title_to_ids: HashMap<String, Vec<usize>> = HashMap::new();
                     for (pages_id, title) in &page_rows {
-                        let title_underscored = title.replace(' ', "_");
-                        title_to_ids
-                            .entry(title_underscored)
-                            .or_default()
-                            .push(*pages_id);
+                        for key in Self::title_match_keys(title) {
+                            title_to_ids.entry(key).or_default().push(*pages_id);
+                        }
                     }
 
                     // Match dump view data against our pages.
@@ -381,28 +445,27 @@ impl DbMySql2 {
                     total_zeroed += zeroed;
 
                     info!(
-                        "load_views_from_dump: '{}': {} matched, {} zeroed, flushing…",
+                        "load_views_from_dump: '{}': {} matched, {} zeroed, queueing flush…",
                         svd.wiki_code, matched, zeroed
                     );
 
-                    if let Err(e) =
-                        Self::flush_view_counts_to_db(&table_name, &id2views, &mut conn).await
-                    {
+                    // Hand off to the flush writer. `.await` here provides
+                    // backpressure: if the writer is behind, we pause scanning
+                    // rather than buffering unbounded view data in memory.
+                    if id2views.is_empty() {
+                        // Nothing to write (no pending pages). Skip.
+                    } else if flush_tx.send((svd.wiki_code.clone(), id2views)).await.is_err() {
                         error!(
-                            "load_views_from_dump: flush failed for '{}': {e}",
+                            "load_views_from_dump: flush writer gone, cannot flush '{}'",
                             svd.wiki_code
                         );
-                        match self.baglama.get_tooldb_conn().await {
-                            Ok(new_conn) => conn = new_conn,
-                            Err(e2) => error!("load_views_from_dump: reconnect failed: {e2}"),
-                        }
-                        continue;
+                        break;
                     }
                     sites_processed += 1;
 
                     if sites_processed % 50 == 0 {
                         info!(
-                            "load_views_from_dump: progress — {} sites, {} updated, {} zeroed",
+                            "load_views_from_dump: progress — {} sites scanned, {} matched, {} zeroed",
                             sites_processed, total_updated, total_zeroed
                         );
                     }
@@ -417,6 +480,21 @@ impl DbMySql2 {
             "load_views_from_dump: select loop ended — {} sites processed",
             sites_processed
         );
+
+        // Close the flush channel and wait for the writer to drain its queue
+        // and finish all pending UPDATEs.
+        drop(flush_tx);
+        match flush_task.await {
+            Ok(Ok(n)) => info!("load_views_from_dump: flush writer done — {n} sites written"),
+            Ok(Err(e)) => {
+                error!("load_views_from_dump: flush writer returned error: {e}");
+                return Err(e);
+            }
+            Err(e) => {
+                error!("load_views_from_dump: flush writer task panicked: {e}");
+                return Err(anyhow!("flush writer task panicked: {e}"));
+            }
+        }
 
         // Wait for the scanner to finish and propagate any error.
         match scan_task.await {
@@ -442,6 +520,39 @@ impl DbMySql2 {
         Ok(())
     }
 
+    /// Title-matching keys for a `pages.title` value, compared against the
+    /// (proper-UTF-8) titles in the pageview dump.
+    ///
+    /// Always includes the space→underscore normalized form. baglama's
+    /// `pages` table historically stores some titles double-encoded (UTF-8
+    /// bytes re-interpreted as Latin-1 and re-encoded), so e.g. `Alcalá`
+    /// appears as `AlcalÃ¡` and would never match the dump. When the title
+    /// is repairable we ALSO emit the repaired form as a key, so both the
+    /// clean ASCII case and the double-encoded case match.
+    fn title_match_keys(raw_title: &str) -> Vec<String> {
+        let underscored = raw_title.replace(' ', "_");
+        match Self::repair_double_encoding(&underscored) {
+            Some(fixed) if fixed != underscored => vec![underscored, fixed],
+            _ => vec![underscored],
+        }
+    }
+
+    /// If `s` looks like double-encoded UTF-8 — every char fits in a single
+    /// byte and the resulting byte sequence is itself valid UTF-8 — return
+    /// the repaired string. Pure ASCII returns an identical string (callers
+    /// dedupe), and correctly-stored multibyte UTF-8 returns `None`.
+    fn repair_double_encoding(s: &str) -> Option<String> {
+        let mut bytes = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            let n = c as u32;
+            if n > 0xFF {
+                return None;
+            }
+            bytes.push(n as u8);
+        }
+        String::from_utf8(bytes).ok()
+    }
+
     /// Write a batch of `pages_id → views` pairs into the viewdata table.
     async fn flush_view_counts_to_db(
         table_name: &str,
@@ -463,7 +574,7 @@ impl DbMySql2 {
             let sql = format!(
                 "UPDATE `{table_name}` \
                  SET `page_views` = CASE `pages_id` {cases} ELSE `page_views` END \
-                 WHERE `pages_id` IN ({ids})"
+                 WHERE `pages_id` IN ({ids}) AND `page_views` IS NULL"
             );
             conn.exec_drop(&sql, ()).await?;
         }
@@ -547,7 +658,8 @@ impl DbMySql2 {
               PRIMARY KEY (`id`),
               UNIQUE KEY `{table_name}_idx1` (`group_status_id`,`files_id`,`pages_id`),
               KEY `{table_name}_idx2` (`pages_id`),
-              KEY `{table_name}_idx3` (`page_views`)
+              KEY `{table_name}_idx3` (`page_views`),
+              KEY `{table_name}_idx4` (`pages_id`,`page_views`)
             ) ENGINE=InnoDB DEFAULT CHARSET=ascii;"
         );
         self.execute(&sql).await?;
@@ -1236,6 +1348,47 @@ mod tests {
     use super::*;
     use crate::file::File;
     use crate::page::Page;
+
+    #[test]
+    fn test_title_match_keys_ascii_single_key() {
+        // Pure ASCII: one key, spaces → underscores, no repaired duplicate.
+        assert_eq!(
+            DbMySql2::title_match_keys("Albert Einstein"),
+            vec!["Albert_Einstein".to_string()]
+        );
+        assert_eq!(
+            DbMySql2::title_match_keys("1033_Fez_massacre"),
+            vec!["1033_Fez_massacre".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_title_match_keys_repairs_double_encoded() {
+        // `Alcalá` double-encoded is stored as `AlcalÃ¡`. We must emit BOTH
+        // the raw key and the repaired (proper-UTF-8) key so the dump matches.
+        let keys = DbMySql2::title_match_keys("Estudios Generales de AlcalÃ¡ de Henares");
+        assert!(keys.contains(&"Estudios_Generales_de_AlcalÃ¡_de_Henares".to_string()));
+        assert!(
+            keys.contains(&"Estudios_Generales_de_Alcalá_de_Henares".to_string()),
+            "repaired UTF-8 key missing: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn test_repair_double_encoding() {
+        // Classic Latin-1/UTF-8 double-encoding round-trips back to clean UTF-8.
+        assert_eq!(
+            DbMySql2::repair_double_encoding("AlcalÃ¡"),
+            Some("Alcalá".to_string())
+        );
+        // Correctly-stored multibyte UTF-8 (char > 0xFF) is left alone.
+        assert_eq!(DbMySql2::repair_double_encoding("北京"), None);
+        // ASCII maps to itself.
+        assert_eq!(
+            DbMySql2::repair_double_encoding("Main_Page"),
+            Some("Main_Page".to_string())
+        );
+    }
 
     /// Build a PageFile with no DB ids assigned yet.
     fn make_page_file(file_name: &str) -> PageFile {

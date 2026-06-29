@@ -421,15 +421,16 @@ where
             None => true,
         };
         if wiki_changed {
-            // Flush the previous wiki's data.
+            // Flush the previous wiki's data. We emit for EVERY wiki we
+            // entered (filter was Some), even if no title matched — the
+            // consumer needs an (empty) SiteViewData to zero out the pages
+            // that had no views that month. `current_titles` is always reset.
             if let Some(prev_wiki) = current_wiki.take() {
-                if !current_titles.is_empty() {
-                    sites_emitted += 1;
-                    site_callback(SiteViewData {
-                        wiki_code: prev_wiki,
-                        title_views: std::mem::take(&mut current_titles),
-                    });
-                }
+                sites_emitted += 1;
+                site_callback(SiteViewData {
+                    wiki_code: prev_wiki,
+                    title_views: std::mem::take(&mut current_titles),
+                });
             }
             current_filter = None;
 
@@ -482,15 +483,13 @@ where
         *current_titles.entry(title.to_owned()).or_insert(0) += monthly_total;
     }
 
-    // Flush the last wiki section.
+    // Flush the last wiki section (emit even if empty; see above).
     if let Some(last_wiki) = current_wiki.take() {
-        if !current_titles.is_empty() {
-            sites_emitted += 1;
-            site_callback(SiteViewData {
-                wiki_code: last_wiki,
-                title_views: current_titles,
-            });
-        }
+        sites_emitted += 1;
+        site_callback(SiteViewData {
+            wiki_code: last_wiki,
+            title_views: current_titles,
+        });
     }
 
     eprintln!(
