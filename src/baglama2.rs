@@ -33,8 +33,13 @@ pub struct Baglama2 {
 }
 
 impl Baglama2 {
-    /// Max time to wait for a pooled DB connection before failing fast.
-    const DB_CONN_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Max time for a SINGLE connection-acquisition attempt. Generous because
+    /// a cold pool / slow replica handshake on Toolforge can legitimately take
+    /// tens of seconds; normal is well under a second.
+    const DB_CONN_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// How many times to retry connection acquisition before giving up.
+    const DB_CONN_RETRIES: u32 = 4;
 
     /// Max time for a single Commons query (exec + fetch) before failing fast.
     /// Generous, because deep category joins on the replicas are legitimately
@@ -205,23 +210,44 @@ impl Baglama2 {
         Ok(serde_json::from_reader(file)?)
     }
 
-    /// Acquire a pooled connection, failing fast if the pool/host is
-    /// unreachable instead of blocking forever (the prod-on-Toolforge
-    /// failure mode). See [`Baglama2::DB_CONN_TIMEOUT`].
+    /// Acquire a pooled connection, retrying transient failures with backoff
+    /// and capping each attempt so it can't block forever (the prod-on-
+    /// Toolforge failure mode). Toolforge replicas occasionally refuse or are
+    /// slow to hand out a connection; a single 30s cap with no retry was too
+    /// brittle for a long-running batch job. Total budget is bounded:
+    /// `DB_CONN_RETRIES` attempts of up to `DB_CONN_TIMEOUT` each, plus
+    /// backoff, so it still fails loudly rather than hanging indefinitely.
     async fn get_conn_with_timeout(&self, name: &'static str) -> Result<Conn> {
-        match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name)).await {
-            Ok(res) => res,
-            Err(_) => {
-                warn!(
-                    "get_conn_with_timeout: acquiring '{name}' connection timed out after {}s",
-                    Self::DB_CONN_TIMEOUT.as_secs()
-                );
-                Err(anyhow!(
-                    "Timed out after {}s acquiring '{name}' database connection",
-                    Self::DB_CONN_TIMEOUT.as_secs()
-                ))
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=Self::DB_CONN_RETRIES {
+            match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name)).await {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => {
+                    warn!(
+                        "get_conn '{name}': attempt {attempt}/{} failed: {e}",
+                        Self::DB_CONN_RETRIES
+                    );
+                    last_err = Some(e.to_string());
+                }
+                Err(_) => {
+                    warn!(
+                        "get_conn '{name}': attempt {attempt}/{} timed out after {}s",
+                        Self::DB_CONN_RETRIES,
+                        Self::DB_CONN_TIMEOUT.as_secs()
+                    );
+                    last_err = Some(format!("timed out after {}s", Self::DB_CONN_TIMEOUT.as_secs()));
+                }
+            }
+            if attempt < Self::DB_CONN_RETRIES {
+                // Linear-ish backoff: 3s, 6s, 9s, …
+                tokio::time::sleep(Duration::from_secs(3 * attempt as u64)).await;
             }
         }
+        Err(anyhow!(
+            "Failed to acquire '{name}' database connection after {} attempts ({})",
+            Self::DB_CONN_RETRIES,
+            last_err.unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
     pub async fn get_tooldb_conn(&self) -> Result<Conn> {

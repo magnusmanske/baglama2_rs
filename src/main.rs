@@ -223,11 +223,11 @@ async fn main() -> Result<()> {
         .map(|s| s.into_string().expect("Bad argv"))
         .collect();
     info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
-    let baglama = Arc::new(with_timeout("Baglama2::new", 180, Baglama2::new()).await?);
+    let baglama = Arc::new(with_timeout("Baglama2::new", 600, Baglama2::new()).await?);
     info!("Baglama2 initialized; deactivating nonexistent categories");
     with_timeout(
         "deactivate_nonexistent_categories",
-        300,
+        600,
         baglama.deactivate_nonexistent_categories(),
     )
     .await?;
@@ -237,7 +237,7 @@ async fn main() -> Result<()> {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
             info!("mysql2: updating sites for {year}-{month:02}");
-            with_timeout("update_sites", 180, baglama.update_sites()).await?;
+            with_timeout("update_sites", 600, baglama.update_sites()).await?;
             info!("mysql2: update_sites complete, processing");
             process_mysql2(
                 YearMonth::new(year, month).expect("bad year/month"),
@@ -248,7 +248,7 @@ async fn main() -> Result<()> {
         Some("mysql2_views") => {
             let year = year(argv.get(2));
             let month = month(argv.get(3));
-            with_timeout("update_sites", 180, baglama.update_sites()).await?;
+            with_timeout("update_sites", 600, baglama.update_sites()).await?;
             process_mysql2_views(
                 YearMonth::new(year, month).expect("bad year/month"),
                 baglama.clone(),
