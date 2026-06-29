@@ -71,11 +71,20 @@ where
     }
 }
 
-/// Extract an optional `--dump=PATH` flag from the command line.
-/// The flag may appear at any position; positional args are unaffected.
+/// Extract an optional dump-file override from the command line.
+/// Accepts both `--dump=PATH` and `--dump PATH` (space-separated). The flag
+/// may appear at any position; positional args are unaffected.
 fn dump_override(argv: &[String]) -> Option<PathBuf> {
-    argv.iter()
-        .find_map(|a| a.strip_prefix("--dump=").map(PathBuf::from))
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(path) = arg.strip_prefix("--dump=") {
+            return Some(PathBuf::from(path));
+        }
+        if arg == "--dump" {
+            return iter.next().map(PathBuf::from);
+        }
+    }
+    None
 }
 
 fn year(year: Option<&String>) -> i32 {
@@ -347,6 +356,28 @@ mod tests {
         assert_eq!(month(Some(&"3".to_string())), 3);
         assert_eq!(month(Some(&"12".to_string())), 12);
         assert_eq!(month(Some(&"1".to_string())), 1);
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_dump_override_equals_form() {
+        let a = argv(&["bin", "mysql2_views", "2026", "5", "--dump=/tmp/d.bz2"]);
+        assert_eq!(dump_override(&a), Some(PathBuf::from("/tmp/d.bz2")));
+    }
+
+    #[test]
+    fn test_dump_override_space_form() {
+        let a = argv(&["bin", "mysql2_views", "2026", "5", "--dump", "/tmp/d.bz2"]);
+        assert_eq!(dump_override(&a), Some(PathBuf::from("/tmp/d.bz2")));
+    }
+
+    #[test]
+    fn test_dump_override_absent() {
+        let a = argv(&["bin", "mysql2_views", "2026", "5"]);
+        assert_eq!(dump_override(&a), None);
     }
 
     #[test]
