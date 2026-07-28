@@ -17,11 +17,10 @@ bytes = "1"
 chronoutil = "0.2"
 chrono = "0.4"
 regex = "1"
-
 anyhow = "1"
 bzip2 = "0.5"
 tools_interface = "*"
-wikimisc = { git = "https://github.com/magnusmanske/wikimisc" }
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc" , features = ["wikidata","database","site-matrix"] }
 log = "0.4"
 env_logger = "0.11"
 base64 = "^0.22"
