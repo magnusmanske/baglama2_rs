@@ -1,0 +1,24 @@
+{
+	"_comment": "baglama2 pool configuration. Copy to config.json (gitignored) and fill in real credentials. Locally, start the SSH tunnels in connect_db.sh first: 3377 = commons core, 3378 = Commons links (x4), 3333 = tool DB (Trove). On Toolforge use the real hosts instead: commonswiki.web.db.svc.wikimedia.cloud, links.commonswiki.web.db.svc.wikimedia.cloud, and your tool DB host.",
+	"commons": {
+		"url": "mysql://USER:PASSWORD@127.0.0.1:3377/commonswiki_p",
+		"min_connections": 0,
+		"max_connections": 10,
+		"keep_sec": 10
+	},
+	"commons_links": {
+		"url": "mysql://USER:PASSWORD@127.0.0.1:3378/commonswiki_p",
+		"min_connections": 0,
+		"max_connections": 10,
+		"keep_sec": 10
+	},
+	"tooldb": {
+		"url": "mysql://USER:PASSWORD@127.0.0.1:3333/baglama2",
+		"min_connections": 0,
+		"max_connections": 20,
+		"keep_sec": 60
+	},
+	"max_concurrent_jobs": 10,
+	"sqlite_schema_file": "baglama.sqlite3_schema",
+	"sqlite_data_root_path": "viewdata"
+}

@@ -21,7 +21,23 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use wikimisc::mediawiki::Api;
 use wikimisc::site_matrix::SiteMatrix;
-use wikimisc::toolforge_db::ToolforgeDB;
+use wikimisc::toolforge_db::{DbCluster, ToolforgeDB};
+
+/// The wiki whose replica databases this tool reads. Baglama only queries
+/// Commons; the links split below applies to no other wiki.
+const COMMONS_WIKI: &str = "commonswiki";
+
+/// Pool key of the Commons core replica (`commonswiki…`), holding every table
+/// that was not split off.
+const POOL_COMMONS_CORE: &str = "commons";
+
+/// Pool key of the Commons links extension cluster (`links.commonswiki…`, the
+/// `x4` section), which took over the links tables in September 2026.
+///
+/// A future split needs a new pool under its own key, registered in
+/// [`Baglama2::new`] from config, plus a [`DbCluster`] arm in
+/// [`Baglama2::commons_pool_key`].
+const POOL_COMMONS_LINKS: &str = "commons_links";
 
 #[derive(Debug)]
 pub struct Baglama2 {
@@ -63,9 +79,21 @@ impl Baglama2 {
             sites_cache: vec![],
             site_matrix: SiteMatrix::new(&wikidata_api).await?,
         };
-        info!("Baglama2::new: adding tooldb + commons MySQL pools");
+        info!("Baglama2::new: adding tooldb + Commons core/links MySQL pools");
         ret.tfdb.add_mysql_pool("tooldb", &config["tooldb"])?;
-        ret.tfdb.add_mysql_pool("commons", &config["commons"])?;
+        ret.tfdb
+            .add_mysql_pool(POOL_COMMONS_CORE, &config["commons"])?;
+        // A missing `commons_links` entry must fail startup, not the first
+        // links query, so say what to add.
+        ret.tfdb
+            .add_mysql_pool(POOL_COMMONS_LINKS, &config["commons_links"])
+            .map_err(|e| {
+                anyhow!(
+                    "config needs a '{POOL_COMMONS_LINKS}' pool for the Commons links \
+                     cluster (links.commonswiki…, the x4 split), e.g. \
+                     `\"{POOL_COMMONS_LINKS}\": {{ \"url\": \"mysql://USER:PASS@links.commonswiki.web.db.svc.wikimedia.cloud:3306/commonswiki_p\" }}`: {e}"
+                )
+            })?;
         info!("Baglama2::new: populating sites cache from tool DB");
         ret.populate_sites().await?;
         info!("Baglama2::new: ready");
@@ -184,13 +212,16 @@ impl Baglama2 {
             categories.len()
         );
         let results = self
-            .get_commons_conn()
+            .get_commons_conn_for_tables(&["page"])
             .await?
             .exec_iter(sql, categories.to_owned())
             .await?
             .map_and_drop(from_row::<String>)
             .await?;
-        info!("get_existing_categories: Commons query returned {} rows", results.len());
+        info!(
+            "get_existing_categories: Commons query returned {} rows",
+            results.len()
+        );
         let results = results
             .iter()
             .map(|category| category.replace("_", " "))
@@ -220,7 +251,8 @@ impl Baglama2 {
     async fn get_conn_with_timeout(&self, name: &'static str) -> Result<Conn> {
         let mut last_err: Option<String> = None;
         for attempt in 1..=Self::DB_CONN_RETRIES {
-            match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name)).await {
+            match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name)).await
+            {
                 Ok(Ok(conn)) => return Ok(conn),
                 Ok(Err(e)) => {
                     warn!(
@@ -235,7 +267,10 @@ impl Baglama2 {
                         Self::DB_CONN_RETRIES,
                         Self::DB_CONN_TIMEOUT.as_secs()
                     );
-                    last_err = Some(format!("timed out after {}s", Self::DB_CONN_TIMEOUT.as_secs()));
+                    last_err = Some(format!(
+                        "timed out after {}s",
+                        Self::DB_CONN_TIMEOUT.as_secs()
+                    ));
                 }
             }
             if attempt < Self::DB_CONN_RETRIES {
@@ -254,8 +289,44 @@ impl Baglama2 {
         self.get_conn_with_timeout("tooldb").await
     }
 
-    pub async fn get_commons_conn(&self) -> Result<Conn> {
-        self.get_conn_with_timeout("commons").await
+    /// A connection to the Commons replica cluster that can serve a query
+    /// reading all of `tables`.
+    ///
+    /// Commons had its links tables moved to a separate cluster (`x4`) in
+    /// September 2026, so "the Commons connection" is no longer a single
+    /// thing. The cluster is chosen with [`DbCluster::for_tables`] instead of
+    /// being hard-coded, so a query keeps working when tables move again.
+    ///
+    /// Tables that no single cluster holds — a join across the split — are an
+    /// error; such joins must be done in code.
+    pub async fn get_commons_conn_for_tables(&self, tables: &[&str]) -> Result<Conn> {
+        self.get_conn_with_timeout(Self::commons_pool_key_for_tables(tables)?)
+            .await
+    }
+
+    /// The pool key serving a query over `tables` on Commons, resolved through
+    /// [`DbCluster`].
+    ///
+    /// Kept pure so the table-to-cluster mapping can be unit-tested without a
+    /// database; the `&'static str` is what `get_conn_with_timeout` needs.
+    fn commons_pool_key_for_tables(tables: &[&str]) -> Result<&'static str> {
+        Ok(Self::commons_pool_key(DbCluster::for_tables(
+            COMMONS_WIKI,
+            tables,
+        )?))
+    }
+
+    /// Maps a Commons cluster to the pool key registered for it. `Core` and
+    /// `Links` are the two clusters Commons has; a future split adds a pool
+    /// key and an arm here.
+    fn commons_pool_key(cluster: DbCluster) -> &'static str {
+        match cluster {
+            DbCluster::Core => POOL_COMMONS_CORE,
+            DbCluster::Links => POOL_COMMONS_LINKS,
+            // The term store is Wikidata-only, so `for_tables` never returns
+            // it for Commons; fall back to core rather than inventing a pool.
+            DbCluster::TermStore => POOL_COMMONS_CORE,
+        }
     }
 
     async fn populate_sites(&mut self) -> Result<()> {
@@ -286,7 +357,10 @@ impl Baglama2 {
     pub async fn update_sites(&self) -> Result<()> {
         info!("update_sites: fetching site list from Commons DB");
         let sites = self.get_sites_from_commons_db().await?;
-        info!("update_sites: got {} sites; upserting into tool DB", sites.len());
+        info!(
+            "update_sites: got {} sites; upserting into tool DB",
+            sites.len()
+        );
         self.ensure_sites_in_tooldb(sites).await?;
         info!("update_sites: tool DB sites table updated");
         Ok(())
@@ -319,7 +393,7 @@ impl Baglama2 {
         regexp_replace(substr(reverse(site_domain),2),'\\..*$','') as `language`
         FROM sites";
         let sites = self
-            .get_commons_conn()
+            .get_commons_conn_for_tables(&["sites"])
             .await?
             .exec_iter(sql, ())
             .await?
@@ -393,6 +467,7 @@ impl Baglama2 {
 
     async fn query_commons_repeat(
         &self,
+        tables: &[&str],
         sql: &str,
         remaining_queries: &[String],
     ) -> Result<Vec<String>> {
@@ -403,7 +478,7 @@ impl Baglama2 {
                 break;
             }
             attempts_left -= 1;
-            let mut conn = match self.get_commons_conn().await {
+            let mut conn = match self.get_commons_conn_for_tables(tables).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     if attempts_left == 0 {
@@ -431,7 +506,9 @@ impl Baglama2 {
             ret = match query_result {
                 Ok(rows) => rows,
                 Err(e) => {
-                    warn!("query_commons_repeat: attempt failed ({e}); {attempts_left} attempts left");
+                    warn!(
+                        "query_commons_repeat: attempt failed ({e}); {attempts_left} attempts left"
+                    );
                     if attempts_left == 0 {
                         return Err(e);
                     } else {
@@ -474,7 +551,9 @@ impl Baglama2 {
 	            AND cl_type='subcat'",
                 placeholders
             );
-            check = self.query_commons_repeat(&sql, &remaining).await?;
+            check = self
+                .query_commons_repeat(&["page", "categorylinks", "linktarget"], &sql, &remaining)
+                .await?;
             if check.is_empty() {
                 break;
             }
@@ -514,7 +593,9 @@ impl Baglama2 {
                 AND page_is_redirect=0",
                 placeholders
             );
-            let mut result = self.query_commons_repeat(&sql, cats).await?;
+            let mut result = self
+                .query_commons_repeat(&["page", "categorylinks", "linktarget"], &sql, cats)
+                .await?;
             ret.append(&mut result);
         }
         ret.sort();
@@ -525,7 +606,9 @@ impl Baglama2 {
     /// Gets all images uploaded by a user
     pub async fn get_files_from_user_name(&self, user_name: &str) -> Result<Vec<String>> {
         let sql = "SELECT DISTINCT FROM_BASE64(TO_BASE64(img_name)) FROM image,actor,user WHERE img_actor=actor_id AND user_name=:user_name AND user_id=actor_user";
-        let mut conn = self.get_commons_conn().await?;
+        let mut conn = self
+            .get_commons_conn_for_tables(&["image", "actor", "user"])
+            .await?;
         let results = conn
             .exec_iter(sql, mysql_async::params! {user_name})
             .await?
@@ -689,6 +772,43 @@ mod tests {
     #[test]
     fn test_sql_placeholders() {
         assert_eq!(Baglama2::sql_placeholders(50).len(), 99);
+    }
+
+    /// The Commons links tables moved to their own cluster in September 2026;
+    /// queries must be routed by the tables they read, not by a single
+    /// hard-coded Commons pool.
+    #[test]
+    fn test_commons_pool_key_for_tables() {
+        // `page` exists on both clusters; every other links table only on the
+        // links cluster, so a join over them belongs there.
+        assert_eq!(
+            Baglama2::commons_pool_key_for_tables(&["page", "categorylinks", "linktarget"])
+                .unwrap(),
+            POOL_COMMONS_LINKS
+        );
+        assert_eq!(
+            Baglama2::commons_pool_key_for_tables(&["globalimagelinks"]).unwrap(),
+            POOL_COMMONS_LINKS
+        );
+
+        // Tables that stayed on the core cluster keep using the core pool.
+        assert_eq!(
+            Baglama2::commons_pool_key_for_tables(&["image", "actor", "user"]).unwrap(),
+            POOL_COMMONS_CORE
+        );
+        assert_eq!(
+            Baglama2::commons_pool_key_for_tables(&["sites"]).unwrap(),
+            POOL_COMMONS_CORE
+        );
+        // `page` alone still resolves to core, the first cluster that holds it.
+        assert_eq!(
+            Baglama2::commons_pool_key_for_tables(&["page"]).unwrap(),
+            POOL_COMMONS_CORE
+        );
+
+        // A query spanning the split cannot be served by one connection, so
+        // it is an error rather than a silently wrong result.
+        assert!(Baglama2::commons_pool_key_for_tables(&["actor", "pagelinks"]).is_err());
     }
 
     #[tokio::test]

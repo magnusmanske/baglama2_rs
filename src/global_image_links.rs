@@ -27,7 +27,12 @@ impl GlobalImageLinks {
             if attempt > 0 {
                 baglama.hold_on().await;
             }
-            let mut mysql_commons_conn = match baglama.get_commons_conn().await {
+            // `globalimagelinks` moved to the Commons links cluster (`x4`);
+            // `for_tables` sends this to the pool that can read it.
+            let mut mysql_commons_conn = match baglama
+                .get_commons_conn_for_tables(&["globalimagelinks"])
+                .await
+            {
                 Ok(conn) => conn,
                 Err(e) => {
                     last_error = Some(format!("Connection error: {e}"));
