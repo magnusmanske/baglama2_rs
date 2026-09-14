@@ -231,7 +231,10 @@ async fn main() -> Result<()> {
         baglama.deactivate_nonexistent_categories(),
     )
     .await?;
-    info!("deactivate_nonexistent_categories complete; command = {:?}", argv.get(1));
+    info!(
+        "deactivate_nonexistent_categories complete; command = {:?}",
+        argv.get(1)
+    );
     match argv.get(1).map(|s| s.as_str()) {
         Some("mysql2") => {
             let year = year(argv.get(2));

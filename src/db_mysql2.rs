@@ -65,9 +65,15 @@ impl DbMySql2 {
             wiki2site_id: HashMap::new(),
             table_name,
         };
-        info!("DbMySql2::new: initializing sites for table `{}`", ret.table_name);
+        info!(
+            "DbMySql2::new: initializing sites for table `{}`",
+            ret.table_name
+        );
         ret.initialize_sites().await?;
-        info!("DbMySql2::new: sites initialized ({} sites)", ret.sites.len());
+        info!(
+            "DbMySql2::new: sites initialized ({} sites)",
+            ret.sites.len()
+        );
         Ok(ret)
     }
 
@@ -185,10 +191,7 @@ impl DbMySql2 {
         let local_path = match dump_override {
             Some(path) => {
                 if !path.is_file() {
-                    return Err(anyhow!(
-                        "--dump file does not exist: {}",
-                        path.display()
-                    ));
+                    return Err(anyhow!("--dump file does not exist: {}", path.display()));
                 }
                 Some(path)
             }
