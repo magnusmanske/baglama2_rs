@@ -40,7 +40,8 @@ the same command:
    `globalimagelinks` → `viewdata/gzb/work/<YYYYMM>/<gid>.tsv.gz`.
    Status `GENERATING PAGE LIST` → `SCANNED`.
 2. **Views**: every page becomes a 64-bit hash key in one in-memory table
-   (~25M pages ≈ 600 MB); one pass over
+   (sorted keys + bucket index, 12 bytes per page: ~25M pages ≈ 300 MB);
+   one pass over
    `/public/dumps/public/other/pageview_complete/monthly/YYYY/YYYY-MM/pageviews-YYYYMM-user.bz2`
    fills it. Saved as `work/<YYYYMM>/views.bin`, reused if newer than all
    page lists.
@@ -103,4 +104,18 @@ reflect current category contents.
 The first run adds `'gzb'` to the `group_status.storage` enum (metadata-only
 ALTER).
 
-Job limits: 6 GiB / 3 CPU per job, 8 GiB for the tool; jobs ask for 5 GiB.
+Job limits: 6 GiB / 3 CPU per job, 8 GiB for the tool, of which the
+webservice holds ~1.5 GiB. `month` jobs ask for 3 GiB, so two fit at once;
+`convert` asks for 5 GiB (giant legacy SQLite files), so it runs alone. A
+job that does not fit is not queued: `kubectl get events` shows
+"exceeded quota".
+
+Memory, measured on a synthetic 7.3M-page group (the size of group 979,
+the largest): phase 3 peaks at 0.72 GB, down from 2.45 GB before per-page
+strings were replaced by a shared title buffer and interned file names.
+The dump scan (phase 2) is flat at the size of the view table (~300 MiB
+for 8.6M pages on 2026-08, 439M dump lines in 13 min). The earlier silent
+failures were in phase 3, not the scan: 1047 of 2026-08's groups were
+already complete when it died, and the old code reached 2.3 GiB building
+group 979 alone; next to other groups, a 3× larger view table and what
+phase 1 left behind, that exceeds the old 5 GiB limit.

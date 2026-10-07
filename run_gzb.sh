@@ -33,7 +33,7 @@ check | month)
 	if [ "$cmd" = check ]; then
 		run_job "gzb-check-$year-$month" 1Gi gzb_check "$year" "$month" "$@"
 	else
-		run_job "gzb-$year-$month" 5Gi gzb_month "$year" "$month" "$@"
+		run_job "gzb-$year-$month" 3Gi gzb_month "$year" "$month" "$@"
 	fi
 	;;
 convert)
@@ -42,7 +42,7 @@ convert)
 	;;
 schedule)
 	toolforge jobs delete gzb-monthly 2>/dev/null || true
-	toolforge jobs run --mem 5Gi --cpu 3 --mount=all --image "$IMAGE" \
+	toolforge jobs run --mem 3Gi --cpu 3 --mount=all --image "$IMAGE" \
 		--command "$BIN gzb_month lm lm" \
 		--schedule "17 3 3 * *" \
 		--filelog -o "$HOME/gzb-monthly.out" -e "$HOME/gzb-monthly.err" gzb-monthly

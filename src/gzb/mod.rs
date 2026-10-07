@@ -34,7 +34,6 @@ use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -108,19 +107,13 @@ pub struct GzbRow {
 
 impl GzbRow {
     fn write_tsv(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(sanitize_field(&self.title).as_bytes());
-        out.push(b'\t');
-        out.extend_from_slice(self.namespace_id.to_string().as_bytes());
-        out.push(b'\t');
-        out.extend_from_slice(self.views.to_string().as_bytes());
-        out.push(b'\t');
-        for (i, file) in self.files.iter().enumerate() {
-            if i > 0 {
-                out.push(b'|');
-            }
-            out.extend_from_slice(sanitize_field(file).replace('|', "_").as_bytes());
-        }
-        out.push(b'\n');
+        write_row(
+            out,
+            &self.title,
+            self.namespace_id,
+            self.views,
+            self.files.iter().map(|f| f.as_str()),
+        );
     }
 
     fn parse_tsv(line: &str) -> Result<Self> {
@@ -130,7 +123,10 @@ impl GzbRow {
             .next()
             .ok_or_else(|| anyhow!("missing namespace"))?
             .parse()?;
-        let views = cols.next().ok_or_else(|| anyhow!("missing views"))?.parse()?;
+        let views = cols
+            .next()
+            .ok_or_else(|| anyhow!("missing views"))?
+            .parse()?;
         let files = cols.next().unwrap_or_default();
         let files = if files.is_empty() {
             vec![]
@@ -144,6 +140,29 @@ impl GzbRow {
             files,
         })
     }
+}
+
+/// Append one TSV row: `title \t namespace_id \t views \t file1|file2|…`.
+pub fn write_row<'a>(
+    out: &mut Vec<u8>,
+    title: &str,
+    namespace_id: i32,
+    views: u64,
+    files: impl IntoIterator<Item = &'a str>,
+) {
+    out.extend_from_slice(sanitize_field(title).as_bytes());
+    out.push(b'\t');
+    out.extend_from_slice(namespace_id.to_string().as_bytes());
+    out.push(b'\t');
+    out.extend_from_slice(views.to_string().as_bytes());
+    out.push(b'\t');
+    for (i, file) in files.into_iter().enumerate() {
+        if i > 0 {
+            out.push(b'|');
+        }
+        out.extend_from_slice(sanitize_field(file).replace('|', "_").as_bytes());
+    }
+    out.push(b'\n');
 }
 
 /// Titles and file names cannot legally contain tabs or newlines; make sure a
@@ -189,9 +208,6 @@ impl GzbWriter {
         mut rows: Vec<GzbRow>,
         summary: Option<(u64, u64)>,
     ) -> Result<()> {
-        if self.header.sites.iter().any(|s| s.giu == giu) {
-            return Err(anyhow!("site {giu} added twice"));
-        }
         for row in rows.iter_mut() {
             row.files.sort();
             row.files.dedup();
@@ -204,13 +220,33 @@ impl GzbWriter {
         });
         let (pages, views) =
             summary.unwrap_or_else(|| (rows.len() as u64, rows.iter().map(|r| r.views).sum()));
+        self.add_site_sorted(giu, rows.len(), pages, views, |i, buf| {
+            rows[i].write_tsv(buf)
+        })
+    }
 
+    /// Add one site whose `n_rows` rows the caller has already sorted (views
+    /// descending). `write_row(i, buf)` appends row `i` to `buf`, normally via
+    /// [`write_row`]. Rows go straight into gzip chunks, so a caller with a
+    /// compact representation never has to build a `GzbRow` per page.
+    pub fn add_site_sorted(
+        &mut self,
+        giu: &str,
+        n_rows: usize,
+        pages: u64,
+        views: u64,
+        mut write_row: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<()> {
+        if self.header.sites.iter().any(|s| s.giu == giu) {
+            return Err(anyhow!("site {giu} added twice"));
+        }
         let mut chunks = vec![];
         let mut buf = Vec::new();
-        for chunk_rows in rows.chunks(CHUNK_ROWS) {
+        for start in (0..n_rows).step_by(CHUNK_ROWS) {
+            let end = (start + CHUNK_ROWS).min(n_rows);
             buf.clear();
-            for row in chunk_rows {
-                row.write_tsv(&mut buf);
+            for i in start..end {
+                write_row(i, &mut buf);
             }
             let mut enc = GzEncoder::new(Vec::new(), Compression::best());
             enc.write_all(&buf)?;
@@ -218,7 +254,7 @@ impl GzbWriter {
             chunks.push(GzbChunk {
                 offset: self.data.len() as u64,
                 length: compressed.len() as u64,
-                rows: chunk_rows.len() as u64,
+                rows: (end - start) as u64,
             });
             self.data.extend_from_slice(&compressed);
         }
@@ -303,7 +339,8 @@ impl GzbReader {
         };
         let mut ret = vec![];
         for chunk in chunks {
-            self.file.seek(SeekFrom::Start(self.data_start + chunk.offset))?;
+            self.file
+                .seek(SeekFrom::Start(self.data_start + chunk.offset))?;
             let mut compressed = vec![0; chunk.length as usize];
             self.file.read_exact(&mut compressed)?;
             let mut text = String::new();
@@ -350,26 +387,104 @@ pub fn page_key(wiki_code: &[u8], title: &[u8]) -> u64 {
     h ^ (h >> 31)
 }
 
-/// Hasher for keys that are already well-mixed `u64`s ([`page_key`]).
-#[derive(Default)]
-pub struct IdentityHasher(u64);
-
-impl Hasher for IdentityHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 << 8) | b as u64;
-        }
-    }
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n;
-    }
+/// Monthly views for every page in a month's page lists, keyed by
+/// [`page_key`]. Sorted keys plus an index of where each bucket of the top
+/// key bits starts: 12 bytes per page (~300 MB for 25M pages), against
+/// 25-35 for a `HashMap` — more while it doubles. Keys are uniform hashes,
+/// so a lookup scans a bucket of about four keys.
+pub struct ViewTable {
+    keys: Vec<u64>,
+    views: Vec<u32>,
+    bucket_starts: Vec<u32>,
+    shift: u32,
 }
 
-/// `page_key` → monthly views.
-pub type ViewMap = HashMap<u64, u32, BuildHasherDefault<IdentityHasher>>;
+impl ViewTable {
+    /// All views zero. `keys` may contain duplicates.
+    pub fn from_keys(mut keys: Vec<u64>) -> Self {
+        keys.sort_unstable();
+        keys.dedup();
+        keys.shrink_to_fit();
+        let views = vec![0; keys.len()];
+        Self::indexed(keys, views)
+    }
+
+    /// From `(key, views)`; the first entry wins for duplicate keys.
+    pub fn from_pairs(mut pairs: Vec<(u64, u32)>) -> Self {
+        pairs.sort_by_key(|p| p.0);
+        pairs.dedup_by_key(|p| p.0);
+        let (keys, views) = pairs.into_iter().unzip();
+        Self::indexed(keys, views)
+    }
+
+    fn indexed(keys: Vec<u64>, views: Vec<u32>) -> Self {
+        let bits = (keys.len() / 4)
+            .max(1)
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(1, 28);
+        let shift = 64 - bits;
+        let buckets = 1usize << bits;
+        let mut bucket_starts = Vec::with_capacity(buckets + 1);
+        let mut i = 0;
+        for bucket in 0..=buckets {
+            while i < keys.len() && ((keys[i] >> shift) as usize) < bucket {
+                i += 1;
+            }
+            bucket_starts.push(i as u32);
+        }
+        Self {
+            keys,
+            views,
+            bucket_starts,
+            shift,
+        }
+    }
+
+    fn position(&self, key: u64) -> Option<usize> {
+        let bucket = (key >> self.shift) as usize;
+        let start = self.bucket_starts[bucket] as usize;
+        let end = self.bucket_starts[bucket + 1] as usize;
+        self.keys[start..end]
+            .iter()
+            .position(|k| *k == key)
+            .map(|p| start + p)
+    }
+
+    /// Views of a page; 0 if unknown.
+    pub fn get(&self, key: u64) -> u32 {
+        self.position(key).map_or(0, |i| self.views[i])
+    }
+
+    /// Add views to a known page. Returns false if the key is unknown.
+    pub fn add(&mut self, key: u64, views: u64) -> bool {
+        match self.position(key) {
+            Some(i) => {
+                let v = u32::try_from(views).unwrap_or(u32::MAX);
+                self.views[i] = self.views[i].saturating_add(v);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// `(key, views)` for every page with views.
+    pub fn with_views(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        self.keys
+            .iter()
+            .copied()
+            .zip(self.views.iter().copied())
+            .filter(|(_, v)| *v > 0)
+    }
+}
 
 /// Clamp a view total to what `group_status.total_views` can hold.
 pub fn db_views(views: u64) -> u64 {
@@ -433,8 +548,12 @@ mod tests {
             .map(|i| row(&format!("Page_{i}"), i, &["B.jpg", "A.jpg", "B.jpg"]))
             .collect();
         w.add_site("enwiki", many, None).unwrap();
-        w.add_site("dewiki", vec![row("Köln", 5, &[]), row("Bonn", 9, &["X.jpg"])], Some((3, 20)))
-            .unwrap();
+        w.add_site(
+            "dewiki",
+            vec![row("Köln", 5, &[]), row("Bonn", 9, &["X.jpg"])],
+            Some((3, 20)),
+        )
+        .unwrap();
         w.add_site("frwiki", vec![], None).unwrap();
         let written = w.finish(&path).unwrap();
 
@@ -460,6 +579,42 @@ mod tests {
     }
 
     #[test]
+    fn test_view_table() {
+        let a = page_key(b"en.wikipedia", b"A");
+        let b = page_key(b"en.wikipedia", b"B");
+        let mut t = ViewTable::from_keys(vec![a, b, a, 0, u64::MAX]);
+        assert_eq!(t.len(), 4);
+        assert!(t.add(a, 5));
+        assert!(t.add(a, u64::MAX)); // saturates
+        assert!(!t.add(page_key(b"en.wikipedia", b"C"), 1));
+        assert!(t.add(0, 1) && t.add(u64::MAX, 2));
+        assert_eq!(t.get(a), u32::MAX);
+        assert_eq!(t.get(b), 0);
+        assert_eq!(t.get(12345), 0);
+        let mut nonzero: Vec<_> = t.with_views().collect();
+        nonzero.sort();
+        assert_eq!(nonzero, vec![(0, 1), (a, u32::MAX), (u64::MAX, 2)]);
+        let back = ViewTable::from_pairs(nonzero);
+        assert_eq!((back.get(u64::MAX), back.get(b), back.len()), (2, 0, 3));
+        assert!(ViewTable::from_keys(vec![]).is_empty());
+        assert_eq!(ViewTable::from_keys(vec![]).get(a), 0);
+    }
+
+    #[test]
+    fn test_view_table_many() {
+        let keys: Vec<u64> = (0..100_000u64)
+            .map(|i| page_key(b"x", &i.to_le_bytes()))
+            .collect();
+        let mut t = ViewTable::from_keys(keys.clone());
+        for (i, k) in keys.iter().enumerate() {
+            assert!(t.add(*k, i as u64));
+        }
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(t.get(*k), i as u32);
+        }
+    }
+
+    #[test]
     fn test_sanitize_fields() {
         let mut out = vec![];
         row("A\tB", 1, &["x|y.jpg"]).write_tsv(&mut out);
@@ -468,8 +623,14 @@ mod tests {
 
     #[test]
     fn test_page_key() {
-        assert_eq!(page_key(b"en.wikipedia", b"Foo"), page_key(b"en.wikipedia", b"Foo"));
-        assert_ne!(page_key(b"en.wikipedia", b"Foo"), page_key(b"de.wikipedia", b"Foo"));
+        assert_eq!(
+            page_key(b"en.wikipedia", b"Foo"),
+            page_key(b"en.wikipedia", b"Foo")
+        );
+        assert_ne!(
+            page_key(b"en.wikipedia", b"Foo"),
+            page_key(b"de.wikipedia", b"Foo")
+        );
         // The separator keeps (code, title) splits apart.
         assert_ne!(page_key(b"ab", b"c"), page_key(b"a", b"bc"));
         // Pinned: a persisted views table must stay readable by later builds.

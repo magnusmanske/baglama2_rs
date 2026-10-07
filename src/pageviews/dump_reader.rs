@@ -683,13 +683,17 @@ mod tests {
         use bzip2::write::BzEncoder;
         use std::io::Write;
         let mut data = vec![];
-        for part in [&b"a.wikipedia X 1 desktop 2 B2\n"[..], b"b.wikipedia Y 2 desktop 3 C3\n"] {
+        for part in [
+            &b"a.wikipedia X 1 desktop 2 B2\n"[..],
+            b"b.wikipedia Y 2 desktop 3 C3\n",
+        ] {
             let mut enc = BzEncoder::new(Vec::new(), bzip2::Compression::fast());
             enc.write_all(part).unwrap();
             data.extend(enc.finish().unwrap());
         }
         let mut seen = vec![];
-        let n = scan_dump_lines(&data[..], |c, t, v| seen.push((c.to_vec(), t.to_vec(), v))).unwrap();
+        let n =
+            scan_dump_lines(&data[..], |c, t, v| seen.push((c.to_vec(), t.to_vec(), v))).unwrap();
         assert_eq!(n, 2);
         assert_eq!(seen[1], (b"b.wikipedia".to_vec(), b"Y".to_vec(), 3));
     }

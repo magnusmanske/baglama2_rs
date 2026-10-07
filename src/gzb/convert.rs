@@ -195,11 +195,8 @@ async fn select_jobs(baglama: &Baglama2, opts: &ConvertOptions) -> Result<Vec<Jo
     if let Some(limit) = opts.limit {
         sql += &format!(" LIMIT {limit}");
     }
-    let rows: Vec<(usize, usize, i32, u32, String, String, String)> = baglama
-        .get_tooldb_conn()
-        .await?
-        .exec(sql, params)
-        .await?;
+    let rows: Vec<(usize, usize, i32, u32, String, String, String)> =
+        baglama.get_tooldb_conn().await?.exec(sql, params).await?;
     rows.into_iter()
         .map(|(gs_id, group_id, year, month, storage, file, sqlite3)| {
             Ok(Job {
@@ -364,7 +361,11 @@ fn convert_sqlite(path: &Path, group_id: usize, ym: &YearMonth, out: &Path) -> R
     let mut summaries: HashMap<i64, (u64, u64)> = HashMap::new();
     let mut stmt = conn.prepare("SELECT site_id,pages,views FROM gs2site")?;
     for r in stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })? {
         let (site, pages, views) = r?;
         summaries
@@ -422,7 +423,12 @@ fn convert_sqlite(path: &Path, group_id: usize, ym: &YearMonth, out: &Path) -> R
     writer.finish(out)
 }
 
-fn convert_flat_file(path: &Path, group_id: usize, ym: &YearMonth, out: &Path) -> Result<GzbHeader> {
+fn convert_flat_file(
+    path: &Path,
+    group_id: usize,
+    ym: &YearMonth,
+    out: &Path,
+) -> Result<GzbHeader> {
     let text = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&text);
     let mut by_site: HashMap<String, Vec<GzbRow>> = HashMap::new();
@@ -512,7 +518,10 @@ async fn convert_mysql(baglama: &Baglama2, job: &Job, out: &Path) -> Result<GzbH
             )
         });
         if let Some(Some(name)) = row.get::<Option<Vec<u8>>, _>(5) {
-            entry.1.files.push(String::from_utf8_lossy(&name).into_owned());
+            entry
+                .1
+                .files
+                .push(String::from_utf8_lossy(&name).into_owned());
         }
     })
     .await?;

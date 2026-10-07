@@ -153,9 +153,9 @@ impl GzbMonth {
         let now = chrono::Utc::now();
         use chrono::Datelike;
         if (ym.year(), ym.month()) >= (now.year(), now.month()) {
-            report
-                .problems
-                .push(format!("{ym} is not over yet; its pageview dump cannot exist"));
+            report.problems.push(format!(
+                "{ym} is not over yet; its pageview dump cannot exist"
+            ));
         }
 
         let dump = self.expected_dump_path();
@@ -211,9 +211,7 @@ impl GzbMonth {
             .await;
             match res {
                 Ok(()) => println!("replica for {tables:?}: OK"),
-                Err(e) => report
-                    .problems
-                    .push(format!("replica for {tables:?}: {e}")),
+                Err(e) => report.problems.push(format!("replica for {tables:?}: {e}")),
             }
         }
 
@@ -232,7 +230,12 @@ impl GzbMonth {
             } else {
                 format!(
                     "; unresolved (views will be 0): {}",
-                    missing.iter().take(20).cloned().collect::<Vec<_>>().join(", ")
+                    missing
+                        .iter()
+                        .take(20)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             }
         );
@@ -332,7 +335,9 @@ impl GzbMonth {
         );
         let failed = list_failed + build_failed;
         if failed > 0 {
-            return Err(anyhow!("{failed} groups failed; re-run the same command to retry them"));
+            return Err(anyhow!(
+                "{failed} groups failed; re-run the same command to retry them"
+            ));
         }
         // Keep the work dir after a partial (--groups) run: views.bin is only
         // valid for the page lists it was built from, and is cheap to keep.
@@ -443,7 +448,7 @@ impl GzbMonth {
     // Phase 2: views from the dump
     // ------------------------------------------------------------------
 
-    async fn phase_views(&self, group_ids: &[usize], dump: &Path) -> Result<ViewMap> {
+    async fn phase_views(&self, group_ids: &[usize], dump: &Path) -> Result<ViewTable> {
         let views_bin = self.views_bin();
         let work_files: Vec<PathBuf> = group_ids.iter().map(|id| self.work_file(*id)).collect();
         if views_bin_is_fresh(&views_bin, &work_files) {
@@ -462,8 +467,8 @@ impl GzbMonth {
                 dump.display()
             );
             scan_dump_into(&dump, &needed, &mut views)?;
-            let with_views = views.values().filter(|v| **v > 0).count();
-            let total: u64 = views.values().map(|v| *v as u64).sum();
+            let with_views = views.with_views().count();
+            let total: u64 = views.with_views().map(|(_, v)| v as u64).sum();
             info!(
                 "Phase 2: {with_views} of {} pages have views, {total} views in total",
                 views.len()
@@ -479,7 +484,7 @@ impl GzbMonth {
     // ------------------------------------------------------------------
 
     /// Returns the number of failed groups.
-    async fn phase_build(&self, group_ids: &[usize], views: Arc<ViewMap>) -> usize {
+    async fn phase_build(&self, group_ids: &[usize], views: Arc<ViewTable>) -> usize {
         info!("Phase 3: writing {} group files", group_ids.len());
         let jobs = self.opts.build_jobs.max(1);
         let semaphore = Arc::new(Semaphore::new(jobs));
@@ -617,7 +622,14 @@ pub async fn set_status(
         .await?
         .exec_drop(
             sql,
-            (group_id, ym.year(), ym.month(), status, total_views, STORAGE),
+            (
+                group_id,
+                ym.year(),
+                ym.month(),
+                status,
+                total_views,
+                STORAGE,
+            ),
         )
         .await?;
     Ok(())
@@ -627,7 +639,7 @@ pub async fn set_status(
 /// cached; `None` for wikis that have no dump code.
 #[derive(Clone)]
 pub struct DumpCodes {
-    baglama: Arc<Baglama2>,
+    baglama: Option<Arc<Baglama2>>,
     known: HashMap<String, Option<String>>,
 }
 
@@ -642,12 +654,15 @@ impl DumpCodes {
                 (giu, code)
             })
             .collect();
-        Ok(Self { baglama, known })
+        Ok(Self {
+            baglama: Some(baglama),
+            known,
+        })
     }
 
     pub fn get(&mut self, giu: &str) -> Option<&str> {
         if !self.known.contains_key(giu) {
-            let code = self.baglama.wiki_dump_code(giu);
+            let code = self.baglama.as_ref().and_then(|b| b.wiki_dump_code(giu));
             self.known.insert(giu.to_string(), code);
         }
         self.known.get(giu).and_then(|c| c.as_deref())
@@ -673,8 +688,12 @@ fn read_work_file(path: &Path) -> Result<impl Iterator<Item = std::io::Result<St
 fn collect_page_keys(
     work_files: &[PathBuf],
     codes: &mut DumpCodes,
-) -> Result<(ViewMap, HashSet<Vec<u8>>)> {
-    let mut views = ViewMap::default();
+) -> Result<(ViewTable, HashSet<Vec<u8>>)> {
+    // Pages used by several groups appear once per group; de-duplicating
+    // whenever the list has doubled keeps it near the number of pages.
+    const MIN_COMPACT: usize = 1 << 22;
+    let mut keys: Vec<u64> = vec![];
+    let mut compact_at = MIN_COMPACT;
     let mut needed = HashSet::new();
     let mut unknown: HashMap<String, u64> = HashMap::new();
     for (n, path) in work_files.iter().enumerate() {
@@ -685,30 +704,30 @@ fn collect_page_keys(
             };
             match codes.get(giu) {
                 Some(code) => {
-                    views.insert(page_key(code.as_bytes(), title.as_bytes()), 0);
+                    keys.push(page_key(code.as_bytes(), title.as_bytes()));
                     if !needed.contains(code.as_bytes()) {
                         needed.insert(code.as_bytes().to_vec());
                     }
                 }
                 None => *unknown.entry(giu.to_string()).or_default() += 1,
             }
+            if keys.len() >= compact_at {
+                keys.sort_unstable();
+                keys.dedup();
+                compact_at = (keys.len() * 2).max(MIN_COMPACT);
+            }
         }
         if (n + 1) % 100 == 0 {
-            info!(
-                "Phase 2: read {}/{} page lists, {} pages",
-                n + 1,
-                work_files.len(),
-                views.len()
-            );
+            info!("Phase 2: read {}/{} page lists", n + 1, work_files.len());
         }
     }
     if !unknown.is_empty() {
         warn!("Usages on wikis without a dump code (views stay 0): {unknown:?}");
     }
-    Ok((views, needed))
+    Ok((ViewTable::from_keys(keys), needed))
 }
 
-fn scan_dump_into(dump: &Path, needed: &HashSet<Vec<u8>>, views: &mut ViewMap) -> Result<()> {
+fn scan_dump_into(dump: &Path, needed: &HashSet<Vec<u8>>, views: &mut ViewTable) -> Result<()> {
     let mut last_code: Vec<u8> = vec![];
     let mut last_needed = false;
     let mut matched: u64 = 0;
@@ -722,8 +741,7 @@ fn scan_dump_into(dump: &Path, needed: &HashSet<Vec<u8>>, views: &mut ViewMap) -
         if !last_needed || title == b"Main_Page" {
             return;
         }
-        if let Some(v) = views.get_mut(&page_key(code, title)) {
-            *v = v.saturating_add(n.min(u32::MAX as u64) as u32);
+        if views.add(page_key(code, title), n) {
             matched += 1;
         }
     })?;
@@ -743,14 +761,14 @@ fn views_bin_is_fresh(views_bin: &Path, work_files: &[PathBuf]) -> bool {
 
 /// `views.bin`: magic, entry count, then `(u64 key, u32 views)` little-endian
 /// for every page with views. Pages without views are implied.
-fn write_views_bin(path: &Path, views: &ViewMap) -> Result<()> {
+fn write_views_bin(path: &Path, views: &ViewTable) -> Result<()> {
     let tmp = path.with_extension("bin.tmp");
     {
         let mut f = std::io::BufWriter::new(File::create(&tmp)?);
         f.write_all(VIEWS_BIN_MAGIC)?;
-        let n = views.values().filter(|v| **v > 0).count() as u64;
+        let n = views.with_views().count() as u64;
         f.write_all(&n.to_le_bytes())?;
-        for (k, v) in views.iter().filter(|(_, v)| **v > 0) {
+        for (k, v) in views.with_views() {
             f.write_all(&k.to_le_bytes())?;
             f.write_all(&v.to_le_bytes())?;
         }
@@ -760,7 +778,7 @@ fn write_views_bin(path: &Path, views: &ViewMap) -> Result<()> {
     Ok(())
 }
 
-fn read_views_bin(path: &Path) -> Result<ViewMap> {
+fn read_views_bin(path: &Path) -> Result<ViewTable> {
     let mut f = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 10];
     f.read_exact(&mut magic)?;
@@ -770,15 +788,53 @@ fn read_views_bin(path: &Path) -> Result<ViewMap> {
     let mut n = [0u8; 8];
     f.read_exact(&mut n)?;
     let n = u64::from_le_bytes(n) as usize;
-    let mut views = ViewMap::with_capacity_and_hasher(n, Default::default());
+    let mut pairs = Vec::with_capacity(n);
     let mut entry = [0u8; 12];
     for _ in 0..n {
         f.read_exact(&mut entry)?;
         let key = u64::from_le_bytes(entry[0..8].try_into()?);
         let v = u32::from_le_bytes(entry[8..12].try_into()?);
-        views.insert(key, v);
+        pairs.push((key, v));
     }
-    Ok(views)
+    Ok(ViewTable::from_pairs(pairs))
+}
+
+/// One line of a page list, compactly: the title is a slice of a shared
+/// byte buffer, wiki and file are indexes into interned lists. 20 bytes plus
+/// the title, where a per-page map of owned strings took ~250 bytes — which
+/// for a 7M-page group was the difference between ~0.5 and ~2.5 GB.
+struct Usage {
+    title_start: u32,
+    title_len: u32,
+    file: u32,
+    namespace_id: i32,
+    wiki: u16,
+}
+
+/// A page: `count` consecutive usages starting at `first`, after sorting.
+struct Page {
+    first: u32,
+    count: u32,
+    views: u64,
+}
+
+/// Interns `name`, returning its index.
+fn intern<T: TryFrom<usize> + Copy>(ids: &mut HashMap<String, T>, name: &str) -> Result<T> {
+    if let Some(id) = ids.get(name) {
+        return Ok(*id);
+    }
+    let id = T::try_from(ids.len()).map_err(|_| anyhow!("too many distinct values"))?;
+    ids.insert(name.to_string(), id);
+    Ok(id)
+}
+
+/// Invert an interning map into a list indexed by id.
+fn interned_list<T: Into<u64>>(ids: HashMap<String, T>) -> Vec<String> {
+    let mut list = vec![String::new(); ids.len()];
+    for (name, id) in ids {
+        list[id.into() as usize] = name;
+    }
+    list
 }
 
 fn build_group_file(
@@ -786,48 +842,99 @@ fn build_group_file(
     ym: &YearMonth,
     work_file: &Path,
     out: &Path,
-    views: &ViewMap,
+    views: &ViewTable,
     codes: &mut DumpCodes,
 ) -> Result<GzbHeader> {
-    // giu → title → (namespace, files)
-    let mut sites: HashMap<String, HashMap<String, (i32, Vec<String>)>> = HashMap::new();
+    let mut wiki_ids: HashMap<String, u16> = HashMap::new();
+    let mut file_ids: HashMap<String, u32> = HashMap::new();
+    let mut titles: Vec<u8> = vec![];
+    let mut usages: Vec<Usage> = vec![];
     for line in read_work_file(work_file)? {
         let line = line?;
-        let Some((giu, ns, title, file)) = parse_work_line(&line) else {
+        let Some((giu, namespace_id, title, file)) = parse_work_line(&line) else {
             continue;
         };
-        let page = match sites.get_mut(giu) {
-            Some(pages) => pages,
-            None => sites.entry(giu.to_string()).or_default(),
-        };
-        match page.get_mut(title) {
-            Some(entry) => entry.1.push(file.to_string()),
-            None => {
-                page.insert(title.to_string(), (ns, vec![file.to_string()]));
-            }
-        }
+        let title_start = u32::try_from(titles.len())
+            .map_err(|_| anyhow!("group {group_id}: over 4 GB of titles"))?;
+        titles.extend_from_slice(title.as_bytes());
+        usages.push(Usage {
+            title_start,
+            title_len: title.len() as u32,
+            file: intern(&mut file_ids, file)?,
+            namespace_id,
+            wiki: intern(&mut wiki_ids, giu)?,
+        });
     }
+    let wikis = interned_list(wiki_ids);
+    let files = interned_list(file_ids);
+    let title = |u: &Usage| &titles[u.title_start as usize..(u.title_start + u.title_len) as usize];
+
+    // Groups each page's usages, wikis in turn, titles ascending.
+    usages.sort_unstable_by(|a, b| {
+        a.wiki
+            .cmp(&b.wiki)
+            .then_with(|| title(a).cmp(title(b)))
+            .then(a.file.cmp(&b.file))
+    });
 
     let mut writer = GzbWriter::new(group_id, ym, "dump");
-    for (giu, pages) in sites {
-        let code = codes.get(&giu).map(|c| c.as_bytes().to_vec());
-        let rows = pages
-            .into_iter()
-            .map(|(title, (namespace_id, files))| {
-                let views = code
-                    .as_ref()
-                    .and_then(|c| views.get(&page_key(c, title.as_bytes())))
-                    .copied()
-                    .unwrap_or(0) as u64;
-                GzbRow {
-                    title,
-                    namespace_id,
-                    views,
-                    files,
-                }
-            })
-            .collect();
-        writer.add_site(&giu, rows, None)?;
+    let mut names: Vec<&str> = vec![];
+    let mut start = 0;
+    while start < usages.len() {
+        let wiki = usages[start].wiki;
+        let end = usages[start..]
+            .iter()
+            .position(|u| u.wiki != wiki)
+            .map_or(usages.len(), |p| start + p);
+        let giu = &wikis[wiki as usize];
+        let code = codes.get(giu).map(|c| c.as_bytes().to_vec());
+
+        let mut pages: Vec<Page> = vec![];
+        let mut i = start;
+        while i < end {
+            let t = title(&usages[i]);
+            let j = usages[i..end]
+                .iter()
+                .position(|u| title(u) != t)
+                .map_or(end, |p| i + p);
+            let views = code
+                .as_ref()
+                .map_or(0, |c| views.get(page_key(c, t)) as u64);
+            pages.push(Page {
+                first: i as u32,
+                count: (j - i) as u32,
+                views,
+            });
+            i = j;
+        }
+        // Stable: equal views keep their ascending title order.
+        pages.sort_by_key(|p| std::cmp::Reverse(p.views));
+        let total_views = pages.iter().map(|p| p.views).sum();
+
+        writer.add_site_sorted(
+            giu,
+            pages.len(),
+            pages.len() as u64,
+            total_views,
+            |n, buf| {
+                let page = &pages[n];
+                let page_usages = &usages[page.first as usize..(page.first + page.count) as usize];
+                names.clear();
+                names.extend(page_usages.iter().map(|u| files[u.file as usize].as_str()));
+                names.sort_unstable();
+                names.dedup();
+                // Titles were &str when stored, so this cannot fail.
+                let t = std::str::from_utf8(title(&page_usages[0])).unwrap_or_default();
+                write_row(
+                    buf,
+                    t,
+                    page_usages[0].namespace_id,
+                    page.views,
+                    names.iter().copied(),
+                );
+            },
+        )?;
+        start = end;
     }
     writer.finish(out)
 }
@@ -884,15 +991,79 @@ mod tests {
     #[test]
     fn test_views_bin_roundtrip() {
         let path = std::env::temp_dir().join(format!("views_{}.bin", std::process::id()));
-        let mut views = ViewMap::default();
-        views.insert(page_key(b"en.wikipedia", b"A"), 5);
-        views.insert(page_key(b"en.wikipedia", b"B"), 0);
-        views.insert(u64::MAX, u32::MAX);
+        let a = page_key(b"en.wikipedia", b"A");
+        let b = page_key(b"en.wikipedia", b"B");
+        let mut views = ViewTable::from_keys(vec![a, b, u64::MAX]);
+        views.add(a, 5);
+        views.add(u64::MAX, u64::MAX);
         write_views_bin(&path, &views).unwrap();
         let back = read_views_bin(&path).unwrap();
         assert_eq!(back.len(), 2);
-        assert_eq!(back.get(&page_key(b"en.wikipedia", b"A")), Some(&5));
-        assert_eq!(back.get(&u64::MAX), Some(&u32::MAX));
+        assert_eq!(back.get(a), 5);
+        assert_eq!(back.get(b), 0);
+        assert_eq!(back.get(u64::MAX), u32::MAX);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_build_group_file() {
+        let dir = std::env::temp_dir().join(format!("gzb_build_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work = dir.join("5.tsv.gz");
+        {
+            let mut enc = GzEncoder::new(File::create(&work).unwrap(), Compression::fast());
+            for line in [
+                "enwiki\t0\tRome\tB.jpg",
+                "dewiki\t14\tKategorie:Rom\tA.jpg",
+                "enwiki\t0\tItaly\tA.jpg",
+                "enwiki\t0\tRome\tA.jpg",
+                "enwiki\t0\tRome\tB.jpg", // same usage twice
+                "enwiki\t0\tBern\tC.jpg",
+                "enwiki\t0\tAachen\tC.jpg",
+                "xxwiki\t0\tNowhere\tA.jpg",
+                "not a usage line",
+            ] {
+                writeln!(enc, "{line}").unwrap();
+            }
+            enc.finish().unwrap();
+        }
+        let mut views = ViewTable::from_keys(
+            [&b"Rome"[..], b"Italy", b"Bern", b"Aachen"]
+                .iter()
+                .map(|t| page_key(b"en.wikipedia", t))
+                .chain([page_key(b"de.wikipedia", b"Kategorie:Rom")])
+                .collect(),
+        );
+        views.add(page_key(b"en.wikipedia", b"Rome"), 70);
+        views.add(page_key(b"en.wikipedia", b"Italy"), 500);
+        views.add(page_key(b"de.wikipedia", b"Kategorie:Rom"), 3);
+        let mut codes = DumpCodes {
+            baglama: None,
+            known: [("enwiki", "en.wikipedia"), ("dewiki", "de.wikipedia")]
+                .into_iter()
+                .map(|(g, c)| (g.to_string(), Some(c.to_string())))
+                .collect(),
+        };
+        let ym = YearMonth::new(2026, 9).unwrap();
+        let out = gzb_path(&dir, 5, &ym);
+        let header = build_group_file(5, &ym, &work, &out, &views, &mut codes).unwrap();
+
+        assert_eq!(header.total_views, 573);
+        assert_eq!(header.total_pages, 6);
+        let giu: Vec<&str> = header.sites.iter().map(|s| s.giu.as_str()).collect();
+        assert_eq!(giu, vec!["enwiki", "dewiki", "xxwiki"]);
+        let mut r = GzbReader::open(&out).unwrap();
+        let en = r.rows("enwiki", 0).unwrap();
+        let summary: Vec<(&str, u64)> = en.iter().map(|r| (r.title.as_str(), r.views)).collect();
+        // Views descending, then title ascending.
+        assert_eq!(
+            summary,
+            vec![("Italy", 500), ("Rome", 70), ("Aachen", 0), ("Bern", 0)]
+        );
+        assert_eq!(en[1].files, vec!["A.jpg", "B.jpg"]);
+        let de = r.rows("dewiki", 0).unwrap();
+        assert_eq!((de[0].namespace_id, de[0].views), (14, 3));
+        assert_eq!(r.rows("xxwiki", 0).unwrap()[0].views, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

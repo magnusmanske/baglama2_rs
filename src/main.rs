@@ -105,7 +105,10 @@ fn group_ids_flag(argv: &[String]) -> Option<Vec<usize>> {
     flag_value(argv, "groups").map(|v| {
         v.split(',')
             .filter(|s| !s.is_empty())
-            .map(|s| s.parse().unwrap_or_else(|_| panic!("--groups: bad id '{s}'")))
+            .map(|s| {
+                s.parse()
+                    .unwrap_or_else(|_| panic!("--groups: bad id '{s}'"))
+            })
             .collect()
     })
 }
@@ -113,8 +116,16 @@ fn group_ids_flag(argv: &[String]) -> Option<Vec<usize>> {
 /// Arguments that are not `--flags` (nor a flag's separate value).
 fn positional(argv: &[String]) -> Vec<String> {
     const VALUE_FLAGS: &[&str] = &[
-        "--dump", "--groups", "--list-jobs", "--build-jobs", "--storage", "--from", "--to",
-        "--limit", "--jobs", "--max",
+        "--dump",
+        "--groups",
+        "--list-jobs",
+        "--build-jobs",
+        "--storage",
+        "--from",
+        "--to",
+        "--limit",
+        "--jobs",
+        "--max",
     ];
     let mut ret = vec![];
     let mut iter = argv.iter();
@@ -538,8 +549,16 @@ mod tests {
     #[test]
     fn test_flags_and_positional() {
         let a = argv(&[
-            "bin", "gzb_month", "2026", "9", "--groups=1,2", "--force", "--dump", "/x.bz2",
-            "--build-jobs=2", "--no-check",
+            "bin",
+            "gzb_month",
+            "2026",
+            "9",
+            "--groups=1,2",
+            "--force",
+            "--dump",
+            "/x.bz2",
+            "--build-jobs=2",
+            "--no-check",
         ]);
         assert_eq!(positional(&a), vec!["bin", "gzb_month", "2026", "9"]);
         assert_eq!(group_ids_flag(&a), Some(vec![1, 2]));

@@ -146,7 +146,11 @@ impl Baglama2 {
     /// Root directory of the gzb view-data files. Defaults to `gzb` inside
     /// the SQLite data root, which is where the PHP API looks.
     pub fn gzb_data_root_path(&self) -> std::path::PathBuf {
-        match self.config.get("gzb_data_root_path").and_then(|v| v.as_str()) {
+        match self
+            .config
+            .get("gzb_data_root_path")
+            .and_then(|v| v.as_str())
+        {
             Some(path) => path.into(),
             None => std::path::Path::new(&self.sqlite_data_root_path()).join("gzb"),
         }
@@ -810,7 +814,10 @@ mod tests {
             Baglama2::dump_code_from_server_url("https://www.wikidata.org/"),
             Some("wikidata".to_string())
         );
-        assert_eq!(Baglama2::dump_code_from_server_url("https://example.com"), None);
+        assert_eq!(
+            Baglama2::dump_code_from_server_url("https://example.com"),
+            None
+        );
     }
 
     #[test]
