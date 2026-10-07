@@ -17,7 +17,8 @@ viewdata/gzb/<YYYYMM>/<group_id>.gzb
 `BAGLAMA-GZB 1 <len>\n` + a JSON header (per-wiki totals + chunk offsets) +
 gzip members of ≤5000 rows each (`title \t ns \t views \t files`), sorted by
 views. "Top 100 of enwiki" inflates one chunk. PHP reads it with plain
-`gzdecode` (`GlamTools\GzbReader`). Format details: `src/gzb/mod.rs`.
+`gzdecode` (`GlamTools\GzbReader`). Full specification:
+[GZB_TECHNICAL.md](GZB_TECHNICAL.md).
 
 Measured on a real 2017 group-month: 20,908 legacy rows → 670 KB.
 

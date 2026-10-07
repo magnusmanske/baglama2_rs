@@ -389,7 +389,9 @@ pub fn year_month_dir(ym: &YearMonth) -> String {
 /// what lets a whole month's lookup table fit in memory. FNV-1a plus a
 /// splitmix64 finalizer — deterministic across builds, unlike std's hasher,
 /// because the table is persisted between runs. A collision only means one
-/// page picks up another page's views; at ~25M keys the odds are ~1e-5/month.
+/// page picks up another page's views. At ~25M keys and ~440M dump lines a
+/// month, that happens about once in 1,700 months (an unrelated dump title
+/// hitting a key); two pages sharing a key, about once in 60,000.
 pub fn page_key(wiki_code: &[u8], title: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
