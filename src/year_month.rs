@@ -33,7 +33,7 @@ impl YearMonth {
             .ok_or(anyhow!(format!("{}/{}", self.year, self.month)))?
             .format("%Y%m")
             .to_string();
-        let dir = format!("{}/{}", baglama.sqlite_data_root_path(), &subdir);
+        let dir = format!("{}/{}", baglama.sqlite_data_root_path(), subdir);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }

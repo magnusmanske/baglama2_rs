@@ -28,7 +28,7 @@ impl DbSqlite {
         }
         debug!(
             "{}: {} [ {path_tmp} => {path_final} ]",
-            &gd.ym(),
+            gd.ym(),
             gd.group_id()
         );
         if std::path::Path::new(&path_tmp).exists() {

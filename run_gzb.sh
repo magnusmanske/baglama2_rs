@@ -2,7 +2,7 @@
 # Launch gzb jobs on Toolforge (run as tools.glamtools from ~/baglama2_rs).
 #
 #   ./run_gzb.sh check 2026 9            preflight only: dump, replicas, DB, dirs
-#   ./run_gzb.sh month 2026 9 [FLAGS]    generate a month (resumable: just re-run)
+#   ./run_gzb.sh month 2026 9 [FLAGS]    check, then generate a month (resumable: just re-run)
 #   ./run_gzb.sh convert [FLAGS]         convert legacy data, e.g. --storage=file
 #   ./run_gzb.sh schedule                monthly cron: last month, on the 3rd
 #

@@ -24,9 +24,14 @@ Measured on a real 2017 group-month: 20,908 legacy rows → 670 KB.
 ## Generating a month (`gzb_month`)
 
 ```bash
-./run_gzb.sh check 2026 9      # preflight only, ~1 min
-./run_gzb.sh month 2026 9      # the real thing
+./run_gzb.sh month 2026 9      # checks first, then generates
+./run_gzb.sh check 2026 9      # just the check, changes nothing
 ```
+
+`gzb_month` runs the same preflight as `gzb_check` (dump, replicas, tool DB,
+output dirs) every time it starts, re-runs included, and stops before
+touching anything if a problem is found. `--no-check` skips it; a missing
+dump then fails at phase 2, and a re-run resumes from the saved page lists.
 
 Three phases (`src/gzb/month.rs`), each resumable — after a crash, re-run
 the same command:

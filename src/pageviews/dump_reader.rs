@@ -11,7 +11,7 @@ use anyhow::Result;
 use log::info;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Accumulated view data for a single wiki code (site).
 ///
@@ -184,7 +184,7 @@ pub fn local_dump_path(year: i32, month: u32) -> Option<PathBuf> {
 /// Runs on a blocking thread.  See [`scan_dump_by_site`] for the
 /// callback contract.
 pub async fn stream_local_file_by_site<E, S>(
-    path: &PathBuf,
+    path: &Path,
     on_site_enter: E,
     site_callback: S,
 ) -> Result<()>
@@ -192,7 +192,7 @@ where
     E: FnMut(&str) -> Option<TitleFilter> + Send + 'static,
     S: FnMut(SiteViewData) + Send + 'static,
 {
-    let path = path.clone();
+    let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
         let reader = std::io::BufReader::with_capacity(512 * 1024, file);
@@ -271,11 +271,11 @@ where
 /// Scan the dump from a local file.  Runs the bz2 decompression +
 /// line scan on a blocking thread to avoid starving the tokio runtime.
 pub async fn scan_dump_from_local_file(
-    path: &PathBuf,
+    path: &Path,
     lookup: DumpLookup,
     all_ids: HashSet<usize>,
 ) -> Result<DumpScanResult> {
-    let path = path.clone();
+    let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
         let reader = std::io::BufReader::with_capacity(512 * 1024, file);
@@ -402,7 +402,7 @@ where
             }
         }
         lines_scanned += 1;
-        if lines_scanned % 50_000_000 == 0 {
+        if lines_scanned.is_multiple_of(50_000_000) {
             eprintln!(
                 "scan_dump_by_site: scanned {} M lines, {} matches, {} sites emitted, {} skipped",
                 lines_scanned / 1_000_000,
@@ -548,7 +548,7 @@ pub fn scan_dump_reader<R: std::io::Read>(
             }
         }
         lines_scanned += 1;
-        if lines_scanned % 50_000_000 == 0 {
+        if lines_scanned.is_multiple_of(50_000_000) {
             eprintln!(
                 "scan_dump_reader: scanned {} M lines, {} matches so far",
                 lines_scanned / 1_000_000,
@@ -637,7 +637,7 @@ where
             break;
         }
         lines += 1;
-        if lines % 100_000_000 == 0 {
+        if lines.is_multiple_of(100_000_000) {
             info!("scan_dump_lines: {}M lines", lines / 1_000_000);
         }
         if let Some((code, title, views)) = parse_dump_line(&line) {
@@ -862,7 +862,7 @@ en.wikipedia Unwanted_Page null desktop 999 A999\n";
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].title_views.len(), 1);
         assert_eq!(sites[0].title_views.get("Wanted_Page"), Some(&10));
-        assert!(sites[0].title_views.get("Unwanted_Page").is_none());
+        assert!(!sites[0].title_views.contains_key("Unwanted_Page"));
     }
 
     #[test]

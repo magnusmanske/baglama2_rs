@@ -55,6 +55,8 @@ pub struct MonthOptions {
     pub build_jobs: usize,
     /// Keep page lists and `views.bin` after a fully successful run.
     pub keep_work: bool,
+    /// Skip the preflight [`GzbMonth::check`] that `run` does first.
+    pub no_check: bool,
 }
 
 impl Default for MonthOptions {
@@ -66,6 +68,7 @@ impl Default for MonthOptions {
             list_jobs: 6,
             build_jobs: 3,
             keep_work: false,
+            no_check: false,
         }
     }
 }
@@ -272,16 +275,23 @@ impl GzbMonth {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let report = self.check().await?;
-        if !report.problems.is_empty() {
-            return Err(anyhow!(
-                "{} problem(s) found, not starting; see above",
-                report.problems.len()
-            ));
-        }
-        let dump = report
-            .dump
-            .ok_or_else(|| anyhow!("no dump despite a clean check"))?;
+        let dump = if self.opts.no_check {
+            // Unverified: a missing dump only surfaces in phase 2, after the
+            // page lists are saved, so a re-run resumes from there.
+            info!("--no-check: skipping the preflight check");
+            self.expected_dump_path()
+        } else {
+            let report = self.check().await?;
+            if !report.problems.is_empty() {
+                return Err(anyhow!(
+                    "{} problem(s) found, not starting; see above",
+                    report.problems.len()
+                ));
+            }
+            report
+                .dump
+                .ok_or_else(|| anyhow!("no dump despite a clean check"))?
+        };
         ensure_storage_enum(&self.baglama).await?;
         self.baglama.update_sites().await?;
 

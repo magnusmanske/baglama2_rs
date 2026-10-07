@@ -133,8 +133,9 @@ gzb commands (view data as one compressed file per group-month):
   gzb_check YEAR MONTH [--dump=PATH]
       Check dump, replicas, tool DB and output dirs for a month; changes nothing.
   gzb_month YEAR MONTH [--dump=PATH] [--groups=1,2] [--force] [--list-jobs=6]
-                       [--build-jobs=3] [--keep-work]
-      Generate a month for all active groups (or --groups). Resumable: re-run
+                       [--build-jobs=3] [--keep-work] [--no-check]
+      Generate a month for all active groups (or --groups). Runs gzb_check
+      first and stops on any problem; --no-check skips that. Resumable: re-run
       the same command after a failure. --force replaces complete data.
   gzb_convert [--storage=file,mysql,sqlite3] [--from=YYYYMM] [--to=YYYYMM]
               [--groups=1,2] [--limit=N] [--jobs=3] [--dry-run] [--no-switch]
@@ -235,7 +236,7 @@ async fn process_all_groups(
                     Ok(_) => {}
                     Err(err) => {
                         let _ = gd.set_group_status("FAILED", 0, "").await;
-                        info!("{group_id} failed: {:?}", &err);
+                        info!("{group_id} failed: {:?}", err);
                     }
                 }
                 // Dropping the permit here releases the semaphore slot.
@@ -390,7 +391,7 @@ async fn main() -> Result<()> {
                         Ok(_) => {}
                         Err(err) => {
                             let _ = gd.set_group_status("FAILED", 0, "").await;
-                            info!("{group_id} failed: {:?}", &err);
+                            info!("{group_id} failed: {:?}", err);
                         }
                     }
                 } else {
@@ -447,6 +448,7 @@ async fn run_gzb_command(command: &str, argv: &[String], baglama: Arc<Baglama2>)
                 list_jobs: parsed_flag(argv, "list-jobs").unwrap_or(6),
                 build_jobs: parsed_flag(argv, "build-jobs").unwrap_or(3),
                 keep_work: has_flag(argv, "keep-work"),
+                no_check: has_flag(argv, "no-check"),
             };
             let job = gzb::month::GzbMonth::new(baglama.clone(), ym, opts);
             if command == "gzb_check" {
@@ -537,12 +539,13 @@ mod tests {
     fn test_flags_and_positional() {
         let a = argv(&[
             "bin", "gzb_month", "2026", "9", "--groups=1,2", "--force", "--dump", "/x.bz2",
-            "--build-jobs=2",
+            "--build-jobs=2", "--no-check",
         ]);
         assert_eq!(positional(&a), vec!["bin", "gzb_month", "2026", "9"]);
         assert_eq!(group_ids_flag(&a), Some(vec![1, 2]));
         assert!(has_flag(&a, "force"));
         assert!(!has_flag(&a, "keep-work"));
+        assert!(has_flag(&a, "no-check"));
         assert_eq!(dump_override(&a), Some(PathBuf::from("/x.bz2")));
         assert_eq!(parsed_flag::<usize>(&a, "build-jobs"), Some(2));
         assert_eq!(parsed_flag::<usize>(&a, "list-jobs"), None);

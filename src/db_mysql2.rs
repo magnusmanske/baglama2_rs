@@ -220,7 +220,7 @@ impl DbMySql2 {
             })
         } else {
             let url = dump_reader::dump_url(year, month);
-            println!("Pageview strategy: streaming HTTP dump ({})", &url);
+            println!("Pageview strategy: streaming HTTP dump ({})", url);
             tokio::spawn(async move {
                 let result =
                     dump_reader::stream_http_by_site(&url, on_site_enter, site_callback).await;
@@ -466,7 +466,7 @@ impl DbMySql2 {
                     }
                     sites_processed += 1;
 
-                    if sites_processed % 50 == 0 {
+                    if sites_processed.is_multiple_of(50) {
                         info!(
                             "load_views_from_dump: progress — {} sites scanned, {} matched, {} zeroed",
                             sites_processed, total_updated, total_zeroed
@@ -789,7 +789,7 @@ impl DbMySql2 {
             let site = match self.get_site_for_wiki(&gil.wiki) {
                 Some(site) => site,
                 None => {
-                    warn!("add_views_for_files: Unknown wiki: {}", &gil.wiki);
+                    warn!("add_views_for_files: Unknown wiki: {}", gil.wiki);
                     continue;
                 }
             };
