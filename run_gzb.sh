@@ -4,6 +4,7 @@
 #   ./run_gzb.sh check 2026 9            preflight only: dump, replicas, DB, dirs
 #   ./run_gzb.sh month 2026 9 [FLAGS]    check, then generate a month (resumable: just re-run)
 #   ./run_gzb.sh convert [FLAGS]         convert legacy data, e.g. --storage=file
+#   ./run_gzb.sh tsv 979 2026 9 [WIKI]   export to ~/gzb-tsv/979-2026-9[-WIKI].tsv
 #   ./run_gzb.sh schedule                monthly cron: last month, on the 3rd
 #
 # FLAGS are passed through; see `target/release/baglama2 help`.
@@ -40,6 +41,15 @@ convert)
 	shift
 	run_job gzb-convert 5Gi gzb_convert "$@"
 	;;
+tsv)
+	group=${2:?group ID expected}
+	year=${3:?year expected}
+	month=${4:?month expected}
+	wiki=${5:-}
+	mkdir -p "$HOME/gzb-tsv"
+	out="$HOME/gzb-tsv/$group-$year-$month${wiki:+-$wiki}.tsv"
+	run_job "gzb-tsv-$group-$year-$month" 1Gi gzb_tsv "$group" "$year" "$month" $wiki "--out=$out"
+	;;
 schedule)
 	toolforge jobs delete gzb-monthly 2>/dev/null || true
 	toolforge jobs run --mem 3Gi --cpu 3 --mount=all --image "$IMAGE" \
@@ -48,7 +58,7 @@ schedule)
 		--filelog -o "$HOME/gzb-monthly.out" -e "$HOME/gzb-monthly.err" gzb-monthly
 	;;
 *)
-	sed -n '2,10p' "$0"
+	sed -n '2,11p' "$0"
 	exit 1
 	;;
 esac

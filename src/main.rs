@@ -126,6 +126,7 @@ fn positional(argv: &[String]) -> Vec<String> {
         "--limit",
         "--jobs",
         "--max",
+        "--out",
     ];
     let mut ret = vec![];
     let mut iter = argv.iter();
@@ -154,6 +155,9 @@ gzb commands (view data as one compressed file per group-month):
       --dry-run only reports; --no-switch writes files but leaves group_status.
   gzb_show GROUP YEAR MONTH [WIKI] [--max=20]
       Print a gzb file's per-wiki totals, or one wiki's top pages.
+  gzb_tsv GROUP YEAR MONTH [WIKI] [--out=FILE]
+      Export a gzb file (or one wiki of it) as tab-separated text, with
+      '#' metadata lines above the header. Writes to stdout without --out.
 YEAR and MONTH may be 'lm' for last month.";
 
 /// Extract an optional dump-file override from the command line.
@@ -293,12 +297,19 @@ async fn main() -> Result<()> {
     // newline). If this line does not appear in the captured output, the
     // running binary is not this build, or output is not being captured —
     // before debugging logic, fix that. Includes the build version so a
-    // stale deploy is obvious.
-    println!(
-        "baglama2 v{} starting — args: {:?}",
-        env!("CARGO_PKG_VERSION"),
-        env::args().skip(1).collect::<Vec<_>>()
+    // stale deploy is obvious. To stderr when stdout carries data (gzb_tsv
+    // without --out).
+    let args: Vec<String> = env::args().skip(1).collect();
+    let banner = format!(
+        "baglama2 v{} starting — args: {args:?}",
+        env!("CARGO_PKG_VERSION")
     );
+    if args.first().is_some_and(|c| c == "gzb_tsv") && !args.iter().any(|a| a.starts_with("--out"))
+    {
+        eprintln!("{banner}");
+    } else {
+        println!("{banner}");
+    }
 
     // Install a logger backend. Without this, all log::{info,warn,error,trace}
     // macros are silently discarded. Defaults to `info`; override per-module
@@ -495,6 +506,46 @@ async fn run_gzb_command(command: &str, argv: &[String], baglama: Arc<Baglama2>)
                 opts.jobs = jobs;
             }
             gzb::convert::run(baglama, opts).await
+        }
+        "gzb_tsv" => {
+            let group_id: usize = pos
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .expect("group ID expected");
+            let ym = ym_at(3);
+            let path = gzb::gzb_path(&baglama.gzb_data_root_path(), group_id, &ym);
+            let mut reader = gzb::GzbReader::open(&path)?;
+            let group_label = baglama
+                .get_group(&GroupId::try_from(group_id)?)
+                .await
+                .ok()
+                .flatten()
+                .map(|g| {
+                    if g.is_user_name() {
+                        format!("files uploaded by User:{}", g.category())
+                    } else {
+                        format!("Category:{} (depth {})", g.category(), g.depth())
+                    }
+                });
+            let meta = gzb::tsv::TsvMeta {
+                group_label,
+                wiki: pos.get(5).cloned(),
+            };
+            let rows = match flag_value(argv, "out") {
+                Some(out) => {
+                    let file = std::fs::File::create(&out)?;
+                    let rows =
+                        gzb::tsv::export(&mut reader, &meta, &mut std::io::BufWriter::new(file))?;
+                    println!("{rows} rows written to {out}");
+                    rows
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    gzb::tsv::export(&mut reader, &meta, &mut stdout.lock())?
+                }
+            };
+            info!("gzb_tsv: {rows} rows");
+            Ok(())
         }
         "gzb_show" => {
             let group_id: usize = pos

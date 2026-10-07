@@ -90,6 +90,20 @@ the tool DB tables `group2view`, `views`, `gs2site` (34.6 GB) once
 — no views. Regenerate them with `gzb_month 2026 1` etc.; page lists then
 reflect current category contents.
 
+## Exporting as TSV (`gzb_tsv`)
+
+```bash
+./run_gzb.sh tsv 979 2026 9            # → ~/gzb-tsv/979-2026-9.tsv
+./run_gzb.sh tsv 979 2026 9 enwiki     # one wiki only
+baglama2 gzb_tsv 979 2026 9 > out.tsv  # direct, where the binary is available
+```
+
+`#` lines first (group and what it tracks, month, source, totals, what the
+views mean, column descriptions), then `wiki title namespace views files`.
+Wikis in order of views, pages by views; streamed chunk by chunk. For
+converted legacy data the stored totals can differ from the row count
+(the old pipelines counted pages differently); the comments then say so.
+
 ## Deploying
 
 1. PHP first (`glamtools`): `GzbReader`, the `gzb` branches in

@@ -25,6 +25,7 @@
 
 pub mod convert;
 pub mod month;
+pub mod tsv;
 
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
@@ -333,11 +334,27 @@ impl GzbReader {
 
     /// The top `max` rows (all if 0) of one site, sorted by views.
     pub fn rows(&mut self, giu: &str, max: usize) -> Result<Vec<GzbRow>> {
+        let mut ret = vec![];
+        self.for_each_row(giu, max, |row| {
+            ret.push(row);
+            Ok(())
+        })?;
+        Ok(ret)
+    }
+
+    /// Calls `f` on the top `max` rows (all if 0) of one site, in order,
+    /// holding one chunk in memory at a time. Returns the number of rows.
+    pub fn for_each_row(
+        &mut self,
+        giu: &str,
+        max: usize,
+        mut f: impl FnMut(GzbRow) -> Result<()>,
+    ) -> Result<usize> {
         let chunks = match self.header.site(giu) {
             Some(site) => site.chunks.clone(),
-            None => return Ok(vec![]),
+            None => return Ok(0),
         };
-        let mut ret = vec![];
+        let mut n = 0;
         for chunk in chunks {
             self.file
                 .seek(SeekFrom::Start(self.data_start + chunk.offset))?;
@@ -346,13 +363,14 @@ impl GzbReader {
             let mut text = String::new();
             GzDecoder::new(&compressed[..]).read_to_string(&mut text)?;
             for line in text.lines() {
-                ret.push(GzbRow::parse_tsv(line)?);
-                if max > 0 && ret.len() >= max {
-                    return Ok(ret);
+                f(GzbRow::parse_tsv(line)?)?;
+                n += 1;
+                if max > 0 && n >= max {
+                    return Ok(n);
                 }
             }
         }
-        Ok(ret)
+        Ok(n)
     }
 }
 
