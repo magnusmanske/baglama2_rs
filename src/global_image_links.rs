@@ -8,18 +8,30 @@ pub struct GlobalImageLinks {
     pub wiki: String,
     pub page: usize,
     pub page_namespace_id: i32,
-    //pub page_namespace: String,
+    /// Local namespace name, e.g. `Kategorie`; empty for the main namespace.
+    pub page_namespace: String,
     pub page_title: String,
     pub to: String,
 }
 
 impl GlobalImageLinks {
+    /// The title as it appears in the pageview dump: namespace-prefixed,
+    /// underscored.
+    pub fn dump_title(&self) -> String {
+        let title = if self.page_namespace.is_empty() {
+            self.page_title.clone()
+        } else {
+            format!("{}:{}", self.page_namespace, self.page_title)
+        };
+        title.replace(' ', "_")
+    }
+
     pub async fn load(files: &[String], baglama: &Baglama2) -> Result<Vec<GlobalImageLinks>> {
         if files.is_empty() {
             return Ok(vec![]);
         }
         let placeholders = Baglama2::sql_placeholders(files.len());
-        let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,gil_page_namespace,FROM_BASE64(TO_BASE64(gil_page_title)),FROM_BASE64(TO_BASE64(gil_to)) FROM `globalimagelinks` WHERE `gil_to` IN ({})",&placeholders);
+        let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,FROM_BASE64(TO_BASE64(gil_page_namespace)),FROM_BASE64(TO_BASE64(gil_page_title)),FROM_BASE64(TO_BASE64(gil_to)) FROM `globalimagelinks` WHERE `gil_to` IN ({})",&placeholders);
 
         let max_attempts = 5;
         let mut last_error: Option<String> = None;
@@ -78,6 +90,10 @@ impl FromRow for GlobalImageLinks {
             page_namespace_id: row
                 .get(2)
                 .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            page_namespace: row
+                .as_ref(3)
+                .and_then(Baglama2::value2opt_string)
+                .unwrap_or_default(),
             page_title: Baglama2::value2opt_string(
                 row.as_ref(4)
                     .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,

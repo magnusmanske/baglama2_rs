@@ -143,6 +143,38 @@ impl Baglama2 {
             .to_string()
     }
 
+    /// Root directory of the gzb view-data files. Defaults to `gzb` inside
+    /// the SQLite data root, which is where the PHP API looks.
+    pub fn gzb_data_root_path(&self) -> std::path::PathBuf {
+        match self.config.get("gzb_data_root_path").and_then(|v| v.as_str()) {
+            Some(path) => path.into(),
+            None => std::path::Path::new(&self.sqlite_data_root_path()).join("gzb"),
+        }
+    }
+
+    /// The code a wiki has in the pageview dumps: its host name without
+    /// `.org`, e.g. `enwiki` → `en.wikipedia`, `wikidatawiki` →
+    /// `wikidata`. The site matrix comes first, because `sites.server` in
+    /// the tool DB is wrong for several special wikis (`meta.wikipedia.org`);
+    /// but the site matrix omits closed wikis, which still get views.
+    pub fn wiki_dump_code(&self, wiki: &str) -> Option<String> {
+        if let Ok(url) = self.site_matrix.get_server_url_for_wiki(wiki) {
+            return Self::dump_code_from_server_url(&url);
+        }
+        let site = self
+            .sites_cache
+            .iter()
+            .find(|s| s.giu_code().as_deref() == Some(wiki))?;
+        Self::dump_code_from_server_url(site.server().as_deref()?)
+    }
+
+    /// The dump drops a leading `www.`: `www.wikidata.org` is `wikidata`.
+    fn dump_code_from_server_url(url: &str) -> Option<String> {
+        let host = url.split("://").last()?.trim_end_matches('/');
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        host.strip_suffix(".org").map(|s| s.to_string())
+    }
+
     pub async fn deactivate_nonexistent_categories(&self) -> Result<()> {
         let sql = format!(
             "{} WHERE is_user_name=0 AND is_active=1",
@@ -472,7 +504,6 @@ impl Baglama2 {
         remaining_queries: &[String],
     ) -> Result<Vec<String>> {
         let mut attempts_left = 5;
-        let mut ret = vec![];
         loop {
             if attempts_left == 0 {
                 break;
@@ -503,8 +534,8 @@ impl Baglama2 {
                     Self::DB_QUERY_TIMEOUT.as_secs()
                 )),
             };
-            ret = match query_result {
-                Ok(rows) => rows,
+            match query_result {
+                Ok(rows) => return Ok(rows),
                 Err(e) => {
                     warn!(
                         "query_commons_repeat: attempt failed ({e}); {attempts_left} attempts left"
@@ -518,7 +549,7 @@ impl Baglama2 {
                 }
             }
         }
-        Ok(ret)
+        Ok(vec![])
     }
 
     // TESTED
@@ -767,6 +798,19 @@ mod tests {
         let remaining: Vec<String> = check.into_iter().filter(|c| !seen.contains(c)).collect();
 
         assert_eq!(remaining, vec!["Cat:B".to_string()]);
+    }
+
+    #[test]
+    fn test_dump_code_from_server_url() {
+        assert_eq!(
+            Baglama2::dump_code_from_server_url("https://en.wikipedia.org"),
+            Some("en.wikipedia".to_string())
+        );
+        assert_eq!(
+            Baglama2::dump_code_from_server_url("https://www.wikidata.org/"),
+            Some("wikidata".to_string())
+        );
+        assert_eq!(Baglama2::dump_code_from_server_url("https://example.com"), None);
     }
 
     #[test]

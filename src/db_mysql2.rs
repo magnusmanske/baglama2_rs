@@ -544,7 +544,7 @@ impl DbMySql2 {
     /// byte and the resulting byte sequence is itself valid UTF-8 — return
     /// the repaired string. Pure ASCII returns an identical string (callers
     /// dedupe), and correctly-stored multibyte UTF-8 returns `None`.
-    fn repair_double_encoding(s: &str) -> Option<String> {
+    pub(crate) fn repair_double_encoding(s: &str) -> Option<String> {
         let mut bytes = Vec::with_capacity(s.len());
         for c in s.chars() {
             let n = c as u32;

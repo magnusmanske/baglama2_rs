@@ -24,6 +24,7 @@ pub mod db_trait;
 pub mod file;
 pub mod global_image_links;
 pub mod group_date;
+pub mod gzb;
 pub mod month_views;
 pub mod page;
 pub mod pageviews;
@@ -70,6 +71,78 @@ where
         }
     }
 }
+
+/// Value of `--name=VALUE` or `--name VALUE`, anywhere on the command line.
+fn flag_value(argv: &[String], name: &str) -> Option<String> {
+    let prefix = format!("--{name}=");
+    let bare = format!("--{name}");
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(v) = arg.strip_prefix(&prefix) {
+            return Some(v.to_string());
+        }
+        if *arg == bare {
+            return iter.next().cloned();
+        }
+    }
+    None
+}
+
+fn has_flag(argv: &[String], name: &str) -> bool {
+    let bare = format!("--{name}");
+    argv.contains(&bare)
+}
+
+fn parsed_flag<T: std::str::FromStr>(argv: &[String], name: &str) -> Option<T> {
+    flag_value(argv, name).map(|v| {
+        v.parse()
+            .unwrap_or_else(|_| panic!("--{name}: cannot parse '{v}'"))
+    })
+}
+
+/// `--groups=1,2,3`
+fn group_ids_flag(argv: &[String]) -> Option<Vec<usize>> {
+    flag_value(argv, "groups").map(|v| {
+        v.split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap_or_else(|_| panic!("--groups: bad id '{s}'")))
+            .collect()
+    })
+}
+
+/// Arguments that are not `--flags` (nor a flag's separate value).
+fn positional(argv: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--dump", "--groups", "--list-jobs", "--build-jobs", "--storage", "--from", "--to",
+        "--limit", "--jobs", "--max",
+    ];
+    let mut ret = vec![];
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if VALUE_FLAGS.contains(&arg.as_str()) {
+            iter.next();
+        } else if !arg.starts_with("--") {
+            ret.push(arg.clone());
+        }
+    }
+    ret
+}
+
+const USAGE: &str = "\
+gzb commands (view data as one compressed file per group-month):
+  gzb_check YEAR MONTH [--dump=PATH]
+      Check dump, replicas, tool DB and output dirs for a month; changes nothing.
+  gzb_month YEAR MONTH [--dump=PATH] [--groups=1,2] [--force] [--list-jobs=6]
+                       [--build-jobs=3] [--keep-work]
+      Generate a month for all active groups (or --groups). Resumable: re-run
+      the same command after a failure. --force replaces complete data.
+  gzb_convert [--storage=file,mysql,sqlite3] [--from=YYYYMM] [--to=YYYYMM]
+              [--groups=1,2] [--limit=N] [--jobs=3] [--dry-run] [--no-switch]
+      Convert completed legacy group-months; sources are left untouched.
+      --dry-run only reports; --no-switch writes files but leaves group_status.
+  gzb_show GROUP YEAR MONTH [WIKI] [--max=20]
+      Print a gzb file's per-wiki totals, or one wiki's top pages.
+YEAR and MONTH may be 'lm' for last month.";
 
 /// Extract an optional dump-file override from the command line.
 /// Accepts both `--dump=PATH` and `--dump PATH` (space-separated). The flag
@@ -222,8 +295,16 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = env::args_os()
         .map(|s| s.into_string().expect("Bad argv"))
         .collect();
+    let command = argv.get(1).map(|s| s.as_str()).unwrap_or_default();
+    if command.is_empty() || command == "help" || command == "--help" {
+        println!("{USAGE}");
+        return Ok(());
+    }
     info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
     let baglama = Arc::new(with_timeout("Baglama2::new", 600, Baglama2::new()).await?);
+    if command.starts_with("gzb_") {
+        return run_gzb_command(command, &argv, baglama).await;
+    }
     info!("Baglama2 initialized; deactivating nonexistent categories");
     with_timeout(
         "deactivate_nonexistent_categories",
@@ -350,9 +431,122 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_gzb_command(command: &str, argv: &[String], baglama: Arc<Baglama2>) -> Result<()> {
+    let pos = positional(argv);
+    let ym_at = |i: usize| {
+        YearMonth::new(year(pos.get(i)), month(pos.get(i + 1)))
+            .unwrap_or_else(|e| panic!("bad year/month: {e}"))
+    };
+    match command {
+        "gzb_check" | "gzb_month" => {
+            let ym = ym_at(2);
+            let opts = gzb::month::MonthOptions {
+                dump_override: dump_override(argv),
+                group_ids: group_ids_flag(argv),
+                force: has_flag(argv, "force"),
+                list_jobs: parsed_flag(argv, "list-jobs").unwrap_or(6),
+                build_jobs: parsed_flag(argv, "build-jobs").unwrap_or(3),
+                keep_work: has_flag(argv, "keep-work"),
+            };
+            let job = gzb::month::GzbMonth::new(baglama.clone(), ym, opts);
+            if command == "gzb_check" {
+                let report = job.check().await?;
+                if !report.problems.is_empty() {
+                    return Err(anyhow!("{} problem(s)", report.problems.len()));
+                }
+                return Ok(());
+            }
+            // As before every monthly run.
+            with_timeout(
+                "deactivate_nonexistent_categories",
+                600,
+                baglama.deactivate_nonexistent_categories(),
+            )
+            .await?;
+            job.run().await
+        }
+        "gzb_convert" => {
+            let mut opts = gzb::convert::ConvertOptions {
+                group_ids: group_ids_flag(argv),
+                from: parsed_flag(argv, "from"),
+                to: parsed_flag(argv, "to"),
+                limit: parsed_flag(argv, "limit"),
+                dry_run: has_flag(argv, "dry-run"),
+                no_switch: has_flag(argv, "no-switch"),
+                ..Default::default()
+            };
+            if let Some(storages) = flag_value(argv, "storage") {
+                opts.storages = storages.split(',').map(|s| s.to_string()).collect();
+            }
+            if let Some(jobs) = parsed_flag(argv, "jobs") {
+                opts.jobs = jobs;
+            }
+            gzb::convert::run(baglama, opts).await
+        }
+        "gzb_show" => {
+            let group_id: usize = pos
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .expect("group ID expected");
+            let ym = ym_at(3);
+            let path = gzb::gzb_path(&baglama.gzb_data_root_path(), group_id, &ym);
+            let mut reader = gzb::GzbReader::open(&path)?;
+            let h = reader.header().clone();
+            match pos.get(5) {
+                None => {
+                    println!(
+                        "{}: group {} {}-{:02}, source {}, created {}\n{} pages, {} views, {} wikis",
+                        path.display(),
+                        h.group_id,
+                        h.year,
+                        h.month,
+                        h.source,
+                        h.created,
+                        h.total_pages,
+                        h.total_views,
+                        h.sites.len()
+                    );
+                    for site in &h.sites {
+                        println!("{}\t{}\t{}", site.giu, site.pages, site.views);
+                    }
+                }
+                Some(giu) => {
+                    let max = parsed_flag(argv, "max").unwrap_or(20);
+                    for row in reader.rows(giu, max)? {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            row.views,
+                            row.namespace_id,
+                            row.title,
+                            row.files.join("|")
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => Err(anyhow!("Unknown command '{other}'\n{USAGE}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_flags_and_positional() {
+        let a = argv(&[
+            "bin", "gzb_month", "2026", "9", "--groups=1,2", "--force", "--dump", "/x.bz2",
+            "--build-jobs=2",
+        ]);
+        assert_eq!(positional(&a), vec!["bin", "gzb_month", "2026", "9"]);
+        assert_eq!(group_ids_flag(&a), Some(vec![1, 2]));
+        assert!(has_flag(&a, "force"));
+        assert!(!has_flag(&a, "keep-work"));
+        assert_eq!(dump_override(&a), Some(PathBuf::from("/x.bz2")));
+        assert_eq!(parsed_flag::<usize>(&a, "build-jobs"), Some(2));
+        assert_eq!(parsed_flag::<usize>(&a, "list-jobs"), None);
+    }
 
     #[test]
     fn test_month_numeric() {
