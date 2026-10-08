@@ -24,8 +24,8 @@ use tokio::sync::Semaphore;
 
 pub const CONVERTIBLE: &[&str] = &["file", "mysql", "sqlite3"];
 
-/// SQLite size that counts as one unit of conversion concurrency.
-const SQLITE_WEIGHT_BYTES: u64 = 256 * 1024 * 1024;
+/// Source file size that counts as one unit of conversion concurrency.
+const SOURCE_WEIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
@@ -93,13 +93,11 @@ pub async fn run(baglama: Arc<Baglama2>, opts: ConvertOptions) -> Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
     let total = jobs.len();
     for (n, job) in jobs.into_iter().enumerate() {
-        let weight = match job.storage.as_str() {
-            "sqlite3" => sqlite_source(&sqlite_root, &job)
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| (m.len() / SQLITE_WEIGHT_BYTES).clamp(1, n_jobs as u64))
-                .unwrap_or(1),
-            _ => 1,
-        } as u32;
+        let weight = source_file(&sqlite_root, &job)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(1, |m| {
+                (m.len() / SOURCE_WEIGHT_BYTES).clamp(1, n_jobs as u64)
+            }) as u32;
         let permit = semaphore
             .clone()
             .acquire_many_owned(weight)
@@ -214,11 +212,7 @@ async fn select_jobs(baglama: &Baglama2, opts: &ConvertOptions) -> Result<Vec<Jo
 fn dry_run(jobs: &[Job], sqlite_root: &Path) -> Result<()> {
     let mut totals: HashMap<String, (u64, u64, u64)> = HashMap::new(); // n, missing, bytes
     for job in jobs {
-        let source = match job.storage.as_str() {
-            "sqlite3" => sqlite_source(sqlite_root, job),
-            "file" => Some(PathBuf::from(&job.file)),
-            _ => None,
-        };
+        let source = source_file(sqlite_root, job);
         let entry = totals.entry(job.storage.clone()).or_default();
         entry.0 += 1;
         if let Some(path) = source {
@@ -322,6 +316,15 @@ fn append_conversion_log(root: &Path, job: &Job, source: &str) -> Result<()> {
     Ok(())
 }
 
+/// The legacy file a job reads, if it reads one.
+fn source_file(sqlite_root: &Path, job: &Job) -> Option<PathBuf> {
+    match job.storage.as_str() {
+        "sqlite3" => sqlite_source(sqlite_root, job),
+        "file" => Some(PathBuf::from(&job.file)),
+        _ => None,
+    }
+}
+
 /// Where the legacy SQLite file of a group-month is: the stored path for old
 /// rows, else `<root>/<YYYYMM>/<gid>.sqlite3`, or `.sqlite` as written by
 /// some Rust builds — the same rule as the PHP API.
@@ -338,6 +341,166 @@ fn sqlite_source(sqlite_root: &Path, job: &Job) -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
+/// Legacy rows, compactly, as in `gzb_month`: titles are slices of one
+/// shared buffer and file names are interned, so a page costs ~40 bytes plus
+/// its title. Owned `GzbRow`s in hash maps took several hundred, which ran
+/// conversions of the biggest group-months out of memory.
+#[derive(Default)]
+struct CompactRows {
+    titles: Vec<u8>,
+    rows: Vec<CompactRow>,
+    /// `(row, file)`: indexes into `rows` and the interned file names.
+    usages: Vec<(u32, u32)>,
+    file_ids: HashMap<String, u32>,
+    /// Legacy site ID → index into `sites`.
+    site_ids: HashMap<String, u32>,
+    sites: Vec<LegacySite>,
+}
+
+struct CompactRow {
+    views: u64,
+    title_start: u32,
+    title_len: u32,
+    namespace_id: i32,
+    site: u32,
+}
+
+#[derive(Default)]
+struct LegacySite {
+    giu: Option<String>,
+    /// Stored `(pages, views)`, which override the computed ones.
+    summary: Option<(u64, u64)>,
+}
+
+impl CompactRows {
+    /// Index of a legacy site, by its ID in the source.
+    fn site(&mut self, id: &str) -> Result<u32> {
+        let n = intern(&mut self.site_ids, id)?;
+        if n as usize == self.sites.len() {
+            self.sites.push(LegacySite::default());
+        }
+        Ok(n)
+    }
+
+    fn site_mut(&mut self, id: &str) -> Result<&mut LegacySite> {
+        let n = self.site(id)?;
+        Ok(&mut self.sites[n as usize])
+    }
+
+    /// Adds a row, returning its index for [`CompactRows::add_file`].
+    fn push(&mut self, site: u32, title: &str, namespace_id: i32, views: u64) -> Result<u32> {
+        let row = u32::try_from(self.rows.len()).map_err(|_| anyhow!("too many rows"))?;
+        let title_start =
+            u32::try_from(self.titles.len()).map_err(|_| anyhow!("over 4 GB of titles"))?;
+        self.titles.extend_from_slice(title.as_bytes());
+        self.rows.push(CompactRow {
+            views,
+            title_start,
+            title_len: title.len() as u32,
+            namespace_id,
+            site,
+        });
+        Ok(row)
+    }
+
+    fn add_file(&mut self, row: u32, name: &str) -> Result<()> {
+        if !name.is_empty() {
+            let file = intern(&mut self.file_ids, name)?;
+            self.usages.push((row, file));
+        }
+        Ok(())
+    }
+
+    /// Writes every site that has rows or a stored summary. Rows of sites
+    /// without a `giu` are dropped with a warning naming `source`.
+    fn write(self, writer: &mut GzbWriter, source: &str) -> Result<()> {
+        let Self {
+            titles,
+            rows,
+            mut usages,
+            file_ids,
+            site_ids,
+            sites,
+        } = self;
+        let files = interned_list(file_ids);
+        let site_names = interned_list(site_ids);
+        usages.sort_unstable();
+        usages.dedup();
+        // Titles were &str when stored, so this cannot fail.
+        let title = |r: &CompactRow| {
+            std::str::from_utf8(&titles[r.title_start as usize..][..r.title_len as usize])
+                .unwrap_or_default()
+        };
+
+        let mut order: Vec<u32> = (0..rows.len() as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (ra, rb) = (&rows[a as usize], &rows[b as usize]);
+            ra.site
+                .cmp(&rb.site)
+                .then(rb.views.cmp(&ra.views))
+                .then_with(|| title(ra).cmp(title(rb)))
+                .then(ra.namespace_id.cmp(&rb.namespace_id))
+                .then(a.cmp(&b))
+        });
+
+        // Each site's slice of `order`, empty for summary-only sites.
+        let mut ranges = vec![0..0; sites.len()];
+        let mut start = 0;
+        while start < order.len() {
+            let site = rows[order[start] as usize].site;
+            let end = order[start..]
+                .iter()
+                .position(|&r| rows[r as usize].site != site)
+                .map_or(order.len(), |p| start + p);
+            ranges[site as usize] = start..end;
+            start = end;
+        }
+
+        let mut names: Vec<&str> = vec![];
+        for (n, (site, range)) in sites.iter().zip(ranges).enumerate() {
+            if range.is_empty() && site.summary.is_none() {
+                continue;
+            }
+            let Some(giu) = &site.giu else {
+                warn!(
+                    "{source}: site id {} unknown, dropping {} rows",
+                    site_names[n],
+                    range.len()
+                );
+                continue;
+            };
+            let site_rows = &order[range];
+            let (pages, views) = site.summary.unwrap_or_else(|| {
+                (
+                    site_rows.len() as u64,
+                    site_rows.iter().map(|&r| rows[r as usize].views).sum(),
+                )
+            });
+            writer.add_site_sorted(giu, site_rows.len(), pages, views, |i, buf| {
+                let r = site_rows[i];
+                let row = &rows[r as usize];
+                let first = usages.partition_point(|u| u.0 < r);
+                names.clear();
+                names.extend(
+                    usages[first..]
+                        .iter()
+                        .take_while(|u| u.0 == r)
+                        .map(|u| files[u.1 as usize].as_str()),
+                );
+                names.sort_unstable();
+                write_row(
+                    buf,
+                    title(row),
+                    row.namespace_id,
+                    row.views,
+                    names.iter().copied(),
+                );
+            })?;
+        }
+        Ok(())
+    }
+}
+
 fn convert_sqlite(path: &Path, group_id: usize, ym: &YearMonth, out: &Path) -> Result<GzbHeader> {
     use rusqlite::{Connection, OpenFlags};
     if std::fs::metadata(path)?.len() == 0 {
@@ -348,79 +511,69 @@ fn convert_sqlite(path: &Path, group_id: usize, ym: &YearMonth, out: &Path) -> R
         format!("file:{}?immutable=1", path.display()),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    let mut data = CompactRows::default();
 
-    let mut site_giu: HashMap<i64, String> = HashMap::new();
     let mut stmt = conn.prepare("SELECT id,giu_code FROM sites WHERE giu_code IS NOT NULL")?;
-    for r in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-        let (id, giu) = r?;
-        site_giu.insert(id, giu);
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        data.site_mut(&r.get::<_, i64>(0)?.to_string())?.giu = Some(r.get(1)?);
     }
 
     // Per-site totals as the API has been showing them; first row wins, as
     // duplicates are not expected.
-    let mut summaries: HashMap<i64, (u64, u64)> = HashMap::new();
     let mut stmt = conn.prepare("SELECT site_id,pages,views FROM gs2site")?;
-    for r in stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })? {
-        let (site, pages, views) = r?;
-        summaries
-            .entry(site)
-            .or_insert((pages.max(0) as u64, views.max(0) as u64));
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let (pages, views) = (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?);
+        let site = data.site_mut(&r.get::<_, i64>(0)?.to_string())?;
+        site.summary
+            .get_or_insert((pages.max(0) as u64, views.max(0) as u64));
     }
 
-    // Only `done=1` rows, which is what the API lists.
-    let mut by_view: HashMap<i64, (i64, GzbRow)> = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT v.id,v.site,v.title,v.namespace_id,v.views,g.image
-         FROM views v LEFT JOIN group2view g ON g.view_id=v.id
-         WHERE v.done=1",
-    )?;
+    // Only `done=1` rows, which is what the API lists. Two plain scans
+    // instead of a join: `group2view.view_id` has no index, so a join makes
+    // SQLite build one in memory.
+    let mut view_rows: Vec<(i64, u32)> = vec![];
+    let mut site_cache: Option<(i64, u32)> = None;
+    let mut stmt =
+        conn.prepare("SELECT id,site,title,namespace_id,views FROM views WHERE done=1")?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let site_id: i64 = r.get(1)?;
+        let site = match site_cache {
+            Some((id, n)) if id == site_id => n,
+            _ => {
+                let n = data.site(&site_id.to_string())?;
+                site_cache = Some((site_id, n));
+                n
+            }
+        };
+        let row = data.push(
+            site,
+            r.get_ref(2)?.as_str()?,
+            r.get(3)?,
+            r.get::<_, i64>(4)?.max(0) as u64,
+        )?;
+        view_rows.push((r.get(0)?, row));
+    }
+    view_rows.sort_unstable();
+
+    let mut stmt = conn.prepare("SELECT view_id,image FROM group2view")?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let view_id: i64 = r.get(0)?;
-        let image: Option<String> = r.get(5)?;
-        let entry = match by_view.get_mut(&view_id) {
-            Some(entry) => entry,
-            None => by_view.entry(view_id).or_insert((
-                r.get(1)?,
-                GzbRow {
-                    title: r.get(2)?,
-                    namespace_id: r.get(3)?,
-                    views: r.get::<_, i64>(4)?.max(0) as u64,
-                    files: vec![],
-                },
-            )),
-        };
-        if let Some(image) = image.filter(|i| !i.is_empty()) {
-            entry.1.files.push(image);
-        }
-    }
-
-    let mut by_site: HashMap<i64, Vec<GzbRow>> = HashMap::new();
-    for (_, (site, row)) in by_view {
-        by_site.entry(site).or_default().push(row);
-    }
-    for site in summaries.keys() {
-        by_site.entry(*site).or_default();
-    }
-    let mut writer = GzbWriter::new(group_id, ym, "sqlite3");
-    for (site, rows) in by_site {
-        let Some(giu) = site_giu.get(&site) else {
-            warn!(
-                "{}: site id {site} unknown, dropping {} rows",
-                path.display(),
-                rows.len()
-            );
+        let Ok(i) = view_rows.binary_search_by_key(&view_id, |v| v.0) else {
             continue;
         };
-        writer.add_site(giu, rows, summaries.get(&site).copied())?;
+        if let Some(image) = r.get_ref(1)?.as_str_or_null()? {
+            data.add_file(view_rows[i].1, image)?;
+        }
     }
-    writer.finish(out)
+    drop(view_rows);
+
+    let mut writer = GzbWriter::new(out, group_id, ym, "sqlite3");
+    data.write(&mut writer, &path.display().to_string())?;
+    writer.finish()
 }
 
 fn convert_flat_file(
@@ -429,11 +582,18 @@ fn convert_flat_file(
     ym: &YearMonth,
     out: &Path,
 ) -> Result<GzbHeader> {
-    let text = std::fs::read(path)?;
-    let text = String::from_utf8_lossy(&text);
-    let mut by_site: HashMap<String, Vec<GzbRow>> = HashMap::new();
+    let mut data = CompactRows::default();
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut buf = vec![];
     // Header row first; then `giu \t urlencoded title \t files \t views`.
-    for line in text.lines().skip(1) {
+    reader.read_until(b'\n', &mut buf)?;
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
         if line.trim().is_empty() {
             continue;
         }
@@ -441,48 +601,49 @@ fn convert_flat_file(
         if cols.len() < 4 {
             continue;
         }
-        let files = cols[2]
-            .split('|')
-            .filter(|f| !f.is_empty())
-            .map(|f| f.to_string())
-            .collect();
-        by_site
-            .entry(cols[0].to_string())
-            .or_default()
-            .push(GzbRow {
-                title: url_decode(cols[1]).replace(' ', "_"),
-                namespace_id: 0,
-                views: cols[3].trim().parse().unwrap_or(0),
-                files,
-            });
+        let site = data.site(cols[0])?;
+        data.sites[site as usize]
+            .giu
+            .get_or_insert_with(|| cols[0].to_string());
+        let row = data.push(
+            site,
+            &url_decode(cols[1]).replace(' ', "_"),
+            0,
+            cols[3].trim().parse().unwrap_or(0),
+        )?;
+        for file in cols[2].split('|') {
+            data.add_file(row, file)?;
+        }
     }
-    let mut writer = GzbWriter::new(group_id, ym, "file");
-    for (giu, rows) in by_site {
-        writer.add_site(&giu, rows, None)?;
-    }
-    writer.finish(out)
+    let mut writer = GzbWriter::new(out, group_id, ym, "file");
+    data.write(&mut writer, &path.display().to_string())?;
+    writer.finish()
 }
 
 async fn convert_mysql(baglama: &Baglama2, job: &Job, out: &Path) -> Result<GzbHeader> {
-    let site_giu: HashMap<usize, String> = baglama
-        .get_sites()?
-        .into_iter()
-        .filter_map(|s| Some((s.id(), s.giu_code().clone()?)))
-        .collect();
+    let mut data = CompactRows::default();
+    for site in baglama.get_sites()? {
+        if let Some(giu) = site.giu_code() {
+            data.site_mut(&site.id().to_string())?.giu = Some(giu.clone());
+        }
+    }
     let mut conn = baglama.get_tooldb_conn().await?;
 
-    let summaries: HashMap<usize, (u64, u64)> = conn
-        .exec::<(usize, u64, u64), _, _>(
+    // First row wins.
+    let summaries: Vec<(usize, u64, u64)> = conn
+        .exec(
             "SELECT site_id,pages,views FROM gs2site WHERE group_status_id=?",
             (job.gs_id,),
         )
-        .await?
-        .into_iter()
-        .rev() // first row wins
-        .map(|(site, pages, views)| (site, (pages, views)))
-        .collect();
+        .await?;
+    for (site, pages, views) in summaries {
+        data.site_mut(&site.to_string())?
+            .summary
+            .get_or_insert((pages, views));
+    }
 
-    let mut by_view: HashMap<usize, (usize, GzbRow)> = HashMap::new();
+    let mut view_rows: HashMap<usize, u32> = HashMap::new();
+    let mut failed: Option<anyhow::Error> = None;
     conn.exec_iter(
         "SELECT g.view_id,v.site,FROM_BASE64(TO_BASE64(p.title)),p.namespace_id,v.views,
                 FROM_BASE64(TO_BASE64(f.name))
@@ -495,58 +656,57 @@ async fn convert_mysql(baglama: &Baglama2, job: &Job, out: &Path) -> Result<GzbH
     )
     .await?
     .for_each_and_drop(|row: mysql_async::Row| {
-        let Some(Some(view_id)) = row.get::<Option<usize>, _>(0) else {
+        if failed.is_some() {
             return;
-        };
-        let Some(Some(site)) = row.get::<Option<usize>, _>(1) else {
-            return;
-        };
-        let entry = by_view.entry(view_id).or_insert_with(|| {
-            let title = row
-                .get::<Option<Vec<u8>>, _>(2)
-                .flatten()
-                .map(|b| repair_title(&String::from_utf8_lossy(&b)))
-                .unwrap_or_default();
-            (
-                site,
-                GzbRow {
-                    title,
-                    namespace_id: row.get::<Option<i32>, _>(3).flatten().unwrap_or(0),
-                    views: row.get::<Option<i64>, _>(4).flatten().unwrap_or(0).max(0) as u64,
-                    files: vec![],
-                },
-            )
-        });
-        if let Some(Some(name)) = row.get::<Option<Vec<u8>>, _>(5) {
-            entry
-                .1
-                .files
-                .push(String::from_utf8_lossy(&name).into_owned());
+        }
+        let res = (|| -> Result<()> {
+            let Some(Some(view_id)) = row.get::<Option<usize>, _>(0) else {
+                return Ok(());
+            };
+            let Some(Some(site)) = row.get::<Option<usize>, _>(1) else {
+                return Ok(());
+            };
+            let r = match view_rows.get(&view_id) {
+                Some(r) => *r,
+                None => {
+                    let title = row
+                        .get::<Option<Vec<u8>>, _>(2)
+                        .flatten()
+                        .map(|b| repair_title(&String::from_utf8_lossy(&b)))
+                        .unwrap_or_default();
+                    let site = data.site(&site.to_string())?;
+                    let r = data.push(
+                        site,
+                        &title,
+                        row.get::<Option<i32>, _>(3).flatten().unwrap_or(0),
+                        row.get::<Option<i64>, _>(4).flatten().unwrap_or(0).max(0) as u64,
+                    )?;
+                    view_rows.insert(view_id, r);
+                    r
+                }
+            };
+            if let Some(Some(name)) = row.get::<Option<Vec<u8>>, _>(5) {
+                data.add_file(r, &String::from_utf8_lossy(&name))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = res {
+            failed = Some(e);
         }
     })
     .await?;
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    drop(view_rows);
 
-    let mut by_site: HashMap<usize, Vec<GzbRow>> = HashMap::new();
-    for (_, (site, row)) in by_view {
-        by_site.entry(site).or_default().push(row);
-    }
-    for site in summaries.keys() {
-        by_site.entry(*site).or_default();
-    }
-    let mut writer = GzbWriter::new(job.group_id, &job.ym, "mysql");
-    for (site, rows) in by_site {
-        let Some(giu) = site_giu.get(&site) else {
-            warn!(
-                "group_status {}: site id {site} unknown, dropping {} rows",
-                job.gs_id,
-                rows.len()
-            );
-            continue;
-        };
-        writer.add_site(giu, rows, summaries.get(&site).copied())?;
-    }
-    let out = out.to_path_buf();
-    tokio::task::spawn_blocking(move || writer.finish(&out)).await?
+    let source = format!("group_status {}", job.gs_id);
+    let mut writer = GzbWriter::new(out, job.group_id, &job.ym, "mysql");
+    tokio::task::spawn_blocking(move || {
+        data.write(&mut writer, &source)?;
+        writer.finish()
+    })
+    .await?
 }
 
 /// Undo the double UTF-8 encoding found in the tool DB's `pages.title`.

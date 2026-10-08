@@ -121,7 +121,7 @@ mod tests {
     fn sample(dir: &Path, source: &str) -> PathBuf {
         let ym = YearMonth::new(2026, 9).unwrap();
         let path = gzb_path(dir, 3, &ym);
-        let mut w = GzbWriter::new(3, &ym, source);
+        let mut w = GzbWriter::new(&path, 3, &ym, source);
         let row = |title: &str, ns, views, files: &[&str]| GzbRow {
             title: title.to_string(),
             namespace_id: ns,
@@ -143,7 +143,7 @@ mod tests {
             None,
         )
         .unwrap();
-        w.finish(&path).unwrap();
+        w.finish().unwrap();
         path
     }
 

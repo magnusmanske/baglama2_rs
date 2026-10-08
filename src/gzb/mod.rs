@@ -176,15 +176,47 @@ fn sanitize_field(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Compressed data a [`GzbWriter`] holds in memory before moving it to a
+/// temporary file next to the output.
+const SPILL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Interns `name`, returning its index.
+fn intern<T: TryFrom<usize> + Copy>(ids: &mut HashMap<String, T>, name: &str) -> Result<T> {
+    if let Some(id) = ids.get(name) {
+        return Ok(*id);
+    }
+    let id = T::try_from(ids.len()).map_err(|_| anyhow!("too many distinct values"))?;
+    ids.insert(name.to_string(), id);
+    Ok(id)
+}
+
+/// Invert an interning map into a list indexed by id.
+fn interned_list<T: Into<u64>>(ids: HashMap<String, T>) -> Vec<String> {
+    let mut list = vec![String::new(); ids.len()];
+    for (name, id) in ids {
+        list[id.into() as usize] = name;
+    }
+    list
+}
+
 /// Accumulates sites for one group-month, then writes the file atomically.
 pub struct GzbWriter {
+    path: PathBuf,
     header: GzbHeader,
     data: Vec<u8>,
+    data_len: u64,
+    /// Once `data` outgrew [`SPILL_BYTES`], all compressed data goes here.
+    spill: Option<std::io::BufWriter<File>>,
+    spilled: bool,
+    spill_bytes: usize,
 }
 
 impl GzbWriter {
-    pub fn new(group_id: usize, ym: &YearMonth, source: &str) -> Self {
+    /// A writer for the file at `path`; nothing is visible there before
+    /// [`GzbWriter::finish`].
+    pub fn new(path: &Path, group_id: usize, ym: &YearMonth, source: &str) -> Self {
         Self {
+            path: path.to_path_buf(),
             header: GzbHeader {
                 version: VERSION,
                 group_id,
@@ -197,7 +229,36 @@ impl GzbWriter {
                 sites: vec![],
             },
             data: vec![],
+            data_len: 0,
+            spill: None,
+            spilled: false,
+            spill_bytes: SPILL_BYTES,
         }
+    }
+
+    fn spill_path(&self) -> PathBuf {
+        self.path
+            .with_extension(format!("{FILE_EXTENSION}.data.tmp"))
+    }
+
+    fn write_data(&mut self, bytes: &[u8]) -> Result<()> {
+        self.data_len += bytes.len() as u64;
+        if let Some(spill) = &mut self.spill {
+            spill.write_all(bytes)?;
+            return Ok(());
+        }
+        self.data.extend_from_slice(bytes);
+        if self.data.len() >= self.spill_bytes {
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            self.spilled = true;
+            let mut spill = std::io::BufWriter::new(File::create(self.spill_path())?);
+            spill.write_all(&self.data)?;
+            self.data = vec![];
+            self.spill = Some(spill);
+        }
+        Ok(())
     }
 
     /// Add one site. Rows are sorted here; files per row are de-duplicated.
@@ -253,11 +314,11 @@ impl GzbWriter {
             enc.write_all(&buf)?;
             let compressed = enc.finish()?;
             chunks.push(GzbChunk {
-                offset: self.data.len() as u64,
+                offset: self.data_len,
                 length: compressed.len() as u64,
                 rows: (end - start) as u64,
             });
-            self.data.extend_from_slice(&compressed);
+            self.write_data(&compressed)?;
         }
 
         self.header.total_pages += pages;
@@ -271,26 +332,48 @@ impl GzbWriter {
         Ok(())
     }
 
-    /// Write to `path` via a temporary file + rename, so a reader never sees
+    /// Write the file via a temporary file + rename, so a reader never sees
     /// a half-written file.
-    pub fn finish(mut self, path: &Path) -> Result<GzbHeader> {
+    pub fn finish(mut self) -> Result<GzbHeader> {
         self.header
             .sites
             .sort_by(|a, b| b.views.cmp(&a.views).then_with(|| a.giu.cmp(&b.giu)));
         let header_json = serde_json::to_vec(&self.header)?;
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension(format!("{FILE_EXTENSION}.tmp"));
+        let tmp = self.path.with_extension(format!("{FILE_EXTENSION}.tmp"));
         {
             let mut f = std::io::BufWriter::new(File::create(&tmp)?);
             writeln!(f, "{MAGIC} {VERSION} {}", header_json.len())?;
             f.write_all(&header_json)?;
-            f.write_all(&self.data)?;
+            match self.spill.take() {
+                Some(spill) => {
+                    drop(spill.into_inner().map_err(|e| e.into_error())?);
+                    let copied = std::io::copy(&mut File::open(self.spill_path())?, &mut f)?;
+                    if copied != self.data_len {
+                        return Err(anyhow!(
+                            "{}: copied {copied} of {} data bytes",
+                            self.path.display(),
+                            self.data_len
+                        ));
+                    }
+                }
+                None => f.write_all(&self.data)?,
+            }
             f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
-        Ok(self.header)
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(self.header.clone())
+    }
+}
+
+impl Drop for GzbWriter {
+    fn drop(&mut self) {
+        // After `finish`, or abandoned on an error.
+        if self.spilled {
+            let _ = std::fs::remove_file(self.spill_path());
+        }
     }
 }
 
@@ -563,7 +646,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gzb_test_{}", std::process::id()));
         let ym = YearMonth::new(2024, 3).unwrap();
         let path = gzb_path(&dir, 42, &ym);
-        let mut w = GzbWriter::new(42, &ym, "dump");
+        let mut w = GzbWriter::new(&path, 42, &ym, "dump");
         let many: Vec<GzbRow> = (0..CHUNK_ROWS as u64 * 2 + 7)
             .map(|i| row(&format!("Page_{i}"), i, &["B.jpg", "A.jpg", "B.jpg"]))
             .collect();
@@ -575,7 +658,7 @@ mod tests {
         )
         .unwrap();
         w.add_site("frwiki", vec![], None).unwrap();
-        let written = w.finish(&path).unwrap();
+        let written = w.finish().unwrap();
 
         let mut r = GzbReader::open(&path).unwrap();
         assert_eq!(r.header(), &written);
@@ -595,6 +678,43 @@ mod tests {
         assert_eq!(de[1], row("Köln", 5, &[]));
         assert!(r.rows("frwiki", 0).unwrap().is_empty());
         assert!(r.rows("nowiki", 0).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_spill() {
+        let dir = std::env::temp_dir().join(format!("gzb_spill_{}", std::process::id()));
+        let ym = YearMonth::new(2024, 3).unwrap();
+        let rows: Vec<GzbRow> = (0..CHUNK_ROWS as u64 * 3)
+            .map(|i| row(&format!("Page_{i}"), i, &["A.jpg"]))
+            .collect();
+        let mut files = vec![];
+        for (n, spill_bytes) in [usize::MAX, 1].into_iter().enumerate() {
+            let path = gzb_path(&dir, n, &ym);
+            let mut w = GzbWriter::new(&path, 42, &ym, "dump");
+            w.spill_bytes = spill_bytes;
+            w.add_site("enwiki", rows.clone(), None).unwrap();
+            w.add_site("dewiki", rows[..10].to_vec(), None).unwrap();
+            assert_eq!(w.spilled, spill_bytes == 1);
+            let spill_path = w.spill_path();
+            w.finish().unwrap();
+            assert!(!spill_path.exists());
+            let mut r = GzbReader::open(&path).unwrap();
+            assert_eq!(r.rows("enwiki", 0).unwrap().len(), rows.len());
+            assert_eq!(r.rows("dewiki", 0).unwrap().len(), 10);
+            // Identical but for the creation time.
+            let text = std::fs::read(&path).unwrap();
+            let created = r.header().created.as_bytes().to_vec();
+            files.push((text, created));
+        }
+        let strip = |(text, created): &(Vec<u8>, Vec<u8>)| {
+            let at = text
+                .windows(created.len())
+                .position(|w| w == created)
+                .unwrap();
+            [&text[..at], &text[at + created.len()..]].concat()
+        };
+        assert_eq!(strip(&files[0]), strip(&files[1]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

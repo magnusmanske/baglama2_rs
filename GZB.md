@@ -134,3 +134,11 @@ failures were in phase 3, not the scan: 1047 of 2026-08's groups were
 already complete when it died, and the old code reached 2.3 GiB building
 group 979 alone; next to other groups, a 3× larger view table and what
 phase 1 left behind, that exceeds the old 5 GiB limit.
+
+`gzb_convert` uses the same compact rows (one SQLite scan each for `views`
+and `group2view` instead of a join, which made SQLite build a transient index
+on the unindexed `group2view.view_id`). On a synthetic 2.5M-page, 573 MB
+SQLite file: 0.38 GB peak, down from 1.42 GB; output identical. Flat-file
+sources are streamed and count towards `--jobs` by size, like SQLite files.
+Writers move compressed data beyond 64 MiB to `<gid>.gzb.data.tmp` next to
+the output instead of keeping it in memory.

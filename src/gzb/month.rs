@@ -818,25 +818,6 @@ struct Page {
     views: u64,
 }
 
-/// Interns `name`, returning its index.
-fn intern<T: TryFrom<usize> + Copy>(ids: &mut HashMap<String, T>, name: &str) -> Result<T> {
-    if let Some(id) = ids.get(name) {
-        return Ok(*id);
-    }
-    let id = T::try_from(ids.len()).map_err(|_| anyhow!("too many distinct values"))?;
-    ids.insert(name.to_string(), id);
-    Ok(id)
-}
-
-/// Invert an interning map into a list indexed by id.
-fn interned_list<T: Into<u64>>(ids: HashMap<String, T>) -> Vec<String> {
-    let mut list = vec![String::new(); ids.len()];
-    for (name, id) in ids {
-        list[id.into() as usize] = name;
-    }
-    list
-}
-
 fn build_group_file(
     group_id: usize,
     ym: &YearMonth,
@@ -877,7 +858,7 @@ fn build_group_file(
             .then(a.file.cmp(&b.file))
     });
 
-    let mut writer = GzbWriter::new(group_id, ym, "dump");
+    let mut writer = GzbWriter::new(out, group_id, ym, "dump");
     let mut names: Vec<&str> = vec![];
     let mut start = 0;
     while start < usages.len() {
@@ -936,7 +917,7 @@ fn build_group_file(
         )?;
         start = end;
     }
-    writer.finish(out)
+    writer.finish()
 }
 
 #[cfg(test)]
