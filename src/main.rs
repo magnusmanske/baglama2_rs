@@ -15,6 +15,9 @@ use tokio::sync::Semaphore;
 pub use view_count::ViewCount;
 pub use year_month::YearMonth;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub type DbId = usize;
 
 pub mod baglama2;
