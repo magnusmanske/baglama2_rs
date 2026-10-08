@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use wikimisc::mediawiki::Api;
 use wikimisc::site_matrix::SiteMatrix;
-use wikimisc::toolforge_db::{DbCluster, ToolforgeDB};
+use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
 
 /// The wiki whose replica databases this tool reads. Baglama only queries
 /// Commons; the links split below applies to no other wiki.
@@ -38,6 +38,17 @@ const POOL_COMMONS_CORE: &str = "commons";
 /// [`Baglama2::new`] from config, plus a [`DbCluster`] arm in
 /// [`Baglama2::commons_pool_key`].
 const POOL_COMMONS_LINKS: &str = "commons_links";
+
+/// MySQL/MariaDB error: the user has used up `max_user_connections`.
+const ER_USER_LIMIT_REACHED: u16 = 1226;
+
+/// MariaDB error: the query ran past `max_statement_time`.
+const ER_STATEMENT_TIMEOUT: u16 = 1969;
+
+/// Whether `e` is an error the server reported with `code`.
+fn is_server_error(e: &mysql_async::Error, code: u16) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if se.code == code)
+}
 
 #[derive(Debug)]
 pub struct Baglama2 {
@@ -57,10 +68,20 @@ impl Baglama2 {
     /// How many times to retry connection acquisition before giving up.
     const DB_CONN_RETRIES: u32 = 4;
 
-    /// Max time for a single Commons query (exec + fetch) before failing fast.
-    /// Generous, because deep category joins on the replicas are legitimately
-    /// slow — but bounded, so the job can't hang for hours on one query.
-    const DB_QUERY_TIMEOUT: Duration = Duration::from_secs(600);
+    /// How long to keep waiting for a connection while the server refuses it
+    /// with `max_user_connections` (error 1226). The limit is per tool user
+    /// across all processes, so it frees up as other queries end; waiting is
+    /// better than failing a group.
+    const DB_CONN_LIMIT_WAIT: Duration = Duration::from_secs(60 * 60);
+
+    /// Server-side time limit for each attempt of a Commons query, in seconds;
+    /// one entry per attempt. Grows because a query that just missed the limit
+    /// on a loaded replica usually succeeds with a bit more time.
+    const DB_QUERY_TIME_LIMITS: [u64; 5] = [600, 900, 1200, 1500, 1800];
+
+    /// Extra time the client waits beyond the server-side limit before giving
+    /// up itself. Only a backstop: normally the server ends the query first.
+    const DB_QUERY_CLIENT_GRACE: Duration = Duration::from_secs(60);
 
     pub async fn new() -> Result<Self> {
         let config = match Self::get_config_from_file("config.json") {
@@ -284,41 +305,57 @@ impl Baglama2 {
     /// brittle for a long-running batch job. Total budget is bounded:
     /// `DB_CONN_RETRIES` attempts of up to `DB_CONN_TIMEOUT` each, plus
     /// backoff, so it still fails loudly rather than hanging indefinitely.
+    ///
+    /// Refusals for `max_user_connections` don't count as attempts: they mean
+    /// the tool's connections are all busy (possibly in another job), so this
+    /// waits for one to free up, for up to `DB_CONN_LIMIT_WAIT`.
     async fn get_conn_with_timeout(&self, name: &'static str) -> Result<Conn> {
-        let mut last_err: Option<String> = None;
-        for attempt in 1..=Self::DB_CONN_RETRIES {
-            match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name)).await
-            {
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => {
-                    warn!(
-                        "get_conn '{name}': attempt {attempt}/{} failed: {e}",
-                        Self::DB_CONN_RETRIES
-                    );
-                    last_err = Some(e.to_string());
-                }
-                Err(_) => {
-                    warn!(
-                        "get_conn '{name}': attempt {attempt}/{} timed out after {}s",
-                        Self::DB_CONN_RETRIES,
-                        Self::DB_CONN_TIMEOUT.as_secs()
-                    );
-                    last_err = Some(format!(
-                        "timed out after {}s",
-                        Self::DB_CONN_TIMEOUT.as_secs()
-                    ));
-                }
+        let started = std::time::Instant::now();
+        let mut failures = 0;
+        let mut limit_waits = 0;
+        loop {
+            let err =
+                match tokio::time::timeout(Self::DB_CONN_TIMEOUT, self.tfdb.get_connection(name))
+                    .await
+                {
+                    Ok(Ok(conn)) => return Ok(conn),
+                    Ok(Err(DatabaseError::MySql(e)))
+                        if is_server_error(&e, ER_USER_LIMIT_REACHED) =>
+                    {
+                        if started.elapsed() >= Self::DB_CONN_LIMIT_WAIT {
+                            return Err(anyhow!(
+                                "Failed to acquire '{name}' database connection: still at the \
+                             connection limit after {}s ({e})",
+                                started.elapsed().as_secs()
+                            ));
+                        }
+                        limit_waits += 1;
+                        // 30s, doubling up to 5 min.
+                        let wait = Duration::from_secs((15u64 << limit_waits.min(5)).min(300));
+                        warn!(
+                            "get_conn '{name}': at the connection limit; waiting {}s",
+                            wait.as_secs()
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => format!("timed out after {}s", Self::DB_CONN_TIMEOUT.as_secs()),
+                };
+            failures += 1;
+            warn!(
+                "get_conn '{name}': attempt {failures}/{} failed: {err}",
+                Self::DB_CONN_RETRIES
+            );
+            if failures >= Self::DB_CONN_RETRIES {
+                return Err(anyhow!(
+                    "Failed to acquire '{name}' database connection after {} attempts ({err})",
+                    Self::DB_CONN_RETRIES
+                ));
             }
-            if attempt < Self::DB_CONN_RETRIES {
-                // Linear-ish backoff: 3s, 6s, 9s, …
-                tokio::time::sleep(Duration::from_secs(3 * attempt as u64)).await;
-            }
+            // Linear-ish backoff: 3s, 6s, 9s, …
+            tokio::time::sleep(Duration::from_secs(3 * failures as u64)).await;
         }
-        Err(anyhow!(
-            "Failed to acquire '{name}' database connection after {} attempts ({})",
-            Self::DB_CONN_RETRIES,
-            last_err.unwrap_or_else(|| "unknown error".to_string())
-        ))
     }
 
     pub async fn get_tooldb_conn(&self) -> Result<Conn> {
@@ -501,59 +538,66 @@ impl Baglama2 {
         placeholders
     }
 
-    async fn query_commons_repeat(
-        &self,
-        tables: &[&str],
-        sql: &str,
-        remaining_queries: &[String],
-    ) -> Result<Vec<String>> {
-        let mut attempts_left = 5;
-        loop {
-            if attempts_left == 0 {
-                break;
+    /// Runs a read query on the Commons cluster that holds `tables`, retrying
+    /// failures, and returns all rows.
+    ///
+    /// Each attempt sets MariaDB's `max_statement_time`, so the server ends a
+    /// query that runs too long and its connection is free again. A query the
+    /// client merely gives up on keeps running on the server and keeps holding
+    /// one of the tool's few connections, so retries would pile up until the
+    /// server refuses new ones (`max_user_connections`). The client-side
+    /// timeout is only a backstop, slightly longer than the server's limit.
+    pub async fn query_commons<T, P>(&self, tables: &[&str], sql: &str, params: P) -> Result<Vec<T>>
+    where
+        T: FromRow + Send + 'static,
+        P: Into<mysql_async::Params> + Clone + Send,
+    {
+        let attempts = Self::DB_QUERY_TIME_LIMITS.len();
+        let mut last_err = anyhow!("no attempt made");
+        for (attempt, &limit) in Self::DB_QUERY_TIME_LIMITS.iter().enumerate() {
+            if attempt > 0 {
+                warn!(
+                    "query_commons: attempt {attempt}/{attempts} failed ({last_err:#}); retrying"
+                );
+                self.hold_on().await;
             }
-            attempts_left -= 1;
             let mut conn = match self.get_commons_conn_for_tables(tables).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    if attempts_left == 0 {
-                        return Err(e);
-                    } else {
-                        continue;
-                    }
+                    last_err = e;
+                    continue;
                 }
             };
-            // Bound the whole exec+fetch: a Commons replica can accept the
-            // connection and then never return on a heavy join, which would
-            // hang the job indefinitely with no error.
+            if let Err(e) = conn
+                .query_drop(format!("SET SESSION max_statement_time={limit}"))
+                .await
+            {
+                // Not MariaDB, or the connection is broken; the client-side
+                // timeout still applies.
+                warn!("query_commons: cannot set max_statement_time: {e}");
+            }
             let query = async {
-                let result = conn.exec_iter(sql, remaining_queries.to_owned()).await?;
-                let rows = result.map_and_drop(from_row::<String>).await?;
-                Ok::<Vec<String>, mysql_async::Error>(rows)
+                let result = conn.exec_iter(sql, params.clone()).await?;
+                result.map_and_drop(from_row::<T>).await
             };
-            let query_result = match tokio::time::timeout(Self::DB_QUERY_TIMEOUT, query).await {
-                Ok(res) => res.map_err(anyhow::Error::from),
-                Err(_) => Err(anyhow!(
-                    "Commons query timed out after {}s",
-                    Self::DB_QUERY_TIMEOUT.as_secs()
-                )),
-            };
-            match query_result {
-                Ok(rows) => return Ok(rows),
-                Err(e) => {
-                    warn!(
-                        "query_commons_repeat: attempt failed ({e}); {attempts_left} attempts left"
+            let client_limit = Duration::from_secs(limit) + Self::DB_QUERY_CLIENT_GRACE;
+            match tokio::time::timeout(client_limit, query).await {
+                Ok(Ok(rows)) => return Ok(rows),
+                Ok(Err(e)) if is_server_error(&e, ER_STATEMENT_TIMEOUT) => {
+                    last_err = anyhow!("Commons query exceeded the server's {limit}s limit");
+                }
+                Ok(Err(e)) => last_err = e.into(),
+                Err(_) => {
+                    // The connection is mid-query; don't hand it back to the pool.
+                    tokio::spawn(conn.disconnect());
+                    last_err = anyhow!(
+                        "Commons query timed out client-side after {}s",
+                        client_limit.as_secs()
                     );
-                    if attempts_left == 0 {
-                        return Err(e);
-                    } else {
-                        drop(conn);
-                        continue;
-                    }
                 }
             }
         }
-        Ok(vec![])
+        Err(last_err.context(format!("Commons query failed after {attempts} attempts")))
     }
 
     // TESTED
@@ -587,7 +631,7 @@ impl Baglama2 {
                 placeholders
             );
             check = self
-                .query_commons_repeat(&["page", "categorylinks", "linktarget"], &sql, &remaining)
+                .query_commons(&["page", "categorylinks", "linktarget"], &sql, remaining)
                 .await?;
             if check.is_empty() {
                 break;
@@ -629,7 +673,11 @@ impl Baglama2 {
                 placeholders
             );
             let mut result = self
-                .query_commons_repeat(&["page", "categorylinks", "linktarget"], &sql, cats)
+                .query_commons(
+                    &["page", "categorylinks", "linktarget"],
+                    &sql,
+                    cats.to_vec(),
+                )
                 .await?;
             ret.append(&mut result);
         }
@@ -641,15 +689,12 @@ impl Baglama2 {
     /// Gets all images uploaded by a user
     pub async fn get_files_from_user_name(&self, user_name: &str) -> Result<Vec<String>> {
         let sql = "SELECT DISTINCT FROM_BASE64(TO_BASE64(img_name)) FROM image,actor,user WHERE img_actor=actor_id AND user_name=:user_name AND user_id=actor_user";
-        let mut conn = self
-            .get_commons_conn_for_tables(&["image", "actor", "user"])
-            .await?;
-        let results = conn
-            .exec_iter(sql, mysql_async::params! {user_name})
-            .await?
-            .map_and_drop(from_row::<String>)
-            .await?;
-        Ok(results)
+        self.query_commons(
+            &["image", "actor", "user"],
+            sql,
+            mysql_async::params! {user_name},
+        )
+        .await
     }
 
     // TESTED
@@ -912,6 +957,24 @@ mod tests {
             .await
             .unwrap();
         assert!(files.contains(&"2002-07_Sylt_-_Westerland_(panorama).jpg".to_string()));
+    }
+
+    // `query_commons` relies on the replica ending queries itself.
+    #[tokio::test]
+    async fn test_commons_max_statement_time() {
+        let baglama = Baglama2::new().await.unwrap();
+        let mut conn = baglama
+            .get_commons_conn_for_tables(&["page"])
+            .await
+            .unwrap();
+        conn.query_drop("SET SESSION max_statement_time=1")
+            .await
+            .unwrap();
+        let err = conn
+            .query_drop("SELECT COUNT(*) FROM page a, page b")
+            .await
+            .unwrap_err();
+        assert!(is_server_error(&err, ER_STATEMENT_TIMEOUT), "{err}");
     }
 
     #[tokio::test]

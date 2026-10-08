@@ -1,6 +1,5 @@
 use crate::Baglama2;
 use anyhow::Result;
-use mysql_async::from_row;
 use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -33,45 +32,11 @@ impl GlobalImageLinks {
         let placeholders = Baglama2::sql_placeholders(files.len());
         let sql = format!("SELECT gil_wiki,gil_page,gil_page_namespace_id,FROM_BASE64(TO_BASE64(gil_page_namespace)),FROM_BASE64(TO_BASE64(gil_page_title)),FROM_BASE64(TO_BASE64(gil_to)) FROM `globalimagelinks` WHERE `gil_to` IN ({})",placeholders);
 
-        let max_attempts = 5;
-        let mut last_error: Option<String> = None;
-        for attempt in 0..max_attempts {
-            if attempt > 0 {
-                baglama.hold_on().await;
-            }
-            // `globalimagelinks` moved to the Commons links cluster (`x4`);
-            // `for_tables` sends this to the pool that can read it.
-            let mut mysql_commons_conn = match baglama
-                .get_commons_conn_for_tables(&["globalimagelinks"])
-                .await
-            {
-                Ok(conn) => conn,
-                Err(e) => {
-                    last_error = Some(format!("Connection error: {e}"));
-                    continue;
-                }
-            };
-            let res = match mysql_commons_conn.exec_iter(&sql, files.to_owned()).await {
-                Ok(res) => res,
-                Err(e) => {
-                    last_error = Some(format!("Query error: {e}"));
-                    drop(mysql_commons_conn);
-                    continue;
-                }
-            };
-            match res.map_and_drop(from_row::<GlobalImageLinks>).await {
-                Ok(ret) => return Ok(ret),
-                Err(e) => {
-                    last_error = Some(format!("Mapping error: {e}"));
-                    drop(mysql_commons_conn);
-                    continue;
-                }
-            }
-        }
-        Err(anyhow::anyhow!(
-            "GlobalImageLinks::load failed after {max_attempts} attempts. Last error: {}",
-            last_error.unwrap_or_else(|| "Unknown".to_string())
-        ))
+        // `globalimagelinks` moved to the Commons links cluster (`x4`);
+        // `query_commons` sends this to the pool that can read it.
+        baglama
+            .query_commons(&["globalimagelinks"], &sql, files.to_vec())
+            .await
     }
 }
 

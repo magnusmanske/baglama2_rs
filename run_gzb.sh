@@ -25,6 +25,14 @@ run_job() { # name mem command...
 	echo "Started $name; follow with: tail -f ~/$name.err"
 }
 
+# Month jobs share the replicas' per-tool connection limit (10 per cluster),
+# so two at once starve each other. Prints running month jobs other than $1.
+other_month_jobs() {
+	toolforge jobs list | awk -F'|' -v self="$1" '
+		{ name = $2; gsub(/^ +| +$/, "", name) }
+		name != self && name ~ /^gzb-(monthly|[0-9lm]+-[0-9lm]+)$/ && $4 ~ /Running/ { print name }'
+}
+
 cmd=${1:-}
 case "$cmd" in
 check | month)
@@ -34,6 +42,12 @@ check | month)
 	if [ "$cmd" = check ]; then
 		run_job "gzb-check-$year-$month" 1Gi gzb_check "$year" "$month" "$@"
 	else
+		running=$(other_month_jobs "gzb-$year-$month")
+		if [ -n "$running" ]; then
+			echo "Not starting: month job(s) still running: $running" >&2
+			echo "Run months one at a time (replica connection limit; see GZB.md)." >&2
+			exit 1
+		fi
 		run_job "gzb-$year-$month" 3Gi gzb_month "$year" "$month" "$@"
 	fi
 	;;

@@ -120,10 +120,26 @@ The first run adds `'gzb'` to the `group_status.storage` enum (metadata-only
 ALTER).
 
 Job limits: 6 GiB / 3 CPU per job, 8 GiB for the tool, of which the
-webservice holds ~1.5 GiB. `month` jobs ask for 3 GiB, so two fit at once;
-`convert` asks for 5 GiB (giant legacy SQLite files), so it runs alone. A
-job that does not fit is not queued: `kubectl get events` shows
-"exceeded quota".
+webservice holds ~1.5 GiB. `month` jobs ask for 3 GiB, so two would fit in
+memory, but run them one at a time: `run_gzb.sh month` refuses to start
+while another month job (including `gzb-monthly`) is running. The replicas
+allow the tool 10 connections per cluster across all its jobs, and each
+month job uses up to 6 at once in phase 1. When 2026-06 and 2026-07 ran
+together, about 30 groups each failed with `max_user_connections` and
+600 s timeouts. `convert` asks for 5 GiB (giant legacy SQLite files), so it
+runs alone. A job that does not fit is not queued: `kubectl get events`
+shows "exceeded quota".
+
+Replica failures in phase 1 are handled in three places:
+- Every Commons query sets `max_statement_time`, so the server ends a query
+  that runs too long and frees its connection. The limit is 600 s and grows
+  by 300 s per retry, for up to 5 attempts. Before this, a query the client
+  gave up on kept running on the server and kept its connection, so retries
+  used up the connection limit.
+- A connection refused for `max_user_connections` is retried for up to an
+  hour, with waits of 30 s growing to 5 min.
+- Groups that still fail are retried once, one at a time, before the dump
+  scan. Whatever fails then is marked `FAILED` and listed again by a re-run.
 
 Memory, measured on a synthetic 7.3M-page group (the size of group 979,
 the largest): phase 3 peaks at 0.72 GB, down from 2.45 GB before per-page

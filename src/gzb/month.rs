@@ -205,6 +205,9 @@ impl GzbMonth {
         ] {
             let res = async {
                 let mut conn = self.baglama.get_commons_conn_for_tables(tables).await?;
+                // Long queries rely on the server ending them; see `query_commons`.
+                conn.query_drop("SET SESSION max_statement_time=600")
+                    .await?;
                 conn.query_drop("SELECT 1").await?;
                 Ok::<_, anyhow::Error>(())
             }
@@ -316,7 +319,25 @@ impl GzbMonth {
             plans.len() - to_list.len() - listed_before.len()
         );
 
-        let listed = self.phase_list_pages(&to_list).await;
+        let mut listed = self.phase_list_pages(&to_list, self.opts.list_jobs).await;
+        // Failures here are mostly the replicas being overloaded, often by the
+        // concurrency itself. One more pass, a group at a time, costs little
+        // next to re-running the month (which rescans the whole dump).
+        let retry: Vec<usize> = {
+            let ok: HashSet<usize> = listed.iter().copied().collect();
+            to_list
+                .iter()
+                .copied()
+                .filter(|id| !ok.contains(id))
+                .collect()
+        };
+        if !retry.is_empty() {
+            info!(
+                "Phase 1: retrying {} failed groups one at a time",
+                retry.len()
+            );
+            listed.extend(self.phase_list_pages(&retry, 1).await);
+        }
         let list_failed = to_list.len() - listed.len();
         let mut build: Vec<usize> = listed_before.into_iter().chain(listed).collect();
         build.sort();
@@ -397,13 +418,14 @@ impl GzbMonth {
     // Phase 1: page lists
     // ------------------------------------------------------------------
 
-    /// Returns the groups whose page list was written.
-    async fn phase_list_pages(&self, group_ids: &[usize]) -> Vec<usize> {
+    /// Lists pages for `group_ids`, `jobs` groups at a time. Returns the
+    /// groups whose page list was written.
+    async fn phase_list_pages(&self, group_ids: &[usize], jobs: usize) -> Vec<usize> {
         if group_ids.is_empty() {
             return vec![];
         }
         info!("Phase 1: listing pages for {} groups", group_ids.len());
-        let semaphore = Arc::new(Semaphore::new(self.opts.list_jobs.max(1)));
+        let semaphore = Arc::new(Semaphore::new(jobs.max(1)));
         let mut join_set = tokio::task::JoinSet::new();
         for (n, &group_id) in group_ids.iter().enumerate() {
             let permit = semaphore
