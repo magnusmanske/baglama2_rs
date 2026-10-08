@@ -59,7 +59,7 @@ When `SELECT storage,COUNT(*) FROM group_status GROUP BY storage` shows no
       chunk row counts are consistent. Once the sources are gone, a bad file
       cannot be regenerated.
 - [x] Set up an off-NFS backup of `viewdata/gzb/` (see 3) before deleting.
-- [x] Delete the legacy sources: `viewdata/<YYYYMM>/*.sqlite3`, the flat files
+- [ ] Delete the legacy sources: `viewdata/<YYYYMM>/*.sqlite3`, the flat files
       named in `group_status.file`, and the tool DB tables `group2view`,
       `views`, `gs2site` (34.6 GB), `pages`, `files` and `viewdata_*`.
 - [ ] Drop the `group_status.file` and `group_status.sqlite3` columns, and
