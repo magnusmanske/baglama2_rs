@@ -51,15 +51,15 @@ rollback path, so keep the conversion code until then.
 When `SELECT storage,COUNT(*) FROM group_status GROUP BY storage` shows no
 `file`, `sqlite3` or `mysql` rows:
 
-- [ ] Regenerate the `mysql2` months (2026-01, 2026-05) with `gzb_month`, so
+- [x] Regenerate the `mysql2` months (2026-01, 2026-05) with `gzb_month`, so
       no `mysql2` rows remain either.
-- [ ] **Add and run `gzb_verify` before deleting any source.** For every gzb
+- [x] **Add and run `gzb_verify` before deleting any source.** For every gzb
       file: it reads back, every chunk decompresses (gzip already has a CRC32
       per member), the header totals match `group_status.total_views`, and the
       chunk row counts are consistent. Once the sources are gone, a bad file
       cannot be regenerated.
-- [ ] Set up an off-NFS backup of `viewdata/gzb/` (see 3) before deleting.
-- [ ] Delete the legacy sources: `viewdata/<YYYYMM>/*.sqlite3`, the flat files
+- [x] Set up an off-NFS backup of `viewdata/gzb/` (see 3) before deleting.
+- [x] Delete the legacy sources: `viewdata/<YYYYMM>/*.sqlite3`, the flat files
       named in `group_status.file`, and the tool DB tables `group2view`,
       `views`, `gs2site` (34.6 GB), `pages`, `files` and `viewdata_*`.
 - [ ] Drop the `group_status.file` and `group_status.sqlite3` columns, and
