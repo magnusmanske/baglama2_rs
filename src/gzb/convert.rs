@@ -15,7 +15,6 @@
 //! storage, source`), which is all it takes to switch back.
 
 use super::*;
-use crate::db_mysql2::DbMySql2;
 use crate::Baglama2;
 use log::{error, info, warn};
 use mysql_async::prelude::*;
@@ -711,10 +710,26 @@ async fn convert_mysql(baglama: &Baglama2, job: &Job, out: &Path) -> Result<GzbH
 
 /// Undo the double UTF-8 encoding found in the tool DB's `pages.title`.
 fn repair_title(s: &str) -> String {
-    match DbMySql2::repair_double_encoding(s) {
+    match repair_double_encoding(s) {
         Some(fixed) => fixed,
         None => s.to_string(),
     }
+}
+
+/// If `s` looks like double-encoded UTF-8 — every char fits in a single
+/// byte and the resulting byte sequence is itself valid UTF-8 — return
+/// the repaired string. Pure ASCII returns an identical string, and
+/// correctly-stored multibyte UTF-8 returns `None`.
+fn repair_double_encoding(s: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let n = c as u32;
+        if n > 0xFF {
+            return None;
+        }
+        bytes.push(n as u8);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// PHP `urldecode`: `%XX` escapes and `+` as space.
@@ -745,6 +760,22 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_repair_double_encoding() {
+        // Classic Latin-1/UTF-8 double-encoding round-trips back to clean UTF-8.
+        assert_eq!(
+            repair_double_encoding("AlcalÃ¡"),
+            Some("Alcalá".to_string())
+        );
+        // Correctly-stored multibyte UTF-8 (char > 0xFF) is left alone.
+        assert_eq!(repair_double_encoding("北京"), None);
+        // ASCII maps to itself.
+        assert_eq!(
+            repair_double_encoding("Main_Page"),
+            Some("Main_Page".to_string())
+        );
+    }
 
     #[test]
     fn test_url_decode() {

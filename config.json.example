@@ -18,7 +18,5 @@
 		"max_connections": 20,
 		"keep_sec": 60
 	},
-	"max_concurrent_jobs": 10,
-	"sqlite_schema_file": "baglama.sqlite3_schema",
 	"sqlite_data_root_path": "viewdata"
 }

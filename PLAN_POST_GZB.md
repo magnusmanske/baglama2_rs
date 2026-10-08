@@ -1,15 +1,14 @@
 # Plan: after the gzb migration
 
-Written 2026-10-08. Nothing here is started yet.
+Written 2026-10-08.
 
 State at writing: all `file` group-months have been converted to `gzb`.
 `sqlite3` is in progress and `mysql` will follow. New months are generated
 with `gzb_month`. See [GZB.md](GZB.md) for running the pipeline and
 [GZB_TECHNICAL.md](GZB_TECHNICAL.md) for the format.
 
-Order of work: 1 can start now, whatever the state of the conversion.
-2 waits until conversion is complete and verified. The rest can go in
-whenever convenient.
+Order of work: 1 is done (2026-10-08). 2 waits until conversion is complete
+and verified. The rest can go in whenever convenient.
 
 ## 1. Retire the legacy generation pipelines
 
@@ -17,30 +16,32 @@ whenever convenient.
 roughly half the crate.
 
 Remove:
-- [ ] Commands in `src/main.rs`: `mysql2`, `mysql2_views`, `_run`, `_next`,
+- [x] Commands in `src/main.rs`: `mysql2`, `mysql2_views`, `_run`, `_next`,
       `_next_all`, `_next_all_seq`, `_backfill`, `_test`, plus
       `process_mysql2`, `process_mysql2_views` and `process_all_groups`.
-- [ ] `src/db_trait.rs`, `src/db_sqlite.rs`, `src/db_mysql2.rs` (about 2,000
+- [x] `src/db_trait.rs`, `src/db_sqlite.rs`, `src/db_mysql2.rs` (about 2,000
       lines).
-- [ ] Most of `src/group_date.rs`, plus `src/month_views.rs`,
-      `src/view_count.rs` and `src/pageviews/api_fallback.rs`. Check what is
-      still referenced before deleting.
-- [ ] Old launch scripts: `run_views.sh`, `run_single.sh`,
+- [x] `src/group_date.rs` (all of it), `src/month_views.rs`,
+      `src/view_count.rs` and `src/pageviews/api_fallback.rs`. Also
+      `src/file.rs`, `src/page.rs`, `src/row_group_status.rs`, the legacy
+      parts of `dump_reader.rs` and `Baglama2`, and seven dependencies.
+      Modules are now private, so rustc reports dead code.
+- [x] Old launch scripts: `run_views.sh`, `run_single.sh`,
       `run_single_wait.sh`, `restart.sh`.
 
 Keep: `src/gzb/`, `src/pageviews/dump_reader.rs`,
 `src/global_image_links.rs`, and whatever `Baglama2` needs for them.
 
 Before removing:
-- [ ] Move `DbMySql2::repair_double_encoding` into `src/gzb/`. It is a pure
+- [x] Move `DbMySql2::repair_double_encoding` into `src/gzb/`. It is a pure
       function and gzb's only dependency on `db_mysql2.rs` (used by
       `repair_title` in `convert.rs`).
-- [ ] **Check Toolforge for a stale `rustbot` job** (`toolforge jobs list`).
+- [x] **Check Toolforge for a stale `rustbot` job** (`toolforge jobs list`).
       `restart.sh` schedules `baglama2 next_all lm lm` for the 2nd of each
       month, but `next_all` no longer exists (only `_next_all`). If the job
       is still scheduled, it runs `deactivate_nonexistent_categories` and
-      then panics every month. Not verified; delete it with
-      `toolforge jobs delete rustbot`.
+      then panics every month. Checked 2026-10-08: not scheduled; only
+      `gzb-monthly` exists.
 
 ## 2. End of `gzb_convert`
 
@@ -67,7 +68,9 @@ When `SELECT storage,COUNT(*) FROM group_status GROUP BY storage` shows no
 - [ ] Remove `src/gzb/convert.rs`, the `gzb_convert` command, the
       `run_gzb.sh convert` case, the `rusqlite` dependency (its bundled SQLite
       build is a large share of compile time), `baglama.sqlite3_schema`, and
-      `sqlite_data_root_path`/`sqlite_schema_file` in `Baglama2`.
+      `sqlite_data_root_path` in `Baglama2`. Careful: without a
+      `gzb_data_root_path` key in `config.json`, the gzb root is
+      `<sqlite_data_root_path>/gzb`, so set that key first.
 - [ ] PHP (`glamtools`): remove the `file`, `sqlite3`, `mysql` and `mysql2`
       branches from `Baglama2Api.php`, so gzb is the only storage and the
       "Unknown storage type" failure mode goes away.

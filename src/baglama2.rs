@@ -1,24 +1,18 @@
 use crate::row_group::RowGroup;
-use crate::row_group_status::RowGroupStatus;
 use crate::DbId;
 use crate::GroupId;
 use crate::Site;
-use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use core::time::Duration;
 use log::{info, warn};
 use mysql_async::{from_row, prelude::*, Conn};
 
 use serde_json::Value;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use wikimisc::mediawiki::Api;
 use wikimisc::site_matrix::SiteMatrix;
 use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
@@ -54,7 +48,6 @@ fn is_server_error(e: &mysql_async::Error, code: u16) -> bool {
 pub struct Baglama2 {
     config: Value,
     tfdb: ToolforgeDB,
-    apis: Arc<Mutex<HashMap<String, Api>>>,
     sites_cache: Vec<Site>,
     site_matrix: SiteMatrix,
 }
@@ -96,7 +89,6 @@ impl Baglama2 {
         let mut ret = Self {
             config: config.clone(),
             tfdb: ToolforgeDB::default(),
-            apis: Arc::new(Mutex::new(HashMap::new())),
             sites_cache: vec![],
             site_matrix: SiteMatrix::new(&wikidata_api).await?,
         };
@@ -119,40 +111,6 @@ impl Baglama2 {
         ret.populate_sites().await?;
         info!("Baglama2::new: ready");
         Ok(ret)
-    }
-
-    async fn api(&self, wiki: &str) -> Option<Api> {
-        match self.apis.lock().await.entry(wiki.to_string()) {
-            Entry::Occupied(e) => {
-                let api: &Api = e.get();
-                Some(api.clone())
-            }
-            Entry::Vacant(entry) => {
-                let namespaces = self.add_api(wiki).await?;
-                let api = entry.insert(namespaces);
-                Some(api.clone())
-            }
-        }
-    }
-
-    async fn add_api(&self, wiki: &str) -> Option<Api> {
-        let server = self.site_matrix.get_server_url_for_wiki(wiki).ok()?;
-        let url = format!("{server}/w/api.php");
-        let api = Api::new(&url).await.ok()?;
-        Some(api)
-    }
-
-    pub fn config(&self) -> &Value {
-        &self.config
-    }
-
-    pub fn sqlite_schema_file(&self) -> String {
-        self.config
-            .get("sqlite_schema_file")
-            .expect("sqlite_schema_file not found")
-            .as_str()
-            .expect("sqlite_schema_file not found")
-            .to_string()
     }
 
     pub fn sqlite_data_root_path(&self) -> String {
@@ -403,7 +361,7 @@ impl Baglama2 {
     }
 
     async fn populate_sites(&mut self) -> Result<()> {
-        let sql = "SELECT id,grok_code,server,giu_code,project,language,name FROM `sites`";
+        let sql = "SELECT id,server,giu_code FROM `sites`";
         self.sites_cache = self
             .get_tooldb_conn()
             .await?
@@ -486,49 +444,6 @@ impl Baglama2 {
             .map_and_drop(from_row::<RowGroup>)
             .await?;
         Ok(groups.first().map(|group| group.to_owned()))
-    }
-
-    // TESTED
-    pub async fn get_group_status(
-        &self,
-        group_id: &GroupId,
-        ym: &YearMonth,
-    ) -> Result<Option<RowGroupStatus>> {
-        let sql = format!(
-            "SELECT {} FROM `group_status` WHERE group_id=? AND year=? AND month=?",
-            RowGroupStatus::sql_all()
-        );
-        let sites: Vec<RowGroupStatus> = self
-            .get_tooldb_conn()
-            .await?
-            .exec_iter(sql, (group_id.get(), ym.year(), ym.month()))
-            .await?
-            .map_and_drop(from_row::<RowGroupStatus>)
-            .await?;
-        let ret = sites.first().map(|x| x.to_owned());
-        Ok(ret)
-    }
-
-    async fn get_namespace_prefix(&self, wiki: &str, namespace_id: i32) -> Option<String> {
-        self.api(wiki)
-            .await?
-            .get_canonical_namespace_name(namespace_id.into())
-            .map(|s| s.to_string())
-    }
-
-    // TESTED
-    pub async fn prefix_with_namespace(
-        &self,
-        title: &str,
-        namespace_id: i32,
-        wiki: &str,
-    ) -> Option<String> {
-        let prefix = self.get_namespace_prefix(wiki, namespace_id).await?;
-        if prefix.is_empty() {
-            Some(title.to_string())
-        } else {
-            Some(format!("{prefix}:{title}"))
-        }
     }
 
     // TESTED
@@ -697,75 +612,15 @@ impl Baglama2 {
         .await
     }
 
-    // TESTED
-    pub async fn get_next_group_id(
-        &self,
-        year: i32,
-        month: u32,
-        requires_previous_date: bool,
-    ) -> Option<DbId> {
-        let mut conn = self.get_tooldb_conn().await.ok()?;
-        let mut sql = "SELECT id FROM groups WHERE is_active=1".to_string();
-        sql += " AND NOT EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND year=:year AND month=:month)";
-        // Backfilling
-        if requires_previous_date {
-            sql += " AND EXISTS (SELECT * FROM group_status WHERE groups.id=group_id AND (year<:year OR (year=:year AND month<:month)))";
-        }
-        sql += " ORDER BY rand() LIMIT 1";
-        let results = conn
-            .exec_iter(sql, mysql_async::params!(year, month))
-            .await
-            .ok()?
-            .map_and_drop(from_row::<DbId>)
-            .await
-            .ok()?;
-        results.first().map(|id| id.to_owned())
-    }
-
-    pub async fn clear_incomplete_group_status(&self, year: i32, month: u32) -> Result<()> {
-        let sql = "DELETE FROM group_status WHERE year=:year AND month=:month AND status!='VIEW DATA COMPLETE'" ;
-        self.get_tooldb_conn()
-            .await?
-            .exec_drop(sql, mysql_async::params! {year,month})
-            .await?;
-        Ok(())
-    }
-
     pub async fn hold_on(&self) {
         let secs = self.config["hold_on"].as_u64().unwrap_or(5);
         // thread::sleep(time::Duration::from_secs(secs));
         tokio::time::sleep(Duration::from_secs(secs)).await;
     }
-
-    pub async fn set_group_status(
-        &self,
-        group_id: GroupId,
-        ym: &YearMonth,
-        status: &str,
-        total_views: usize,
-        sqlite_filename: &str,
-    ) -> Result<()> {
-        let mut mysql_connection = self.get_tooldb_conn().await?;
-        let group_id = group_id.get();
-        let year = ym.year();
-        let month = ym.month();
-        let sql = "INSERT INTO `group_status` (group_id,year,month,status,total_views,sqlite3)
-        	VALUES (:group_id,:year,:month,:status,:total_views,:sqlite_filename)
-         	ON DUPLICATE KEY UPDATE status=:status,total_views=:total_views,sqlite3=:sqlite_filename";
-        let _ = mysql_connection
-            .exec_drop(
-                sql,
-                mysql_async::params! {group_id,year,month,status,total_views,sqlite_filename},
-            )
-            .await;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::row_group_status::StorageType;
-
     use super::*;
 
     #[test]
@@ -933,13 +788,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_next_group_id() {
-        let baglama = Baglama2::new().await.unwrap();
-        let ng = baglama.get_next_group_id(2014, 1, false).await;
-        assert!(ng.is_some());
-    }
-
-    #[tokio::test]
     async fn test_get_pages_in_category() {
         let baglama = Baglama2::new().await.unwrap();
         let images = baglama
@@ -975,39 +823,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is_server_error(&err, ER_STATEMENT_TIMEOUT), "{err}");
-    }
-
-    #[tokio::test]
-    async fn test_prefix_with_namespace() {
-        let baglama = Baglama2::new().await.unwrap();
-        assert_eq!(
-            baglama
-                .prefix_with_namespace("Magnus Manske", 2, "enwiki")
-                .await
-                .unwrap(),
-            "User:Magnus Manske".to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_group_status() {
-        let baglama = Baglama2::new().await.unwrap();
-        let expected = Some(RowGroupStatus {
-            id: 62776,
-            group_id: 782,
-            year: 2022,
-            month: 10,
-            status: "VIEW DATA COMPLETE".to_string(),
-            total_views: Some(2062290),
-            file: None,
-            sqlite3: Some("/data/project/glamtools/viewdata/202210/782.sqlite3".to_string()),
-            storage: StorageType::Sqlite3,
-        });
-        let gs = baglama
-            .get_group_status(&782.try_into().unwrap(), &YearMonth::new(2022, 10).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(gs, expected);
     }
 
     #[tokio::test]

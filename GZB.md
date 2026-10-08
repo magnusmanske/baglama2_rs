@@ -85,7 +85,8 @@ Freeing the space is a separate, manual step once you are happy:
 `viewdata/<YYYYMM>/*.sqlite3` per converted month, and for the `mysql` era
 the tool DB tables `group2view`, `views`, `gs2site` (34.6 GB) once
 `SELECT COUNT(*) FROM group_status WHERE storage='mysql'` is 0. `pages`,
-`files` and the `viewdata_*` tables are only used by the `mysql2` pipeline.
+`files` and the `viewdata_*` tables were only used by the `mysql2` pipeline,
+which has been removed; nothing reads them now.
 
 `mysql2` months (2026-01, 2026-05; 2025-12 was dropped) are not convertible
 — no views. Regenerate them with `gzb_month 2026 1` etc.; page lists then

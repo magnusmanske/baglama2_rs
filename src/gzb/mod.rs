@@ -262,8 +262,9 @@ impl GzbWriter {
     }
 
     /// Add one site. Rows are sorted here; files per row are de-duplicated.
-    /// `summary` overrides the computed `(pages, views)` — used when converting
-    /// legacy data, whose stored per-site totals are what users have seen.
+    /// `summary` overrides the computed `(pages, views)`. Real writers use
+    /// [`Self::add_site_sorted`]; this builds test files.
+    #[cfg(test)]
     pub fn add_site(
         &mut self,
         giu: &str,
@@ -575,10 +576,6 @@ impl ViewTable {
         self.keys.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
     /// `(key, views)` for every page with views.
     pub fn with_views(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
         self.keys
@@ -736,7 +733,7 @@ mod tests {
         assert_eq!(nonzero, vec![(0, 1), (a, u32::MAX), (u64::MAX, 2)]);
         let back = ViewTable::from_pairs(nonzero);
         assert_eq!((back.get(u64::MAX), back.get(b), back.len()), (2, 0, 3));
-        assert!(ViewTable::from_keys(vec![]).is_empty());
+        assert_eq!(ViewTable::from_keys(vec![]).len(), 0);
         assert_eq!(ViewTable::from_keys(vec![]).get(a), 0);
     }
 
