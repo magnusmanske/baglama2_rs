@@ -4,8 +4,10 @@
 use crate::config::Config;
 use anyhow::{anyhow, Result};
 use log::warn;
-use mysql_async::{from_row_opt, prelude::*, Conn, FromRowError, Row};
+use mysql_async::{from_row_opt, prelude::*, Conn};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
 
 /// The wiki whose replica databases this tool reads. Baglama only queries
@@ -216,7 +218,41 @@ impl Db {
     }
 
     /// Runs a read query on the Commons cluster that holds `tables`, retrying
-    /// failures, and returns all rows.
+    /// failures, and returns all rows. See [`Self::fold_commons`].
+    pub async fn query_commons<T, P>(&self, tables: &[&str], sql: &str, params: P) -> Result<Vec<T>>
+    where
+        T: FromRow + Send + 'static,
+        P: Into<mysql_async::Params> + Clone + Send,
+    {
+        self.fold_commons(tables, sql, params, Vec::new, |rows, row| {
+            rows.push(row);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Runs a read query and calls `f` for each row as it arrives, so the
+    /// result is never held in memory. A failed attempt is retried from the
+    /// start, so `f` can see a row again; callers must tolerate that. An
+    /// error from `f` ends the query and is not retried.
+    pub async fn query_commons_each<T, P, F>(
+        &self,
+        tables: &[&str],
+        sql: &str,
+        params: P,
+        mut f: F,
+    ) -> Result<()>
+    where
+        T: FromRow + Send + 'static,
+        P: Into<mysql_async::Params> + Clone + Send,
+        F: FnMut(T) -> Result<()>,
+    {
+        self.fold_commons(tables, sql, params, || (), |(), row| f(row))
+            .await
+    }
+
+    /// The Commons read queries: every attempt starts from `init()` and
+    /// folds each row into it with `step`, as the rows stream in.
     ///
     /// Each attempt sets MariaDB's `max_statement_time`, so the server ends a
     /// query that runs too long and its connection is free again. A query the
@@ -224,10 +260,19 @@ impl Db {
     /// one of the tool's few connections, so retries would pile up until the
     /// server refuses new ones (`max_user_connections`). The client-side
     /// timeout is only a backstop, slightly longer than the server's limit.
-    pub async fn query_commons<T, P>(&self, tables: &[&str], sql: &str, params: P) -> Result<Vec<T>>
+    async fn fold_commons<T, P, A, I, S>(
+        &self,
+        tables: &[&str],
+        sql: &str,
+        params: P,
+        init: I,
+        mut step: S,
+    ) -> Result<A>
     where
         T: FromRow + Send + 'static,
         P: Into<mysql_async::Params> + Clone + Send,
+        I: Fn() -> A,
+        S: FnMut(&mut A, T) -> Result<()>,
     {
         let attempts = Self::DB_QUERY_TIME_LIMITS.len();
         let mut last_err = anyhow!("no attempt made");
@@ -253,28 +298,34 @@ impl Db {
                 // timeout still applies.
                 warn!("query_commons: cannot set max_statement_time: {e}");
             }
-            // Rows are converted as they stream in, so a big result is held
-            // once, not as raw rows and again as `T`.
             let query = async {
-                let result = conn.exec_iter(sql, params.clone()).await?;
-                result
-                    .reduce_and_drop(
-                        Ok(Vec::new()),
-                        |acc: Result<Vec<T>, FromRowError>, row: Row| {
-                            let mut rows = acc?;
-                            rows.push(from_row_opt::<T>(row)?);
-                            Ok(rows)
-                        },
-                    )
-                    .await
+                let mut result = conn.exec_iter(sql, params.clone()).await?;
+                let mut acc = init();
+                let mut failed: Option<anyhow::Error> = None;
+                while let Some(row) = result.next().await? {
+                    let outcome = match from_row_opt::<T>(row) {
+                        Ok(row) => step(&mut acc, row),
+                        // A row that does not fit `T` will not fit on a retry
+                        // either. An error, not a panic: only this group fails.
+                        Err(e) => Err(anyhow!("Commons query returned an unexpected row: {e}")),
+                    };
+                    if let Err(e) = outcome {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+                Ok::<_, mysql_async::Error>(match failed {
+                    Some(e) => Err(e),
+                    None => Ok(acc),
+                })
             };
             let client_limit = Duration::from_secs(limit) + Self::DB_QUERY_CLIENT_GRACE;
             match tokio::time::timeout(client_limit, query).await {
-                Ok(Ok(rows)) => {
-                    // A row that does not fit `T` will not fit on a retry
-                    // either. An error, not a panic: only this group fails.
-                    return rows
-                        .map_err(|e| anyhow!("Commons query returned an unexpected row: {e}"));
+                Ok(Ok(Ok(acc))) => return Ok(acc),
+                Ok(Ok(Err(e))) => {
+                    // Rows may be pending; don't hand the connection back.
+                    tokio::spawn(conn.disconnect());
+                    return Err(e);
                 }
                 Ok(Err(e)) if is_server_error(&e, ER_STATEMENT_TIMEOUT) => {
                     last_err = anyhow!("Commons query exceeded the server's {limit}s limit");
@@ -291,6 +342,64 @@ impl Db {
             }
         }
         Err(last_err.context(format!("Commons query failed after {attempts} attempts")))
+    }
+
+    /// Server-side time limit for a streamed query ([`Self::stream_commons`]).
+    /// The statement stays open while the caller works through the rows,
+    /// which for the largest groups takes hours; the connection is in use
+    /// the whole time, not abandoned, so the limit is only a backstop.
+    const DB_STREAM_TIME_LIMIT_SECS: u64 = 6 * 60 * 60;
+
+    /// Runs a read query in a background task and hands the rows over a
+    /// channel holding at most `buffer` of them, so the caller can run its
+    /// own queries between rows while the result is never held in memory
+    /// (a single Commons category can have millions of files).
+    ///
+    /// No retry: a failure arrives as an `Err` and ends the stream; the
+    /// caller's unit of work (a group) is what gets retried.
+    pub fn stream_commons<T, P>(
+        self: &Arc<Self>,
+        tables: &[&str],
+        sql: &str,
+        params: P,
+        buffer: usize,
+    ) -> Result<mpsc::Receiver<Result<T>>>
+    where
+        T: FromRow + Send + 'static,
+        P: Into<mysql_async::Params> + Send + 'static,
+    {
+        let pool_key = Self::commons_pool_key_for_tables(tables)?;
+        let (tx, rx) = mpsc::channel(buffer);
+        let db = Arc::clone(self);
+        let sql = sql.to_string();
+        tokio::spawn(async move {
+            let outcome: Result<()> = async {
+                let mut conn = db.get_conn_with_timeout(pool_key).await?;
+                conn.query_drop(format!(
+                    "SET SESSION max_statement_time={}",
+                    Self::DB_STREAM_TIME_LIMIT_SECS
+                ))
+                .await?;
+                let mut result = conn.exec_iter(sql, params).await?;
+                while let Some(row) = result.next().await? {
+                    let row = from_row_opt::<T>(row)
+                        .map_err(|e| anyhow!("Commons query returned an unexpected row: {e}"))?;
+                    if tx.send(Ok(row)).await.is_err() {
+                        // The receiver is gone; abandon the statement rather
+                        // than read the rest of it.
+                        drop(result);
+                        tokio::spawn(conn.disconnect());
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = outcome {
+                let _ = tx.send(Err(e)).await;
+            }
+        });
+        Ok(rx)
     }
 
     /// Pause between retries, `hold_on` seconds from the config.

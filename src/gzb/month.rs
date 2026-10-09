@@ -590,9 +590,10 @@ async fn list_pages(
     );
     let mut rows = 0u64;
     let mut batches = FileBatches::default();
-    // Files flow from the category queries into the usage queries a batch at
-    // a time; what stays in memory is the set of file names seen, not the
-    // lists of the largest groups (4.2M files for "Pronunciation").
+    // Files stream from the category queries into the usage queries a batch
+    // at a time, and usages stream into the page list row by row; what stays
+    // in memory is the set of file names seen, not the lists of the largest
+    // groups (4.8M files for "Uploaded with OpenRefine").
     match group.source() {
         GroupSource::Uploader(name) => {
             for file in baglama.get_files_from_user_name(name).await? {
@@ -609,8 +610,9 @@ async fn list_pages(
                 categories.len()
             );
             for chunk in categories.chunks(IN_CHUNK) {
-                for file in baglama.files_in_categories(chunk).await? {
-                    if let Some(batch) = batches.push(file) {
+                let mut files = baglama.stream_files_in_categories(chunk)?;
+                while let Some(file) = files.recv().await {
+                    if let Some(batch) = batches.push(file?) {
                         rows += write_usages(&mut enc, &batch, baglama).await?;
                     }
                 }
@@ -672,7 +674,7 @@ async fn write_usages<W: Write>(enc: &mut W, files: &[String], baglama: &Baglama
         return Ok(0);
     }
     let mut rows = 0;
-    for gil in GlobalImageLinks::load(files, baglama.db()).await? {
+    GlobalImageLinks::for_each(files, baglama.db(), |gil| {
         writeln!(
             enc,
             "{}\t{}\t{}\t{}",
@@ -682,7 +684,9 @@ async fn write_usages<W: Write>(enc: &mut W, files: &[String], baglama: &Baglama
             gil.to
         )?;
         rows += 1;
-    }
+        Ok(())
+    })
+    .await?;
     Ok(rows)
 }
 

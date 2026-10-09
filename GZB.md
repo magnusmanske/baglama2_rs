@@ -51,9 +51,15 @@ the same command:
    "Armenia" at depth 20 made the 2026-01 run run out of memory: Commons
    categories link widely, so deep trees reach much of Commons. The legacy
    pipelines did walk them fully (that group's 2021-08 file is 304 MB).
-   Even at depth 5 a group can be huge ("Pronunciation": 4.2M files), so
-   files stream from the category queries into the `globalimagelinks`
-   queries in batches of 3,000; only the set of file names seen is held.
+   Even at depth 5 a group can be huge ("Pronunciation": 4.2M files;
+   "Uploaded with OpenRefine": 4.8M files in 3 categories), so nothing
+   holds a group's file list: the file query streams its rows over a
+   channel (`Db::stream_commons`), they are de-duplicated and passed to
+   the `globalimagelinks` queries in batches of 3,000, and the usages
+   stream straight into the page list. What stays in memory per group is
+   the set of file names seen (~120 MB per million). Those queries use no
+   `DISTINCT`: the client de-duplicates, and a server-side sort of millions
+   of rows held them up (and ran into the 600 s limit).
    Category titles go into `IN (…)` lists of 1,000 (`IN_CHUNK`): MySQL
    allows 65,535 placeholders per statement, and a tree level can exceed
    that (group 903 did in 2026-01). While phases 1–3 run, a `memory: N MB

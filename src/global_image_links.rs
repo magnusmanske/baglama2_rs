@@ -25,17 +25,35 @@ impl GlobalImageLinks {
         title.replace(' ', "_")
     }
 
-    pub async fn load(files: &[String], db: &Db) -> Result<Vec<GlobalImageLinks>> {
+    /// Calls `f` for each usage of `files` as the rows arrive, so a batch
+    /// with a widely used file (millions of usages) is never held in memory.
+    /// On a retried query `f` can see a usage twice; the page list tolerates
+    /// duplicate rows.
+    pub async fn for_each<F>(files: &[String], db: &Db, f: F) -> Result<()>
+    where
+        F: FnMut(GlobalImageLinks) -> Result<()>,
+    {
         if files.is_empty() {
-            return Ok(vec![]);
+            return Ok(());
         }
         let placeholders = sql_placeholders(files.len());
         let sql = format!("SELECT gil_wiki,gil_page_namespace_id,FROM_BASE64(TO_BASE64(gil_page_namespace)),FROM_BASE64(TO_BASE64(gil_page_title)),FROM_BASE64(TO_BASE64(gil_to)) FROM `globalimagelinks` WHERE `gil_to` IN ({})",placeholders);
 
         // `globalimagelinks` moved to the Commons links cluster (`x4`);
-        // `query_commons` sends this to the pool that can read it.
-        db.query_commons(&["globalimagelinks"], &sql, files.to_vec())
+        // `query_commons_each` sends this to the pool that can read it.
+        db.query_commons_each(&["globalimagelinks"], &sql, files.to_vec(), f)
             .await
+    }
+
+    #[cfg(test)]
+    pub async fn load(files: &[String], db: &Db) -> Result<Vec<GlobalImageLinks>> {
+        let mut usages = vec![];
+        Self::for_each(files, db, |gil| {
+            usages.push(gil);
+            Ok(())
+        })
+        .await?;
+        Ok(usages)
     }
 }
 
