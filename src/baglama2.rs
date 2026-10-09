@@ -4,7 +4,7 @@ use crate::row_group::RowGroup;
 use crate::DbId;
 use crate::Site;
 use anyhow::{anyhow, Result};
-use log::{info, warn};
+use log::{error, info, warn};
 use mysql_async::{from_row, prelude::*};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -80,6 +80,34 @@ fn site_names_to_fill(
     ret
 }
 
+/// Most groups [`Baglama2::deactivate_nonexistent_categories`] switches off
+/// in one run. Categories rarely disappear; many missing at once means the
+/// Commons lookup went wrong (a replica problem, another table split).
+const MAX_DEACTIVATIONS: usize = 20;
+
+/// The `(id, category)` groups whose category is not in `existing`, or an
+/// error if there are more than `max`.
+fn groups_to_deactivate(
+    groups: &[(DbId, String)],
+    existing: &HashSet<String>,
+    max: usize,
+) -> Result<Vec<(DbId, String)>> {
+    let gone: Vec<(DbId, String)> = groups
+        .iter()
+        .filter(|(_, category)| !existing.contains(category))
+        .cloned()
+        .collect();
+    if gone.len() > max {
+        return Err(anyhow!(
+            "{} of {} categories not found on Commons, more than the limit of {max}; \
+             check the lookup before trusting that",
+            gone.len(),
+            groups.len()
+        ));
+    }
+    Ok(gone)
+}
+
 #[derive(Debug)]
 pub struct Baglama2 {
     config: Config,
@@ -138,49 +166,54 @@ impl Baglama2 {
         host.strip_suffix(".org").map(|s| s.to_string())
     }
 
+    /// Switches off groups whose category no longer exists on Commons.
+    ///
+    /// Nothing switches groups back on, so this refuses to act on more than
+    /// [`MAX_DEACTIVATIONS`] at once; see [`groups_to_deactivate`].
     pub async fn deactivate_nonexistent_categories(&self) -> Result<()> {
         let sql = format!(
             "{} WHERE is_user_name=0 AND is_active=1",
             RowGroup::sql_select()
         );
         info!("deactivate_nonexistent_categories: querying active groups from tool DB");
-        let groups = self
+        let groups: Vec<(DbId, String)> = self
             .db
             .get_tooldb_conn()
             .await?
             .exec_iter(sql, ())
             .await?
             .map_and_drop(from_row::<RowGroup>)
-            .await?;
-        let active_categories = groups
-            .iter()
-            .map(|group| group.category().to_owned())
-            .collect::<Vec<String>>();
-        info!(
-            "deactivate_nonexistent_categories: {} active categories; checking existence on Commons",
-            active_categories.len()
-        );
-        let existing_categories = self.get_existing_categories(&active_categories).await?;
+            .await?
+            .into_iter()
+            .map(|group| (group.id(), group.category().to_owned()))
+            .collect();
+        let categories: Vec<String> = groups.iter().map(|(_, cat)| cat.clone()).collect();
+        let existing: HashSet<String> = self
+            .get_existing_categories(&categories)
+            .await?
+            .into_iter()
+            .collect();
         info!(
             "deactivate_nonexistent_categories: {} of {} categories exist on Commons",
-            existing_categories.len(),
-            active_categories.len()
+            existing.len(),
+            groups.len()
         );
-        let non_existing_categories = active_categories
-            .iter()
-            .filter(|category| !existing_categories.contains(*category))
-            .cloned()
-            .collect::<Vec<String>>();
-        let groups_to_deactivate = groups
-            .iter()
-            .filter(|group| non_existing_categories.contains(group.category()))
-            .map(|group| group.id())
-            .collect::<Vec<DbId>>();
-        if groups_to_deactivate.is_empty() {
+        let gone = match groups_to_deactivate(&groups, &existing, MAX_DEACTIVATIONS) {
+            Ok(gone) => gone,
+            Err(e) => {
+                // Not fatal: the month runs with the groups as they are.
+                error!("deactivate_nonexistent_categories: {e:#}; deactivating none");
+                return Ok(());
+            }
+        };
+        for (id, category) in &gone {
+            warn!("deactivating group {id}: Category:{category} does not exist on Commons");
+        }
+        if gone.is_empty() {
             return Ok(());
         }
-        self.deactivate_groups(&groups_to_deactivate).await?;
-        Ok(())
+        let ids: Vec<DbId> = gone.iter().map(|(id, _)| *id).collect();
+        self.deactivate_groups(&ids).await
     }
 
     async fn deactivate_groups(&self, group_ids: &[DbId]) -> Result<()> {
@@ -288,26 +321,40 @@ impl Baglama2 {
         Ok(())
     }
 
+    /// Adds the wikis that the `sites` table does not have yet.
+    ///
+    /// Only new ones are sent: InnoDB reserves an auto-increment ID for every
+    /// row of a multi-row `INSERT IGNORE`, including the ignored ones, so
+    /// sending all ~1,100 wikis each run used up that many IDs.
     async fn ensure_sites_in_tooldb(
         &self,
         sites: Vec<(String, String, String, String)>,
     ) -> Result<()> {
-        let params = sites
-            .iter()
-            .flat_map(|(server, giu_code, project, language)| [server, giu_code, project, language])
-            .collect::<Vec<_>>();
-        let placeholder = "(?,?,?,?)".to_string();
-        let mut placeholders: Vec<String> = Vec::new();
-        placeholders.resize(sites.len(), placeholder);
-        let placeholders = placeholders.join(",");
+        let mut conn = self.db.get_tooldb_conn().await?;
+        let known: HashSet<String> = conn
+            .query::<String, _>("SELECT giu_code FROM `sites`")
+            .await?
+            .into_iter()
+            .collect();
+        let new: Vec<_> = sites
+            .into_iter()
+            .filter(|(_, giu_code, _, _)| !known.contains(giu_code))
+            .collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        info!("update_sites: adding {} new wikis", new.len());
+        // IGNORE still covers a new wiki that clashes on `server` or
+        // `(project, language)`.
+        let placeholders = vec!["(?,?,?,?)"; new.len()].join(",");
         let sql = format!(
             "INSERT IGNORE INTO `sites` (server,giu_code,project,language) VALUES {placeholders}"
         );
-        self.db
-            .get_tooldb_conn()
-            .await?
-            .exec_drop(sql, params)
-            .await?;
+        let params = new
+            .iter()
+            .flat_map(|(server, giu_code, project, language)| [server, giu_code, project, language])
+            .collect::<Vec<_>>();
+        conn.exec_drop(sql, params).await?;
         Ok(())
     }
 
@@ -491,6 +538,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_groups_to_deactivate() {
+        let groups: Vec<(DbId, String)> = (1..=30).map(|i| (i, format!("Cat {i}"))).collect();
+        let all: HashSet<String> = groups.iter().map(|(_, c)| c.clone()).collect();
+        assert!(groups_to_deactivate(&groups, &all, 20).unwrap().is_empty());
+        let mut some = all.clone();
+        some.remove("Cat 7");
+        assert_eq!(
+            groups_to_deactivate(&groups, &some, 20).unwrap(),
+            vec![(7, "Cat 7".to_string())]
+        );
+        // An empty lookup result would switch off everything: refused.
+        assert!(groups_to_deactivate(&groups, &HashSet::new(), 20).is_err());
+        assert_eq!(
+            groups_to_deactivate(&groups, &HashSet::new(), 30)
+                .unwrap()
+                .len(),
+            30
+        );
+    }
+
     fn test_matrix() -> Value {
         serde_json::json!({"sitematrix": {
             "count": 5,
@@ -553,6 +621,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_get_sites() {
         let baglama = Baglama2::new(Config::load().unwrap()).await.unwrap();
         let sites1 = baglama.get_sites().unwrap(); // Raw
@@ -564,6 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_get_pages_in_category() {
         let baglama = Baglama2::new(Config::load().unwrap()).await.unwrap();
         let images = baglama
@@ -574,6 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_get_files_from_user_name() {
         let baglama = Baglama2::new(Config::load().unwrap()).await.unwrap();
         let files = baglama

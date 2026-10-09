@@ -23,8 +23,14 @@ impl FromRow for Site {
         Self: Sized,
     {
         Ok(Self {
-            server: row.get(0).unwrap(),
-            giu_code: row.get(1).unwrap(),
+            server: row
+                .get_opt(0)
+                .and_then(Result::ok)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            giu_code: row
+                .get_opt(1)
+                .and_then(Result::ok)
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
         })
     }
 }

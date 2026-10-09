@@ -78,6 +78,7 @@ mod tests {
     use crate::config::Config;
 
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_load() {
         let db = Db::new(&Config::load().unwrap()).unwrap();
         let group = RowGroup::load(&db, 1255.try_into().unwrap())
@@ -91,6 +92,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_load_utf8() {
         let db = Db::new(&Config::load().unwrap()).unwrap();
         let group = RowGroup::load(&db, 292.try_into().unwrap())

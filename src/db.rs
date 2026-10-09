@@ -4,7 +4,7 @@
 use crate::config::Config;
 use anyhow::{anyhow, Result};
 use log::warn;
-use mysql_async::{from_row, prelude::*, Conn};
+use mysql_async::{from_row_opt, prelude::*, Conn};
 use std::time::Duration;
 use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
 
@@ -253,11 +253,18 @@ impl Db {
             }
             let query = async {
                 let result = conn.exec_iter(sql, params.clone()).await?;
-                result.map_and_drop(from_row::<T>).await
+                result.map_and_drop(from_row_opt::<T>).await
             };
             let client_limit = Duration::from_secs(limit) + Self::DB_QUERY_CLIENT_GRACE;
             match tokio::time::timeout(client_limit, query).await {
-                Ok(Ok(rows)) => return Ok(rows),
+                Ok(Ok(rows)) => {
+                    // A row that does not fit `T` will not fit on a retry
+                    // either. An error, not a panic: only this group fails.
+                    return rows
+                        .into_iter()
+                        .collect::<Result<Vec<T>, _>>()
+                        .map_err(|e| anyhow!("Commons query returned an unexpected row: {e}"));
+                }
                 Ok(Err(e)) if is_server_error(&e, ER_STATEMENT_TIMEOUT) => {
                     last_err = anyhow!("Commons query exceeded the server's {limit}s limit");
                 }
@@ -362,6 +369,7 @@ mod tests {
 
     // Pooled connections come back as latin1; see `get_tooldb_conn`.
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_tooldb_conn_utf8_after_reuse() {
         let db = Db::new(&Config::load().unwrap()).unwrap();
         for _ in 0..3 {
@@ -376,6 +384,7 @@ mod tests {
 
     // `query_commons` relies on the replica ending queries itself.
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_commons_max_statement_time() {
         let db = Db::new(&Config::load().unwrap()).unwrap();
         let mut conn = db.get_commons_conn_for_tables(&["page"]).await.unwrap();

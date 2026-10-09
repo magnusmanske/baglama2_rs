@@ -71,6 +71,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_load() {
         let db = Db::new(&crate::config::Config::load().unwrap()).unwrap();
         let files = vec!["Albert_Einstein_Head.jpg".to_string()];

@@ -1,0 +1,21 @@
+# Format, lint and the offline tests. Tests that need the Toolforge databases
+# are #[ignore]d; run them locally with the tunnels from connect_db.sh:
+#   cargo test -- --ignored --skip bench_large_group
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
