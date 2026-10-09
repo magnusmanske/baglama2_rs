@@ -126,7 +126,7 @@ fn positional(argv: &[String]) -> Vec<String> {
 }
 
 const USAGE: &str = "\
-gzb commands (view data as one compressed file per group-month):
+Commands (gzb: view data as one compressed file per group-month):
   gzb_check YEAR MONTH [--dump=PATH]
       Check dump, replicas, tool DB and output dirs for a month; changes nothing.
   gzb_month YEAR MONTH [--dump=PATH] [--groups=1,2] [--force] [--list-jobs=6]
@@ -139,7 +139,18 @@ gzb commands (view data as one compressed file per group-month):
   gzb_tsv GROUP YEAR MONTH [WIKI] [--out=FILE]
       Export a gzb file (or one wiki of it) as tab-separated text, with
       '#' metadata lines above the header. Writes to stdout without --out.
+  update_sites
+      Add new wikis to the sites table and fill in missing language names.
+      gzb_month does this too.
 YEAR and MONTH may be 'lm' for last month.";
+
+const COMMANDS: &[&str] = &[
+    "gzb_check",
+    "gzb_month",
+    "gzb_show",
+    "gzb_tsv",
+    "update_sites",
+];
 
 /// Extract an optional dump-file override from the command line.
 /// Accepts both `--dump=PATH` and `--dump PATH` (space-separated). The flag
@@ -208,15 +219,15 @@ async fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-    if !command.starts_with("gzb_") {
+    if !COMMANDS.contains(&command) {
         return Err(anyhow!("Unknown command '{command}'\n{USAGE}"));
     }
     info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
     let baglama = Arc::new(with_timeout("Baglama2::new", 600, Baglama2::new()).await?);
-    run_gzb_command(command, &argv, baglama).await
+    run_command(command, &argv, baglama).await
 }
 
-async fn run_gzb_command(command: &str, argv: &[String], baglama: Arc<Baglama2>) -> Result<()> {
+async fn run_command(command: &str, argv: &[String], baglama: Arc<Baglama2>) -> Result<()> {
     let pos = positional(argv);
     let ym_at = |i: usize| {
         YearMonth::new(year(pos.get(i)), month(pos.get(i + 1)))
@@ -251,6 +262,7 @@ async fn run_gzb_command(command: &str, argv: &[String], baglama: Arc<Baglama2>)
             .await?;
             job.run().await
         }
+        "update_sites" => with_timeout("update_sites", 600, baglama.update_sites()).await,
         "gzb_tsv" => {
             let group_id: usize = pos
                 .get(2)

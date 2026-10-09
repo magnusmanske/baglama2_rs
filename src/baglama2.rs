@@ -8,11 +8,12 @@ use log::{info, warn};
 use mysql_async::{from_row, prelude::*, Conn};
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::path::Path;
 
+use wikimisc::mediawiki::action_api::{ActionApi, ActionApiRunnable};
 use wikimisc::mediawiki::Api;
 use wikimisc::site_matrix::SiteMatrix;
 use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
@@ -42,6 +43,74 @@ const ER_STATEMENT_TIMEOUT: u16 = 1969;
 /// Whether `e` is an error the server reported with `code`.
 fn is_server_error(e: &mysql_async::Error, code: u16) -> bool {
     matches!(e, mysql_async::Error::Server(se) if se.code == code)
+}
+
+/// Language wikis in a `sitematrix` API response: dbname → (language code,
+/// English language name). Special wikis (Commons, Meta, chapters, test
+/// wikis) are not listed under a language, so they are not included.
+fn wiki_languages(matrix: &Value) -> HashMap<String, (String, String)> {
+    let mut ret = HashMap::new();
+    let Some(entries) = matrix["sitematrix"].as_object() else {
+        return ret;
+    };
+    for (key, language) in entries {
+        if key == "count" || key == "specials" {
+            continue;
+        }
+        let (Some(code), Some(name)) = (language["code"].as_str(), language["localname"].as_str())
+        else {
+            continue;
+        };
+        for site in language["site"].as_array().into_iter().flatten() {
+            if let Some(dbname) = site["dbname"].as_str() {
+                ret.insert(dbname.to_string(), (code.to_string(), name.to_string()));
+            }
+        }
+    }
+    ret
+}
+
+/// `(giu_code, name)` for each language wiki in `sites` that has no name yet.
+///
+/// The name is the one already used for another wiki in the same language,
+/// so the labels stay consistent (the hand-set "Azeri" over the site
+/// matrix's "Azerbaijani"); if several are in use, the most common, then the
+/// alphabetically first. Failing that, the site matrix's English name.
+/// Wikis that are not language wikis keep no name: `ar.wikimedia.org` is
+/// Wikimedia Argentina, not Arabic.
+fn site_names_to_fill(
+    sites: &[(String, Option<String>)],
+    languages: &HashMap<String, (String, String)>,
+) -> Vec<(String, String)> {
+    let mut in_use: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
+    for (giu, name) in sites {
+        if let (Some(name), Some((code, _))) = (name, languages.get(giu)) {
+            *in_use.entry(code).or_default().entry(name).or_default() += 1;
+        }
+    }
+    let preferred: HashMap<&str, &str> = in_use
+        .into_iter()
+        .filter_map(|(code, names)| {
+            let best = names
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))?;
+            Some((code, best.0))
+        })
+        .collect();
+    let mut ret = vec![];
+    for (giu, name) in sites {
+        let Some((code, matrix_name)) = languages.get(giu) else {
+            continue;
+        };
+        if name.is_some() {
+            continue;
+        }
+        let label = preferred.get(code.as_str()).copied().unwrap_or(matrix_name);
+        if !label.is_empty() {
+            ret.push((giu.clone(), label.to_string()));
+        }
+    }
+    ret
 }
 
 #[derive(Debug)]
@@ -304,8 +373,16 @@ impl Baglama2 {
         }
     }
 
+    /// A tool DB connection that reads and writes UTF-8.
+    ///
+    /// The tool DB server defaults to `latin1`. A new connection asks for
+    /// utf8mb4, but a pooled one comes back reset to the server default, so
+    /// non-ASCII text would be read as latin1 and written double-encoded.
+    /// (Older queries sidestep this with `FROM_BASE64(TO_BASE64(...))`.)
     pub async fn get_tooldb_conn(&self) -> Result<Conn> {
-        self.get_conn_with_timeout("tooldb").await
+        let mut conn = self.get_conn_with_timeout("tooldb").await?;
+        conn.query_drop("SET NAMES utf8mb4").await?;
+        Ok(conn)
     }
 
     /// A connection to the Commons replica cluster that can serve a query
@@ -382,6 +459,36 @@ impl Baglama2 {
         );
         self.ensure_sites_in_tooldb(sites).await?;
         info!("update_sites: tool DB sites table updated");
+        // Labels are cosmetic; a run must not fail over them.
+        if let Err(e) = self.update_site_names().await {
+            warn!("update_sites: could not fill in language names: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Fills in `sites.name`, the language name the web interface shows
+    /// ("Arabic Wiktionary" rather than "ar.Wiktionary"), where it is missing.
+    /// Existing names are never changed. See [`site_names_to_fill`].
+    async fn update_site_names(&self) -> Result<()> {
+        let api = Api::new("https://meta.wikimedia.org/w/api.php").await?;
+        let matrix = ActionApi::sitematrix().run(&api).await?;
+        let languages = wiki_languages(&matrix);
+        if languages.is_empty() {
+            return Err(anyhow!("site matrix lists no language wikis"));
+        }
+        let mut conn = self.get_tooldb_conn().await?;
+        let sites: Vec<(String, Option<String>)> =
+            conn.query("SELECT giu_code,name FROM `sites`").await?;
+        let fill = site_names_to_fill(&sites, &languages);
+        if fill.is_empty() {
+            return Ok(());
+        }
+        conn.exec_batch(
+            "UPDATE `sites` SET name=? WHERE giu_code=? AND name IS NULL",
+            fill.iter().map(|(giu, name)| (name, giu)),
+        )
+        .await?;
+        info!("update_sites: filled in {} language names", fill.len());
         Ok(())
     }
 
@@ -708,6 +815,67 @@ mod tests {
         );
     }
 
+    fn test_matrix() -> Value {
+        serde_json::json!({"sitematrix": {
+            "count": 5,
+            "0": {"code": "ar", "localname": "Arabic", "site": [
+                {"dbname": "arwiki"}, {"dbname": "arwiktionary"}, {"dbname": "arwikibooks"}]},
+            "1": {"code": "az", "localname": "Azerbaijani", "site": [
+                {"dbname": "azwiki"}, {"dbname": "azwikiquote"}]},
+            "2": {"code": "xx", "localname": "Ex", "site": [
+                {"dbname": "xxwiki"}, {"dbname": "xxwiktionary"}, {"dbname": "xxwikibooks"}]},
+            "specials": [{"dbname": "arwikimedia"}, {"dbname": "commonswiki"}]
+        }})
+    }
+
+    #[test]
+    fn test_wiki_languages() {
+        let languages = wiki_languages(&test_matrix());
+        assert_eq!(
+            languages.get("arwiktionary"),
+            Some(&("ar".to_string(), "Arabic".to_string()))
+        );
+        assert!(!languages.contains_key("arwikimedia"));
+        assert!(!languages.contains_key("commonswiki"));
+        assert!(wiki_languages(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn test_site_names_to_fill() {
+        let site = |giu: &str, name: Option<&str>| (giu.to_string(), name.map(String::from));
+        let sites = vec![
+            site("arwiki", Some("Arabic")),
+            site("arwiktionary", None),
+            site("arwikimedia", None), // Wikimedia Argentina, not Arabic
+            site("azwiki", Some("Azeri")),
+            site("azwikiquote", None),
+            site("xxwiki", Some("B")),
+            site("xxwiktionary", Some("A")),
+            site("xxwikibooks", None),
+            site("commonswiki", Some("Commons")),
+            site("unknownwiki", None),
+        ];
+        let mut fill = site_names_to_fill(&sites, &wiki_languages(&test_matrix()));
+        fill.sort();
+        let expected = vec![
+            ("arwiktionary".to_string(), "Arabic".to_string()),
+            // An existing label beats the site matrix name.
+            ("azwikiquote".to_string(), "Azeri".to_string()),
+            // A tie goes to the alphabetically first.
+            ("xxwikibooks".to_string(), "A".to_string()),
+        ];
+        assert_eq!(fill, expected);
+        // Without any existing label, the site matrix name is used.
+        let fill = site_names_to_fill(
+            &[site("arwikibooks", None)],
+            &wiki_languages(&test_matrix()),
+        );
+        assert_eq!(
+            fill,
+            vec![("arwikibooks".to_string(), "Arabic".to_string())]
+        );
+    }
+
     #[test]
     fn test_sql_placeholders() {
         assert_eq!(Baglama2::sql_placeholders(50).len(), 99);
@@ -773,6 +941,20 @@ mod tests {
             group.category(),
             "Images from Archives of Ontario – RG 14-100 Official Road Maps of Ontario"
         );
+    }
+
+    // Pooled connections come back as latin1; see `get_tooldb_conn`.
+    #[tokio::test]
+    async fn test_tooldb_conn_utf8_after_reuse() {
+        let baglama = Baglama2::new().await.unwrap();
+        for _ in 0..3 {
+            let mut conn = baglama.get_tooldb_conn().await.unwrap();
+            let name: Option<String> = conn
+                .query_first("SELECT name FROM sites WHERE giu_code='vowiki'")
+                .await
+                .unwrap();
+            assert_eq!(name.as_deref(), Some("Volapük"));
+        }
     }
 
     #[tokio::test]
