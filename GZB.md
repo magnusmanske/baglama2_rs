@@ -100,7 +100,7 @@ converted legacy data the stored totals can differ from the row count
 (the old pipelines counted pages differently); the comments then say so.
 
 `gzb_tsv` and `gzb_show` need only `config.json` and the file, not the
-tool DB or any API, so they work during a Trove outage. `gzb_tsv` takes
+tool DB or any API, so they work during a tool DB outage. `gzb_tsv` takes
 the group label from the tool DB if it answers within 10 s, and leaves it
 out otherwise.
 

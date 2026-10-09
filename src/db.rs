@@ -163,10 +163,12 @@ impl Db {
 
     /// A tool DB connection that reads and writes UTF-8.
     ///
-    /// The tool DB server defaults to `latin1`. A new connection asks for
-    /// utf8mb4, but a pooled one comes back reset to the server default, so
-    /// non-ASCII text would be read as latin1 and written double-encoded.
-    /// (Older queries sidestep this with `FROM_BASE64(TO_BASE64(...))`.)
+    /// A new connection asks for utf8mb4, but a pooled one comes back reset
+    /// to the server's default character set. On a server whose default is
+    /// `latin1` (the tool DB's previous host), non-ASCII text would then be
+    /// read as latin1 and written double-encoded. ToolsDB defaults to
+    /// utf8mb4, but this does not depend on that. (Older queries sidestep it
+    /// with `FROM_BASE64(TO_BASE64(...))`.)
     pub async fn get_tooldb_conn(&self) -> Result<Conn> {
         let mut conn = self.get_conn_with_timeout("tooldb").await?;
         conn.query_drop("SET NAMES utf8mb4").await?;
@@ -367,7 +369,8 @@ mod tests {
         assert!(Db::commons_pool_key_for_tables(&["actor", "pagelinks"]).is_err());
     }
 
-    // Pooled connections come back as latin1; see `get_tooldb_conn`.
+    // Pooled connections come back in the server default charset; see
+    // `get_tooldb_conn`.
     #[tokio::test]
     #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_tooldb_conn_utf8_after_reuse() {

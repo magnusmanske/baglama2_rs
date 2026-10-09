@@ -99,8 +99,8 @@ After step 2, `viewdata/gzb/` on NFS holds all view data, at about
 ## 4. Read-only commands without the tool DB
 
 `gzb_show` and `gzb_tsv` go through `Baglama2::new()`, which connects to the
-tool DB (Trove), loads sites and calls the Wikidata API. When Trove was down
-(2026-09-15), even reading a local gzb file failed.
+tool DB, loads sites and calls the Wikidata API. When the tool DB was down
+(2026-09-15, then on Trove), even reading a local gzb file failed.
 
 - [x] Dispatch `gzb_show`/`gzb_tsv` before `Baglama2::new()`. They need only
       the gzb root (from `config.json`) and the file. Make the group label in
