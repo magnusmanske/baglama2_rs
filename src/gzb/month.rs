@@ -1055,13 +1055,30 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Writes a gzb file from fixed inputs to `$GOLDEN_OUT`, to compare the
-    /// output of two builds byte for byte (apart from `created`).
+    /// Reference output of [`test_golden_file`], written by the code of
+    /// 2026-10-09. The PHP reader in glamtools reads it the same way.
+    const GOLDEN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/gzb/testdata/golden_42.gzb"
+    );
+
+    /// Blanks the `"created":"…"` timestamp, the only part allowed to differ.
+    fn without_created(bytes: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(bytes);
+        let start = text.find("\"created\":\"").expect("created") + 11;
+        let end = start + text[start..].find('"').expect("end of created");
+        let mut ret = bytes.to_vec();
+        ret[start..end].fill(b'X');
+        ret
+    }
+
+    /// Phase 3 on fixed inputs must give exactly [`GOLDEN`], so a change to
+    /// what gets written cannot slip through. After an intended format change,
+    /// regenerate it: `UPDATE_GOLDEN=1 cargo test test_golden_file`.
     #[test]
-    #[ignore]
-    fn golden_write() {
-        let out = PathBuf::from(std::env::var("GOLDEN_OUT").expect("GOLDEN_OUT"));
+    fn test_golden_file() {
         let dir = std::env::temp_dir().join(format!("gzb_golden_{}", std::process::id()));
+        let out = dir.join("42.gzb");
         std::fs::create_dir_all(&dir).unwrap();
         let work = dir.join("42.tsv.gz");
         let wikis = [
@@ -1115,7 +1132,16 @@ mod tests {
             &mut codes,
         )
         .unwrap();
+        let written = std::fs::read(&out).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(GOLDEN, &written).unwrap();
+        }
+        let golden = std::fs::read(GOLDEN).unwrap();
+        assert!(
+            without_created(&written) == without_created(&golden),
+            "gzb output differs from {GOLDEN}"
+        );
     }
 
     #[test]
