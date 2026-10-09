@@ -1,10 +1,13 @@
+use crate::wiki::Dbname;
 use anyhow::Result;
+use log::warn;
 use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Site {
     server: Option<String>,
-    giu_code: Option<String>,
+    /// `None` if the stored value is not a valid database name.
+    giu_code: Option<Dbname>,
 }
 
 impl Site {
@@ -12,8 +15,8 @@ impl Site {
         &self.server
     }
 
-    pub fn giu_code(&self) -> &Option<String> {
-        &self.giu_code
+    pub fn giu_code(&self) -> Option<&Dbname> {
+        self.giu_code.as_ref()
     }
 }
 
@@ -28,9 +31,16 @@ impl FromRow for Site {
                 .and_then(Result::ok)
                 .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
             giu_code: row
-                .get_opt(1)
+                .get_opt::<Option<String>, _>(1)
                 .and_then(Result::ok)
-                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?
+                .and_then(|giu| match Dbname::parse(&giu) {
+                    Ok(giu) => Some(giu),
+                    Err(e) => {
+                        warn!("sites: {e}; ignoring that wiki");
+                        None
+                    }
+                }),
         })
     }
 }

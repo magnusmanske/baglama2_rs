@@ -26,6 +26,7 @@
 pub mod month;
 pub mod tsv;
 
+use crate::group_id::GroupId;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
@@ -210,12 +211,12 @@ pub struct GzbWriter {
 impl GzbWriter {
     /// A writer for the file at `path`; nothing is visible there before
     /// [`GzbWriter::finish`].
-    pub fn new(path: &Path, group_id: usize, ym: &YearMonth, source: &str) -> Self {
+    pub fn new(path: &Path, group_id: GroupId, ym: &YearMonth, source: &str) -> Self {
         Self {
             path: path.to_path_buf(),
             header: GzbHeader {
                 version: VERSION,
-                group_id,
+                group_id: group_id.get(),
                 year: ym.year(),
                 month: ym.month(),
                 source: source.to_string(),
@@ -455,7 +456,7 @@ impl GzbReader {
 }
 
 /// `<root>/<YYYYMM>/<group_id>.gzb`. The PHP API builds the same path.
-pub fn gzb_path(root: &Path, group_id: usize, ym: &YearMonth) -> PathBuf {
+pub fn gzb_path(root: &Path, group_id: GroupId, ym: &YearMonth) -> PathBuf {
     root.join(year_month_dir(ym))
         .join(format!("{group_id}.{FILE_EXTENSION}"))
 }
@@ -609,8 +610,8 @@ mod tests {
     fn test_roundtrip() {
         let dir = std::env::temp_dir().join(format!("gzb_test_{}", std::process::id()));
         let ym = YearMonth::new(2024, 3).unwrap();
-        let path = gzb_path(&dir, 42, &ym);
-        let mut w = GzbWriter::new(&path, 42, &ym, "dump");
+        let path = gzb_path(&dir, GroupId::new(42).unwrap(), &ym);
+        let mut w = GzbWriter::new(&path, GroupId::new(42).unwrap(), &ym, "dump");
         let many: Vec<GzbRow> = (0..CHUNK_ROWS as u64 * 2 + 7)
             .map(|i| row(&format!("Page_{i}"), i, &["B.jpg", "A.jpg", "B.jpg"]))
             .collect();
@@ -654,8 +655,8 @@ mod tests {
             .collect();
         let mut files = vec![];
         for (n, spill_bytes) in [usize::MAX, 1].into_iter().enumerate() {
-            let path = gzb_path(&dir, n, &ym);
-            let mut w = GzbWriter::new(&path, 42, &ym, "dump");
+            let path = gzb_path(&dir, GroupId::new(n + 1).unwrap(), &ym);
+            let mut w = GzbWriter::new(&path, GroupId::new(42).unwrap(), &ym, "dump");
             w.spill_bytes = spill_bytes;
             w.add_site("enwiki", rows.clone(), None).unwrap();
             w.add_site("dewiki", rows[..10].to_vec(), None).unwrap();

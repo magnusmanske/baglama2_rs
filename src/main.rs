@@ -3,14 +3,15 @@ use baglama2::*;
 use chrono::{DateTime, Datelike, Months, Utc};
 use clap::{Args, Parser, Subcommand};
 use config::Config;
+use group_id::GroupId;
 use log::{error, info, warn};
 use row_group::RowGroup;
 use site::Site;
 use std::future::Future;
-use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use wiki::Dbname;
 use year_month::YearMonth;
 
 #[global_allocator]
@@ -19,17 +20,18 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub type DbId = usize;
 
 mod baglama2;
+mod category;
 mod config;
 mod db;
 mod global_image_links;
+mod group_id;
 mod group_status;
 mod gzb;
 mod pageviews;
 mod row_group;
 mod site;
+mod wiki;
 mod year_month;
-
-pub type GroupId = NonZero<DbId>;
 
 /// How long `gzb_tsv` waits for the tool DB for its group label.
 const LABEL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,11 +69,11 @@ enum Command {
     /// Print a gzb file's per-wiki totals, or one wiki's top pages.
     #[command(name = "gzb_show")]
     GzbShow {
-        group: usize,
+        group: GroupId,
         #[command(flatten)]
         month: MonthArg,
         /// Show this wiki's pages, e.g. enwiki.
-        wiki: Option<String>,
+        wiki: Option<Dbname>,
         /// Pages to show for WIKI.
         #[arg(long, default_value_t = 20)]
         max: usize,
@@ -80,11 +82,11 @@ enum Command {
     /// metadata lines above the header.
     #[command(name = "gzb_tsv")]
     GzbTsv {
-        group: usize,
+        group: GroupId,
         #[command(flatten)]
         month: MonthArg,
         /// Export only this wiki, e.g. enwiki.
-        wiki: Option<String>,
+        wiki: Option<Dbname>,
         /// Write here instead of to stdout.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -118,7 +120,7 @@ struct MonthFlags {
     dump: Option<PathBuf>,
     /// Only these groups (active or not), e.g. --groups=1,2.
     #[arg(long, value_delimiter = ',')]
-    groups: Option<Vec<usize>>,
+    groups: Option<Vec<GroupId>>,
     /// Regenerate groups that are already complete.
     #[arg(long)]
     force: bool,
@@ -215,7 +217,15 @@ async fn main() -> Result<()> {
             month,
             wiki,
             max,
-        } => return show(&config, group, &month.year_month()?, wiki.as_deref(), max),
+        } => {
+            return show(
+                &config,
+                group,
+                &month.year_month()?,
+                wiki.as_ref().map(Dbname::as_str),
+                max,
+            )
+        }
         Command::GzbTsv {
             group,
             month,
@@ -268,7 +278,7 @@ async fn main() -> Result<()> {
 
 fn show(
     config: &Config,
-    group: usize,
+    group: GroupId,
     ym: &YearMonth,
     wiki: Option<&str>,
     max: usize,
@@ -311,16 +321,16 @@ fn show(
 
 async fn tsv(
     config: &Config,
-    group: usize,
+    group: GroupId,
     ym: &YearMonth,
-    wiki: Option<String>,
+    wiki: Option<Dbname>,
     out: Option<&Path>,
 ) -> Result<()> {
     let path = gzb::gzb_path(&config.gzb_data_root_path, group, ym);
     let mut reader = gzb::GzbReader::open(&path)?;
     let meta = gzb::tsv::TsvMeta {
         group_label: group_label(config, group).await,
-        wiki,
+        wiki: wiki.map(|wiki| wiki.to_string()),
     };
     let rows = match out {
         Some(out) => {
@@ -337,10 +347,10 @@ async fn tsv(
 
 /// What the group tracks, for the TSV comments. Best-effort: without the
 /// tool DB, the export goes ahead without it.
-async fn group_label(config: &Config, group: usize) -> Option<String> {
+async fn group_label(config: &Config, group: GroupId) -> Option<String> {
     let load = async {
         let db = db::Db::new(config)?;
-        RowGroup::load(&db, GroupId::try_from(group)?).await
+        RowGroup::load(&db, group).await
     };
     let group = match tokio::time::timeout(LABEL_TIMEOUT, load).await {
         Ok(Ok(Some(group))) => group,
@@ -357,11 +367,7 @@ async fn group_label(config: &Config, group: usize) -> Option<String> {
             return None;
         }
     };
-    Some(if group.is_user_name() {
-        format!("files uploaded by User:{}", group.category())
-    } else {
-        format!("Category:{} (depth {})", group.category(), group.depth())
-    })
+    Some(group.label())
 }
 
 #[cfg(test)]
@@ -396,7 +402,10 @@ mod tests {
             panic!("not gzb_month");
         };
         assert_eq!((month.year, month.month), (2026, 9));
-        assert_eq!(flags.groups, Some(vec![1, 2]));
+        assert_eq!(
+            flags.groups,
+            Some(vec![GroupId::new(1).unwrap(), GroupId::new(2).unwrap()])
+        );
         assert!(flags.force && flags.no_check && !flags.keep_work);
         assert_eq!(flags.dump, Some(PathBuf::from("/x.bz2")));
         assert_eq!((flags.list_jobs, flags.build_jobs), (6, 2));
@@ -422,8 +431,8 @@ mod tests {
         else {
             panic!("not gzb_show");
         };
-        assert_eq!((group, month.year, month.month), (979, 2026, 9));
-        assert_eq!(wiki.as_deref(), Some("enwiki"));
+        assert_eq!((group.get(), month.year, month.month), (979, 2026, 9));
+        assert_eq!(wiki.as_ref().map(Dbname::as_str), Some("enwiki"));
         assert_eq!(max, 5);
     }
 
@@ -454,6 +463,14 @@ mod tests {
     #[test]
     fn test_unknown_command_and_missing_month() {
         assert!(Cli::try_parse_from(["baglama2", "mysql2_views", "2026", "5"]).is_err());
+        assert!(Cli::try_parse_from(["baglama2", "gzb_show", "0", "2026", "5"]).is_err());
+        assert!(
+            Cli::try_parse_from(["baglama2", "gzb_show", "1", "2026", "5", "en.wikipedia"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["baglama2", "gzb_month", "2026", "5", "--groups=1,0"]).is_err()
+        );
         assert!(Cli::try_parse_from(["baglama2", "gzb_month", "2026"]).is_err());
     }
 }

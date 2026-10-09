@@ -16,9 +16,10 @@
 
 use super::*;
 use crate::global_image_links::GlobalImageLinks;
-use crate::group_status::{self, STATUS_COMPLETE, STATUS_FAILED, STATUS_LISTING, STATUS_SCANNED};
+use crate::group_status::{self, GroupStatus};
 use crate::pageviews::dump_reader;
-use crate::row_group::RowGroup;
+use crate::row_group::{GroupSource, RowGroup};
+use crate::wiki::{Dbname, DumpCode};
 use crate::{Baglama2, GroupId};
 use log::{error, info, warn};
 use mysql_async::prelude::*;
@@ -43,7 +44,7 @@ const VIEWS_BIN_MAGIC: &[u8; 10] = b"BGZVIEWS1\n";
 pub struct MonthOptions {
     pub dump_override: Option<PathBuf>,
     /// Only these groups (active or not); default all active groups.
-    pub group_ids: Option<Vec<usize>>,
+    pub group_ids: Option<Vec<GroupId>>,
     /// Regenerate even groups that already have complete data.
     pub force: bool,
     /// Concurrent groups in phase 1 (replica-bound).
@@ -78,13 +79,13 @@ pub enum Plan {
 }
 
 /// What to do with one group, given its `group_status` status for the month.
-pub fn plan_group(status: Option<&str>, work_file_exists: bool, force: bool) -> Plan {
+pub fn plan_group(status: Option<GroupStatus>, work_file_exists: bool, force: bool) -> Plan {
     if force {
         return Plan::ListPages;
     }
     match status {
-        Some(STATUS_COMPLETE) => Plan::Skip("already complete"),
-        Some(STATUS_SCANNED) if work_file_exists => Plan::BuildFile,
+        Some(GroupStatus::Complete) => Plan::Skip("already complete"),
+        Some(GroupStatus::Scanned) if work_file_exists => Plan::BuildFile,
         _ => Plan::ListPages,
     }
 }
@@ -116,7 +117,7 @@ impl GzbMonth {
         }
     }
 
-    fn work_file(&self, group_id: usize) -> PathBuf {
+    fn work_file(&self, group_id: GroupId) -> PathBuf {
         self.work.join(format!("{group_id}.tsv.gz"))
     }
 
@@ -213,8 +214,9 @@ impl GzbMonth {
         let sites = self.baglama.get_sites()?;
         let missing: Vec<String> = sites
             .iter()
-            .filter_map(|s| s.giu_code().clone())
+            .filter_map(|s| s.giu_code())
             .filter(|giu| self.baglama.wiki_dump_code(giu).is_none())
+            .map(|giu| giu.to_string())
             .collect();
         println!(
             "dump codes: {} of {} wikis resolved{}",
@@ -281,7 +283,7 @@ impl GzbMonth {
         self.baglama.update_sites().await?;
 
         let plans = self.select_groups().await?;
-        let ids_with = |plan: Plan| -> Vec<usize> {
+        let ids_with = |plan: Plan| -> Vec<GroupId> {
             plans
                 .iter()
                 .filter(|(_, p)| *p == plan)
@@ -302,8 +304,8 @@ impl GzbMonth {
         // Failures here are mostly the replicas being overloaded, often by the
         // concurrency itself. One more pass, a group at a time, costs little
         // next to re-running the month (which rescans the whole dump).
-        let retry: Vec<usize> = {
-            let ok: HashSet<usize> = listed.iter().copied().collect();
+        let retry: Vec<GroupId> = {
+            let ok: HashSet<GroupId> = listed.iter().copied().collect();
             to_list
                 .iter()
                 .copied()
@@ -318,7 +320,7 @@ impl GzbMonth {
             listed.extend(self.phase_list_pages(&retry, 1).await);
         }
         let list_failed = to_list.len() - listed.len();
-        let mut build: Vec<usize> = listed_before.into_iter().chain(listed).collect();
+        let mut build: Vec<GroupId> = listed_before.into_iter().chain(listed).collect();
         build.sort();
         if build.is_empty() {
             info!("Nothing to build for {}", self.ym);
@@ -348,9 +350,9 @@ impl GzbMonth {
         Ok(())
     }
 
-    async fn select_groups(&self) -> Result<Vec<(usize, Plan)>> {
+    async fn select_groups(&self) -> Result<Vec<(GroupId, Plan)>> {
         let rows = group_status::groups_for_month(self.baglama.db(), &self.ym).await?;
-        let wanted: Option<HashSet<usize>> = self
+        let wanted: Option<HashSet<GroupId>> = self
             .opts
             .group_ids
             .as_ref()
@@ -364,18 +366,14 @@ impl GzbMonth {
             if !selected {
                 continue;
             }
-            let plan = plan_group(
-                status.as_deref(),
-                self.work_file(id).is_file(),
-                self.opts.force,
-            );
+            let plan = plan_group(status, self.work_file(id).is_file(), self.opts.force);
             if let Plan::Skip(why) = plan {
                 info!("group {id}: skipped, {why}");
             }
             ret.push((id, plan));
         }
         if let Some(ids) = &wanted {
-            let found: HashSet<usize> = ret.iter().map(|(id, _)| *id).collect();
+            let found: HashSet<GroupId> = ret.iter().map(|(id, _)| *id).collect();
             for id in ids.difference(&found) {
                 warn!("group {id} does not exist");
             }
@@ -389,7 +387,7 @@ impl GzbMonth {
 
     /// Lists pages for `group_ids`, `jobs` groups at a time. Returns the
     /// groups whose page list was written.
-    async fn phase_list_pages(&self, group_ids: &[usize], jobs: usize) -> Vec<usize> {
+    async fn phase_list_pages(&self, group_ids: &[GroupId], jobs: usize) -> Vec<GroupId> {
         if group_ids.is_empty() {
             return vec![];
         }
@@ -418,8 +416,14 @@ impl GzbMonth {
                     Err(e) => {
                         error!("Phase 1: group {group_id} failed: {e:#}");
                         let _ = std::fs::remove_file(&tmp);
-                        let _ = group_status::set(baglama.db(), group_id, &ym, STATUS_FAILED, None)
-                            .await;
+                        let _ = group_status::set(
+                            baglama.db(),
+                            group_id,
+                            &ym,
+                            GroupStatus::Failed,
+                            None,
+                        )
+                        .await;
                         None
                     }
                 }
@@ -440,7 +444,7 @@ impl GzbMonth {
     // Phase 2: views from the dump
     // ------------------------------------------------------------------
 
-    async fn phase_views(&self, group_ids: &[usize], dump: &Path) -> Result<ViewTable> {
+    async fn phase_views(&self, group_ids: &[GroupId], dump: &Path) -> Result<ViewTable> {
         let views_bin = self.views_bin();
         let work_files: Vec<PathBuf> = group_ids.iter().map(|id| self.work_file(*id)).collect();
         if views_bin_is_fresh(&views_bin, &work_files) {
@@ -476,7 +480,7 @@ impl GzbMonth {
     // ------------------------------------------------------------------
 
     /// Returns the number of failed groups.
-    async fn phase_build(&self, group_ids: &[usize], views: Arc<ViewTable>) -> usize {
+    async fn phase_build(&self, group_ids: &[GroupId], views: Arc<ViewTable>) -> usize {
         info!("Phase 3: writing {} group files", group_ids.len());
         let jobs = self.opts.build_jobs.max(1);
         let semaphore = Arc::new(Semaphore::new(jobs));
@@ -519,8 +523,14 @@ impl GzbMonth {
                             header.total_views
                         );
                         let total = Some(db_views(header.total_views));
-                        match group_status::set(baglama.db(), group_id, &ym, STATUS_COMPLETE, total)
-                            .await
+                        match group_status::set(
+                            baglama.db(),
+                            group_id,
+                            &ym,
+                            GroupStatus::Complete,
+                            total,
+                        )
+                        .await
                         {
                             Ok(()) => true,
                             Err(e) => {
@@ -531,8 +541,14 @@ impl GzbMonth {
                     }
                     Err(e) => {
                         error!("Phase 3: group {group_id} failed: {e:#}");
-                        let _ = group_status::set(baglama.db(), group_id, &ym, STATUS_FAILED, None)
-                            .await;
+                        let _ = group_status::set(
+                            baglama.db(),
+                            group_id,
+                            &ym,
+                            GroupStatus::Failed,
+                            None,
+                        )
+                        .await;
                         false
                     }
                 }
@@ -551,25 +567,23 @@ impl GzbMonth {
 async fn list_pages(
     baglama: &Baglama2,
     ym: &YearMonth,
-    group_id: usize,
+    group_id: GroupId,
     tmp: &Path,
     out: &Path,
 ) -> Result<u64> {
-    group_status::set(baglama.db(), group_id, ym, STATUS_LISTING, None).await?;
-    let gid = GroupId::try_from(group_id)?;
-    let group = RowGroup::load(baglama.db(), gid)
+    group_status::set(baglama.db(), group_id, ym, GroupStatus::Listing, None).await?;
+    let group = RowGroup::load(baglama.db(), group_id)
         .await?
         .ok_or_else(|| anyhow!("group {group_id} not found"))?;
-    let files = if group.is_user_name() {
-        baglama.get_files_from_user_name(group.category()).await?
-    } else {
-        baglama
-            .get_pages_in_category(group.category(), group.depth(), 6)
-            .await?
+    let files = match group.source() {
+        GroupSource::Uploader(name) => baglama.get_files_from_user_name(name).await?,
+        GroupSource::Category { title, depth } => {
+            baglama.get_pages_in_category(title, *depth, 6).await?
+        }
     };
     info!(
         "group {group_id} ({}): {} files",
-        group.category(),
+        group.label(),
         files.len()
     );
 
@@ -596,7 +610,7 @@ async fn list_pages(
         .map_err(|e| e.into_error())?
         .sync_all()?;
     std::fs::rename(tmp, out)?;
-    group_status::set(baglama.db(), group_id, ym, STATUS_SCANNED, None).await?;
+    group_status::set(baglama.db(), group_id, ym, GroupStatus::Scanned, None).await?;
     Ok(rows)
 }
 
@@ -605,7 +619,7 @@ async fn list_pages(
 #[derive(Clone)]
 pub struct DumpCodes {
     baglama: Option<Arc<Baglama2>>,
-    known: HashMap<String, Option<String>>,
+    known: HashMap<Dbname, Option<DumpCode>>,
 }
 
 impl DumpCodes {
@@ -613,7 +627,7 @@ impl DumpCodes {
         let known = baglama
             .get_sites()?
             .iter()
-            .filter_map(|s| s.giu_code().clone())
+            .filter_map(|s| s.giu_code().cloned())
             .map(|giu| {
                 let code = baglama.wiki_dump_code(&giu);
                 (giu, code)
@@ -625,12 +639,15 @@ impl DumpCodes {
         })
     }
 
-    pub fn get(&mut self, giu: &str) -> Option<&str> {
+    /// The dump code for `giu`, a database name as read from a page list.
+    /// `None` if the wiki has none, or `giu` is not a database name.
+    pub fn get(&mut self, giu: &str) -> Option<&DumpCode> {
         if !self.known.contains_key(giu) {
-            let code = self.baglama.as_ref().and_then(|b| b.wiki_dump_code(giu));
-            self.known.insert(giu.to_string(), code);
+            let giu = Dbname::parse(giu).ok()?;
+            let code = self.baglama.as_ref().and_then(|b| b.wiki_dump_code(&giu));
+            self.known.insert(giu, code);
         }
-        self.known.get(giu).and_then(|c| c.as_deref())
+        self.known.get(giu).and_then(Option::as_ref)
     }
 }
 
@@ -784,7 +801,7 @@ struct Page {
 }
 
 fn build_group_file(
-    group_id: usize,
+    group_id: GroupId,
     ym: &YearMonth,
     work_file: &Path,
     out: &Path,
@@ -893,24 +910,24 @@ mod tests {
     fn test_plan_group() {
         assert_eq!(plan_group(None, false, false), Plan::ListPages);
         assert_eq!(
-            plan_group(Some(STATUS_COMPLETE), false, false),
+            plan_group(Some(GroupStatus::Complete), false, false),
             Plan::Skip("already complete")
         );
         assert_eq!(
-            plan_group(Some(STATUS_SCANNED), true, false),
+            plan_group(Some(GroupStatus::Scanned), true, false),
             Plan::BuildFile
         );
         // A SCANNED row without its page list (deleted work dir) is redone.
         assert_eq!(
-            plan_group(Some(STATUS_SCANNED), false, false),
+            plan_group(Some(GroupStatus::Scanned), false, false),
             Plan::ListPages
         );
         assert_eq!(
-            plan_group(Some(STATUS_FAILED), true, false),
+            plan_group(Some(GroupStatus::Failed), true, false),
             Plan::ListPages
         );
         assert_eq!(
-            plan_group(Some(STATUS_COMPLETE), true, true),
+            plan_group(Some(GroupStatus::Complete), true, true),
             Plan::ListPages
         );
     }
@@ -990,7 +1007,12 @@ mod tests {
             baglama: None,
             known: wikis
                 .iter()
-                .map(|(giu, code)| (giu.clone(), Some(code.clone())))
+                .map(|(giu, code)| {
+                    (
+                        Dbname::parse(giu).unwrap(),
+                        Some(DumpCode::parse(code).unwrap()),
+                    )
+                })
                 .collect(),
         };
         let t = Instant::now();
@@ -1012,8 +1034,16 @@ mod tests {
 
         let t = Instant::now();
         let ym = YearMonth::new(2026, 9).unwrap();
-        let out = gzb_path(&dir, 979, &ym);
-        let header = build_group_file(979, &ym, &work, &out, &views, &mut codes).unwrap();
+        let out = gzb_path(&dir, GroupId::new(979).unwrap(), &ym);
+        let header = build_group_file(
+            GroupId::new(979).unwrap(),
+            &ym,
+            &work,
+            &out,
+            &views,
+            &mut codes,
+        )
+        .unwrap();
         eprintln!(
             "bench: file built in {:.1?}: {} pages, {} views, {} bytes",
             t.elapsed(),
@@ -1022,6 +1052,69 @@ mod tests {
             std::fs::metadata(&out).unwrap().len()
         );
         assert_eq!(header.total_pages as usize, pages);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writes a gzb file from fixed inputs to `$GOLDEN_OUT`, to compare the
+    /// output of two builds byte for byte (apart from `created`).
+    #[test]
+    #[ignore]
+    fn golden_write() {
+        let out = PathBuf::from(std::env::var("GOLDEN_OUT").expect("GOLDEN_OUT"));
+        let dir = std::env::temp_dir().join(format!("gzb_golden_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work = dir.join("42.tsv.gz");
+        let wikis = [
+            ("enwiki", "en.wikipedia"),
+            ("dewiki", "de.wikipedia"),
+            ("zh_min_nanwiki", "zh-min-nan.wikipedia"),
+            ("wikidatawiki", "wikidata"),
+            ("commonswiki", "commons.wikimedia"),
+        ];
+        let mut lines = vec![];
+        for i in 0..5000usize {
+            let (giu, _) = wikis[i % wikis.len()];
+            let ns = [0, 0, 14, 4, 0][i % 5];
+            let title = format!("Ünïcødé_{}_{}", i % 1700, ["Zürich", "東京", "x"][i % 3]);
+            lines.push(format!("{giu}\t{ns}\t{title}\tFile_{}.jpg", (i * 7) % 900));
+        }
+        lines.push("xxwiki\t0\tNowhere\tA.jpg".to_string());
+        lines.push("not a usage line".to_string());
+        {
+            let mut enc = GzEncoder::new(File::create(&work).unwrap(), Compression::fast());
+            for line in &lines {
+                writeln!(enc, "{line}").unwrap();
+            }
+            enc.finish().unwrap();
+        }
+        let mut codes = DumpCodes {
+            baglama: None,
+            known: wikis
+                .iter()
+                .map(|(g, c)| (Dbname::parse(g).unwrap(), Some(DumpCode::parse(c).unwrap())))
+                .collect(),
+        };
+        let (mut views, _) = collect_page_keys(std::slice::from_ref(&work), &mut codes).unwrap();
+        for (i, line) in lines.iter().enumerate().step_by(3) {
+            if let Some((giu, _, title, _)) = parse_work_line(line) {
+                if let Some(code) = codes.get(giu) {
+                    views.add(
+                        page_key(code.as_bytes(), title.as_bytes()),
+                        (i * 37 % 5000) as u64,
+                    );
+                }
+            }
+        }
+        let ym = YearMonth::new(2026, 9).unwrap();
+        build_group_file(
+            GroupId::new(42).unwrap(),
+            &ym,
+            &work,
+            &out,
+            &views,
+            &mut codes,
+        )
+        .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1061,12 +1154,20 @@ mod tests {
             baglama: None,
             known: [("enwiki", "en.wikipedia"), ("dewiki", "de.wikipedia")]
                 .into_iter()
-                .map(|(g, c)| (g.to_string(), Some(c.to_string())))
+                .map(|(g, c)| (Dbname::parse(g).unwrap(), Some(DumpCode::parse(c).unwrap())))
                 .collect(),
         };
         let ym = YearMonth::new(2026, 9).unwrap();
-        let out = gzb_path(&dir, 5, &ym);
-        let header = build_group_file(5, &ym, &work, &out, &views, &mut codes).unwrap();
+        let out = gzb_path(&dir, GroupId::new(5).unwrap(), &ym);
+        let header = build_group_file(
+            GroupId::new(5).unwrap(),
+            &ym,
+            &work,
+            &out,
+            &views,
+            &mut codes,
+        )
+        .unwrap();
 
         assert_eq!(header.total_views, 573);
         assert_eq!(header.total_pages, 6);

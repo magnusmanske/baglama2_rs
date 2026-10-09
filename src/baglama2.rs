@@ -1,11 +1,13 @@
+use crate::category::{category_tree, CategoryTitle};
 use crate::config::Config;
 use crate::db::{sql_placeholders, Db};
-use crate::row_group::RowGroup;
-use crate::DbId;
+use crate::group_id::GroupId;
+use crate::row_group::{GroupSource, RowGroup};
+use crate::wiki::{Dbname, DumpCode};
 use crate::Site;
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
-use mysql_async::{from_row, prelude::*};
+use mysql_async::{from_row, from_row_opt, prelude::*};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use wikimisc::mediawiki::action_api::{ActionApi, ActionApiRunnable};
@@ -80,6 +82,9 @@ fn site_names_to_fill(
     ret
 }
 
+/// Tables a category-membership query reads.
+const CATEGORY_TABLES: [&str; 3] = ["page", "categorylinks", "linktarget"];
+
 /// Most groups [`Baglama2::deactivate_nonexistent_categories`] switches off
 /// in one run. Categories rarely disappear; many missing at once means the
 /// Commons lookup went wrong (a replica problem, another table split).
@@ -88,11 +93,11 @@ const MAX_DEACTIVATIONS: usize = 20;
 /// The `(id, category)` groups whose category is not in `existing`, or an
 /// error if there are more than `max`.
 fn groups_to_deactivate(
-    groups: &[(DbId, String)],
-    existing: &HashSet<String>,
+    groups: &[(GroupId, CategoryTitle)],
+    existing: &HashSet<CategoryTitle>,
     max: usize,
-) -> Result<Vec<(DbId, String)>> {
-    let gone: Vec<(DbId, String)> = groups
+) -> Result<Vec<(GroupId, CategoryTitle)>> {
+    let gone: Vec<(GroupId, CategoryTitle)> = groups
         .iter()
         .filter(|(_, category)| !existing.contains(category))
         .cloned()
@@ -148,22 +153,15 @@ impl Baglama2 {
     /// `wikidata`. The site matrix comes first, because `sites.server` in
     /// the tool DB is wrong for several special wikis (`meta.wikipedia.org`);
     /// but the site matrix omits closed wikis, which still get views.
-    pub fn wiki_dump_code(&self, wiki: &str) -> Option<String> {
-        if let Ok(url) = self.site_matrix.get_server_url_for_wiki(wiki) {
-            return Self::dump_code_from_server_url(&url);
+    pub fn wiki_dump_code(&self, wiki: &Dbname) -> Option<DumpCode> {
+        if let Ok(url) = self.site_matrix.get_server_url_for_wiki(wiki.as_str()) {
+            return DumpCode::from_server(&url);
         }
         let site = self
             .sites_cache
             .iter()
-            .find(|s| s.giu_code().as_deref() == Some(wiki))?;
-        Self::dump_code_from_server_url(site.server().as_deref()?)
-    }
-
-    /// The dump drops a leading `www.`: `www.wikidata.org` is `wikidata`.
-    fn dump_code_from_server_url(url: &str) -> Option<String> {
-        let host = url.split("://").last()?.trim_end_matches('/');
-        let host = host.strip_prefix("www.").unwrap_or(host);
-        host.strip_suffix(".org").map(|s| s.to_string())
+            .find(|s| s.giu_code() == Some(wiki))?;
+        DumpCode::from_server(site.server().as_deref()?)
     }
 
     /// Switches off groups whose category no longer exists on Commons.
@@ -176,23 +174,28 @@ impl Baglama2 {
             RowGroup::sql_select()
         );
         info!("deactivate_nonexistent_categories: querying active groups from tool DB");
-        let groups: Vec<(DbId, String)> = self
+        let rows = self
             .db
             .get_tooldb_conn()
             .await?
             .exec_iter(sql, ())
             .await?
-            .map_and_drop(from_row::<RowGroup>)
-            .await?
-            .into_iter()
-            .map(|group| (group.id(), group.category().to_owned()))
-            .collect();
-        let categories: Vec<String> = groups.iter().map(|(_, cat)| cat.clone()).collect();
-        let existing: HashSet<String> = self
-            .get_existing_categories(&categories)
-            .await?
-            .into_iter()
-            .collect();
+            .map_and_drop(from_row_opt::<RowGroup>)
+            .await?;
+        let mut groups: Vec<(GroupId, CategoryTitle)> = vec![];
+        for row in rows {
+            match row {
+                Ok(group) => {
+                    if let GroupSource::Category { title, .. } = group.source() {
+                        groups.push((group.id(), title.clone()));
+                    }
+                }
+                // Left alone: it cannot be checked, so it is not known to be gone.
+                Err(e) => warn!("deactivate_nonexistent_categories: skipping {e}"),
+            }
+        }
+        let categories: Vec<CategoryTitle> = groups.iter().map(|(_, cat)| cat.clone()).collect();
+        let existing = self.get_existing_categories(&categories).await?;
         info!(
             "deactivate_nonexistent_categories: {} of {} categories exist on Commons",
             existing.len(),
@@ -212,52 +215,47 @@ impl Baglama2 {
         if gone.is_empty() {
             return Ok(());
         }
-        let ids: Vec<DbId> = gone.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<GroupId> = gone.iter().map(|(id, _)| *id).collect();
         self.deactivate_groups(&ids).await
     }
 
-    async fn deactivate_groups(&self, group_ids: &[DbId]) -> Result<()> {
+    async fn deactivate_groups(&self, group_ids: &[GroupId]) -> Result<()> {
         let placeholders = sql_placeholders(group_ids.len());
         let sql = format!("UPDATE `groups` SET is_active=0 WHERE id IN ({placeholders})");
         self.db
             .get_tooldb_conn()
             .await?
-            .exec_drop(sql, group_ids.to_owned())
+            .exec_drop(sql, group_ids.iter().map(|id| id.get()).collect::<Vec<_>>())
             .await?;
         Ok(())
     }
 
-    async fn get_existing_categories(&self, categories: &[String]) -> Result<Vec<String>> {
+    /// Those of `categories` that exist on Commons.
+    async fn get_existing_categories(
+        &self,
+        categories: &[CategoryTitle],
+    ) -> Result<HashSet<CategoryTitle>> {
         if categories.is_empty() {
-            return Ok(vec![]);
+            return Ok(HashSet::new());
         }
-        let categories = categories
-            .iter()
-            .map(|category| category.replace(" ", "_"))
-            .collect::<Vec<String>>();
-        let placeholders = sql_placeholders(categories.len());
-        let sql = format!("SELECT `page_title` FROM `page` WHERE `page_namespace`=14 AND `page_title` IN ({placeholders})");
+        let keys: Vec<String> = categories.iter().map(CategoryTitle::db_key).collect();
+        let sql = format!(
+            "SELECT FROM_BASE64(TO_BASE64(page_title)) FROM `page` WHERE `page_namespace`=14 AND `page_title` IN ({})",
+            sql_placeholders(keys.len())
+        );
         info!(
             "get_existing_categories: running single IN query against Commons `page` with {} placeholders",
-            categories.len()
+            keys.len()
         );
-        let results = self
-            .db
-            .get_commons_conn_for_tables(&["page"])
-            .await?
-            .exec_iter(sql, categories.to_owned())
-            .await?
-            .map_and_drop(from_row::<String>)
-            .await?;
+        let found: Vec<String> = self.db.query_commons(&["page"], &sql, keys).await?;
         info!(
             "get_existing_categories: Commons query returned {} rows",
-            results.len()
+            found.len()
         );
-        let results = results
+        Ok(found
             .iter()
-            .map(|category| category.replace("_", " "))
-            .collect::<Vec<String>>();
-        Ok(results)
+            .filter_map(|title| CategoryTitle::parse(title).ok())
+            .collect())
     }
 
     async fn populate_sites(&mut self) -> Result<()> {
@@ -377,63 +375,27 @@ impl Baglama2 {
     }
 
     // TESTED
-    async fn find_subcats(&self, root: &[String], depth: isize) -> Result<Vec<String>> {
-        let mut depth = depth;
-        let mut check = root.to_owned();
-        // Use a HashSet for O(1) membership tests; a Vec would give O(n) per check,
-        // leading to O(n²) behaviour over deep category trees.
-        let mut subcats: HashSet<String> = HashSet::new();
-        loop {
-            if depth == 0 {
-                break;
-            }
-            // Keep only categories we haven't visited yet.
-            let remaining: Vec<String> = check
-                .into_iter()
-                .filter(|category| !subcats.contains(category))
-                .collect();
-            if remaining.is_empty() {
-                break;
-            }
-            subcats.extend(remaining.iter().cloned());
-            let placeholders = sql_placeholders(remaining.len());
-            let sql = format!(
-                "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
-	            FROM page,categorylinks,linktarget
-	            WHERE page_id=cl_from
-	            AND cl_target_id=lt_id AND lt_namespace=14
-	            AND lt_title IN ({})
-	            AND cl_type='subcat'",
-                placeholders
-            );
-            check = self
-                .db
-                .query_commons(&["page", "categorylinks", "linktarget"], &sql, remaining)
-                .await?;
-            if check.is_empty() {
-                break;
-            }
-            subcats.extend(check.iter().cloned());
-            depth -= 1;
-        }
-        // Convert to a sorted Vec to match the previous behaviour (callers rely on
-        // the result being usable as SQL IN-list parameters).
-        let mut result: Vec<String> = subcats.into_iter().collect();
-        result.sort();
-        Ok(result)
-    }
-
-    // TESTED
+    /// Pages in namespace `namespace` (6 for files) in a category tree, as
+    /// DB keys. Namespace 14 returns the tree's categories themselves.
     pub async fn get_pages_in_category(
         &self,
-        category: &str,
+        category: &CategoryTitle,
         depth: isize,
         namespace: isize,
     ) -> Result<Vec<String>> {
-        let category = category.replace(" ", "_");
-        let categories = self
-            .find_subcats(std::slice::from_ref(&category), depth)
-            .await?;
+        let categories = category_tree(category, depth, |cats| async move {
+            let sql = format!(
+                "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
+                FROM page,categorylinks,linktarget
+                WHERE page_id=cl_from
+                AND cl_target_id=lt_id AND lt_namespace=14
+                AND lt_title IN ({})
+                AND cl_type='subcat'",
+                sql_placeholders(cats.len())
+            );
+            self.db.query_commons(&CATEGORY_TABLES, &sql, cats).await
+        })
+        .await?;
         if namespace == 14 {
             return Ok(categories);
         }
@@ -451,11 +413,7 @@ impl Baglama2 {
             );
             let mut result = self
                 .db
-                .query_commons(
-                    &["page", "categorylinks", "linktarget"],
-                    &sql,
-                    cats.to_vec(),
-                )
+                .query_commons(&CATEGORY_TABLES, &sql, cats.to_vec())
                 .await?;
             ret.append(&mut result);
         }
@@ -523,32 +481,25 @@ mod tests {
     }
 
     #[test]
-    fn test_dump_code_from_server_url() {
-        assert_eq!(
-            Baglama2::dump_code_from_server_url("https://en.wikipedia.org"),
-            Some("en.wikipedia".to_string())
-        );
-        assert_eq!(
-            Baglama2::dump_code_from_server_url("https://www.wikidata.org/"),
-            Some("wikidata".to_string())
-        );
-        assert_eq!(
-            Baglama2::dump_code_from_server_url("https://example.com"),
-            None
-        );
-    }
-
-    #[test]
     fn test_groups_to_deactivate() {
-        let groups: Vec<(DbId, String)> = (1..=30).map(|i| (i, format!("Cat {i}"))).collect();
-        let all: HashSet<String> = groups.iter().map(|(_, c)| c.clone()).collect();
+        let cat = |s: &str| CategoryTitle::parse(s).unwrap();
+        let groups: Vec<(GroupId, CategoryTitle)> = (1..=30)
+            .map(|i| (GroupId::new(i).unwrap(), cat(&format!("Cat {i}"))))
+            .collect();
+        let all: HashSet<CategoryTitle> = groups.iter().map(|(_, c)| c.clone()).collect();
         assert!(groups_to_deactivate(&groups, &all, 20).unwrap().is_empty());
         let mut some = all.clone();
-        some.remove("Cat 7");
+        some.remove(&cat("Cat 7"));
         assert_eq!(
             groups_to_deactivate(&groups, &some, 20).unwrap(),
-            vec![(7, "Cat 7".to_string())]
+            vec![(GroupId::new(7).unwrap(), cat("Cat 7"))]
         );
+        // Commons spells it with underscores: still the same category.
+        let from_commons: HashSet<CategoryTitle> =
+            (1..=30).map(|i| cat(&format!("Cat_{i}"))).collect();
+        assert!(groups_to_deactivate(&groups, &from_commons, 20)
+            .unwrap()
+            .is_empty());
         // An empty lookup result would switch off everything: refused.
         assert!(groups_to_deactivate(&groups, &HashSet::new(), 20).is_err());
         assert_eq!(
@@ -636,11 +587,23 @@ mod tests {
     #[ignore = "needs the DB tunnels from connect_db.sh"]
     async fn test_get_pages_in_category() {
         let baglama = Baglama2::new(Config::load().unwrap()).await.unwrap();
+        let blue_sky = CategoryTitle::parse("Blue sky in Berlin").unwrap();
         let images = baglama
-            .get_pages_in_category("Blue sky in Berlin", 3, 6)
+            .get_pages_in_category(&blue_sky, 3, 6)
             .await
             .unwrap();
         assert!(images.contains(&"2013-06-07_Kindergartenfest_Berlin-Karow_03.jpg".to_string()));
+        // Depth 0 is the category alone, and each level adds subcategories.
+        let mut last = 0;
+        for depth in 0..3 {
+            let cats = baglama
+                .get_pages_in_category(&blue_sky, depth, 14)
+                .await
+                .unwrap();
+            assert!(cats.contains(&"Blue_sky_in_Berlin".to_string()));
+            assert!(cats.len() > last, "depth {depth}: {cats:?}");
+            last = cats.len();
+        }
     }
 
     #[tokio::test]

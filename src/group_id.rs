@@ -1,5 +1,6 @@
 use std::num::NonZero;
 
+/// A `groups.id`. Zero is not a valid ID, so it cannot be represented.
 pub type GroupId = NonZero<usize>;
 
 #[cfg(test)]

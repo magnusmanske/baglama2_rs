@@ -91,8 +91,8 @@ When `SELECT storage,COUNT(*) FROM group_status GROUP BY storage` shows no
 After step 2, `viewdata/gzb/` on NFS holds all view data, at about
 530 MB a month.
 
-- [ ] Back up somewhere other than NFS, and do it before deleting sources.
-- [ ] Optional: a header checksum in a future format version. Chunk data is
+- [x] Back up somewhere other than NFS, and do it before deleting sources.
+- [x] Optional: a header checksum in a future format version. Chunk data is
       already covered by gzip's CRC; the JSON header is not. Only worth it
       together with another reason to bump `VERSION`, as PHP has to follow.
 

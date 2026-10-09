@@ -1,10 +1,11 @@
 use crate::db::{sql_placeholders, value2opt_string, Db};
+use crate::wiki::Dbname;
 use anyhow::Result;
 use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct GlobalImageLinks {
-    pub wiki: String,
+    pub wiki: Dbname,
     pub page_namespace_id: i32,
     /// Local namespace name, e.g. `Kategorie`; empty for the main namespace.
     pub page_namespace: String,
@@ -45,7 +46,8 @@ impl FromRow for GlobalImageLinks {
     {
         let ret = Self {
             wiki: row
-                .get(0)
+                .get::<String, _>(0)
+                .and_then(|wiki| Dbname::parse(&wiki).ok())
                 .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
             page_namespace_id: row
                 .get(1)
