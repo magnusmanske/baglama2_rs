@@ -11,6 +11,9 @@
 set -euo pipefail
 
 IMAGE=tool-glamtools/tool-glamtools:latest
+# Toolforge's per-job maximum. The tool has 8Gi in all and the webservice
+# holds ~1.5Gi, so a month job leaves room only for small jobs beside it.
+MONTH_MEM=6Gi
 BIN=target/release/baglama2
 
 run_job() { # name mem command...
@@ -47,7 +50,7 @@ check | month)
 			echo "Run months one at a time (replica connection limit; see GZB.md)." >&2
 			exit 1
 		fi
-		run_job "gzb-$year-$month" 3Gi gzb_month "$year" "$month" "$@"
+		run_job "gzb-$year-$month" "$MONTH_MEM" gzb_month "$year" "$month" "$@"
 	fi
 	;;
 tsv)
@@ -61,7 +64,7 @@ tsv)
 	;;
 schedule)
 	toolforge jobs delete gzb-monthly 2>/dev/null || true
-	toolforge jobs run --mem 3Gi --cpu 3 --mount=all --image "$IMAGE" \
+	toolforge jobs run --mem "$MONTH_MEM" --cpu 3 --mount=all --image "$IMAGE" \
 		--command "$BIN gzb_month lm lm" \
 		--schedule "17 3 3 * *" \
 		--filelog -o "$HOME/gzb-monthly.out" -e "$HOME/gzb-monthly.err" gzb-monthly

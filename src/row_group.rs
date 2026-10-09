@@ -1,4 +1,4 @@
-use crate::category::CategoryTitle;
+use crate::category::{effective_depth, CategoryTitle};
 use crate::db::{value2opt_string, Db};
 use crate::GroupId;
 use anyhow::{anyhow, Result};
@@ -7,8 +7,9 @@ use mysql_async::{from_row_opt, prelude::*, FromRowError, Row};
 /// What a group tracks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupSource {
-    /// Files in a category tree, `depth` levels of subcategories deep (all
-    /// levels if negative); see [`crate::category::category_tree`].
+    /// Files in a category tree, `depth` levels of subcategories deep as
+    /// stored; the walk is capped at [`crate::category::MAX_DEPTH`], see
+    /// [`crate::category::category_tree`].
     Category { title: CategoryTitle, depth: isize },
     /// Files uploaded by a user.
     Uploader(String),
@@ -55,7 +56,14 @@ impl RowGroup {
     /// What the group tracks, for people: `Category:NASA (depth 5)`.
     pub fn label(&self) -> String {
         match &self.source {
-            GroupSource::Category { title, depth } => format!("Category:{title} (depth {depth})"),
+            GroupSource::Category { title, depth } => {
+                let walked = effective_depth(*depth);
+                if walked == *depth {
+                    format!("Category:{title} (depth {depth})")
+                } else {
+                    format!("Category:{title} (depth {depth}, capped at {walked})")
+                }
+            }
             GroupSource::Uploader(name) => format!("files uploaded by User:{name}"),
         }
     }

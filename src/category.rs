@@ -57,11 +57,28 @@ impl fmt::Display for CategoryTitle {
     }
 }
 
+/// Deepest category tree `gzb_month` walks, whatever a group asks for.
+///
+/// Some groups ask for depth 10 to 80, and a negative depth means all
+/// levels. Commons categories link widely, so trees that deep reach much of
+/// Commons: "Armenia" at depth 20 made the 2026-01 run run out of memory.
+pub const MAX_DEPTH: isize = 5;
+
+/// The depth a tree is actually walked to: `depth`, capped at [`MAX_DEPTH`].
+pub fn effective_depth(depth: isize) -> isize {
+    if (0..=MAX_DEPTH).contains(&depth) {
+        depth
+    } else {
+        MAX_DEPTH
+    }
+}
+
 /// The DB keys of a category tree: `root` plus `depth` levels of
-/// subcategories, or all levels if `depth` is negative. So depth 0 is the
-/// category alone. The same rule as `ToolforgeCommon::findSubcats`, which
-/// the legacy pipelines used. `subcats` returns the subcategories (DB keys)
-/// of a set of categories.
+/// subcategories, at most [`MAX_DEPTH`] (also for a negative depth, which
+/// used to mean all levels). So depth 0 is the category alone. Otherwise the
+/// same rule as `ToolforgeCommon::findSubcats`, which the legacy pipelines
+/// used. `subcats` returns the subcategories (DB keys) of a set of
+/// categories.
 pub async fn category_tree<F, Fut>(
     root: &CategoryTitle,
     depth: isize,
@@ -73,7 +90,7 @@ where
 {
     let mut seen: HashSet<String> = HashSet::new();
     let mut level = vec![root.db_key()];
-    let mut depth = depth;
+    let mut depth = effective_depth(depth);
     loop {
         // Only categories not seen yet: trees can have cycles.
         level.retain(|category| seen.insert(category.clone()));
@@ -165,6 +182,36 @@ mod tests {
         .await
         .unwrap();
         ret
+    }
+
+    #[test]
+    fn test_effective_depth() {
+        assert_eq!(effective_depth(0), 0);
+        assert_eq!(effective_depth(3), 3);
+        assert_eq!(effective_depth(MAX_DEPTH), MAX_DEPTH);
+        assert_eq!(effective_depth(20), MAX_DEPTH);
+        assert_eq!(effective_depth(-1), MAX_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn test_category_tree_capped() {
+        // A chain: L0 → L1 → … → L9.
+        let mut levels_queried = 0;
+        let tree = category_tree(&CategoryTitle::parse("L0").unwrap(), 20, |cats| {
+            levels_queried += 1;
+            let next: Vec<String> = cats
+                .iter()
+                .filter_map(|c| c[1..].parse::<u32>().ok())
+                .filter(|n| *n < 9)
+                .map(|n| format!("L{}", n + 1))
+                .collect();
+            async move { Ok(next) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(levels_queried, MAX_DEPTH as usize);
+        assert_eq!(tree.len(), MAX_DEPTH as usize + 1);
+        assert!(tree.contains(&format!("L{MAX_DEPTH}")));
     }
 
     #[tokio::test]
