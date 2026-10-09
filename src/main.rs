@@ -110,11 +110,6 @@ fn positional(argv: &[String]) -> Vec<String> {
         "--groups",
         "--list-jobs",
         "--build-jobs",
-        "--storage",
-        "--from",
-        "--to",
-        "--limit",
-        "--jobs",
         "--max",
         "--out",
     ];
@@ -139,10 +134,6 @@ gzb commands (view data as one compressed file per group-month):
       Generate a month for all active groups (or --groups). Runs gzb_check
       first and stops on any problem; --no-check skips that. Resumable: re-run
       the same command after a failure. --force replaces complete data.
-  gzb_convert [--storage=file,mysql,sqlite3] [--from=YYYYMM] [--to=YYYYMM]
-              [--groups=1,2] [--limit=N] [--jobs=3] [--dry-run] [--no-switch]
-      Convert completed legacy group-months; sources are left untouched.
-      --dry-run only reports; --no-switch writes files but leaves group_status.
   gzb_show GROUP YEAR MONTH [WIKI] [--max=20]
       Print a gzb file's per-wiki totals, or one wiki's top pages.
   gzb_tsv GROUP YEAR MONTH [WIKI] [--out=FILE]
@@ -259,24 +250,6 @@ async fn run_gzb_command(command: &str, argv: &[String], baglama: Arc<Baglama2>)
             )
             .await?;
             job.run().await
-        }
-        "gzb_convert" => {
-            let mut opts = gzb::convert::ConvertOptions {
-                group_ids: group_ids_flag(argv),
-                from: parsed_flag(argv, "from"),
-                to: parsed_flag(argv, "to"),
-                limit: parsed_flag(argv, "limit"),
-                dry_run: has_flag(argv, "dry-run"),
-                no_switch: has_flag(argv, "no-switch"),
-                ..Default::default()
-            };
-            if let Some(storages) = flag_value(argv, "storage") {
-                opts.storages = storages.split(',').map(|s| s.to_string()).collect();
-            }
-            if let Some(jobs) = parsed_flag(argv, "jobs") {
-                opts.jobs = jobs;
-            }
-            gzb::convert::run(baglama, opts).await
         }
         "gzb_tsv" => {
             let group_id: usize = pos

@@ -1,19 +1,13 @@
-use crate::DbId;
 use anyhow::Result;
 use mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Site {
-    id: DbId,
     server: Option<String>,
     giu_code: Option<String>,
 }
 
 impl Site {
-    pub fn id(&self) -> DbId {
-        self.id
-    }
-
     pub fn server(&self) -> &Option<String> {
         &self.server
     }
@@ -29,11 +23,8 @@ impl FromRow for Site {
         Self: Sized,
     {
         Ok(Self {
-            id: row
-                .get(0)
-                .ok_or_else(|| mysql_async::FromRowError(row.to_owned()))?,
-            server: row.get(1).unwrap(),
-            giu_code: row.get(2).unwrap(),
+            server: row.get(0).unwrap(),
+            giu_code: row.get(1).unwrap(),
         })
     }
 }

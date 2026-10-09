@@ -23,7 +23,6 @@
 //! namespace prefix in the title (as in the pageview dump); converted legacy
 //! data keeps whatever form the legacy store had.
 
-pub mod convert;
 pub mod month;
 pub mod tsv;
 
@@ -594,35 +593,6 @@ pub fn db_views(views: u64) -> u64 {
     } else {
         views
     }
-}
-
-/// Ensure `group_status.storage` accepts [`STORAGE`]. Appending an ENUM value
-/// is a metadata-only change on InnoDB, so this is cheap and idempotent.
-pub async fn ensure_storage_enum(baglama: &crate::Baglama2) -> Result<()> {
-    use mysql_async::prelude::*;
-    let mut conn = baglama.get_tooldb_conn().await?;
-    let column_type: Option<String> = conn
-        .query_first(
-            "SELECT COLUMN_TYPE FROM information_schema.COLUMNS
-             WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='group_status' AND COLUMN_NAME='storage'",
-        )
-        .await?;
-    let column_type = column_type.ok_or_else(|| anyhow!("group_status.storage not found"))?;
-    if column_type.contains(&format!("'{STORAGE}'")) {
-        return Ok(());
-    }
-    let expected = "enum('file','mysql','sqlite3','mysql2')";
-    if column_type != expected {
-        return Err(anyhow!(
-            "group_status.storage is {column_type}, expected {expected}; not altering it automatically"
-        ));
-    }
-    log::info!("Adding '{STORAGE}' to group_status.storage");
-    conn.query_drop(format!(
-        "ALTER TABLE group_status MODIFY `storage` enum('file','mysql','sqlite3','mysql2','{STORAGE}') NOT NULL DEFAULT 'sqlite3'"
-    ))
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]

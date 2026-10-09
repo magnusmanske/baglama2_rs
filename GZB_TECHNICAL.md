@@ -1,7 +1,7 @@
 # gzb — technical reference
 
 Specification of the gzb view-data format and of the files and database
-state around it. For running, converting and deploying, see
+state around it. For running and deploying, see
 [GZB.md](GZB.md).
 
 - [1. Overview](#1-overview)
@@ -269,8 +269,8 @@ compressed size, so ~41 MB for the largest group.
 <gzb root>/<YYYYMM>/<group_id>.gzb
 ```
 
-`<gzb root>` is `gzb_data_root_path` from `config.json` if set, otherwise
-`<sqlite_data_root_path>/gzb`. On Toolforge that is
+`<gzb root>` is `gzb_data_root_path` from `config.json` (required). On
+Toolforge that is
 `/data/project/glamtools/viewdata/gzb`. `YYYYMM` is zero-padded, e.g.
 `202609`.
 
@@ -284,17 +284,16 @@ One row per group and month (unique on `group_id, year, month`):
 
 | Column | For gzb |
 |---|---|
-| `storage` | `'gzb'`. Added to the ENUM by the first `gzb_month` or `gzb_convert` run. |
+| `storage` | `'gzb'`, the only value since all legacy storage was converted. |
 | `status` | `GENERATING PAGE LIST` → `SCANNED` → `VIEW DATA COMPLETE`, or `FAILED`. Only `VIEW DATA COMPLETE` rows are listed by the API. |
-| `total_views` | Header `total_views`, clamped to 2,147,483,647 (the column is a signed `INT`). Set on completion. Conversions leave the legacy value in place. |
-| `file`, `sqlite3` | Not used by gzb. Conversions leave them untouched, so the legacy source stays findable. |
+| `total_views` | Header `total_views`, clamped to 2,147,483,647 (the column is a signed `INT`). Set on completion. Converted rows kept their legacy value. |
 
 ### API mapping (`Baglama2Api.php`)
 
-| Action | gzb branch |
+| Action | Reads |
 |---|---|
 | `month_overview` | Header `sites[]`; `server`, `name`, `language` and `project` are joined from the tool DB `sites` table on `giu_code`. |
-| `month_site` | `rows(giu, max)`; returns `title`, `namespace_id`, `views` and `files` per row, as the other storage branches do. |
+| `month_site` | `rows(giu, max)`; returns `title`, `namespace_id`, `views` and `files` per row. |
 
 ## 9. Data provenance
 
@@ -317,8 +316,10 @@ Written by `gzb_month` (`src/gzb/month.rs`):
 
 ### 9.2 Converted files (`source: sqlite3`, `mysql`, `file`)
 
-Written by `gzb_convert` (`src/gzb/convert.rs`). Rows are what the legacy
-API showed; totals are what the legacy month overview showed.
+Written by `gzb_convert` (`src/gzb/convert.rs`, removed once every legacy
+group-month was converted, October 2026). Rows are what the legacy API
+showed; totals are what the legacy month overview showed. The sources are
+deleted, so these files are the only copy.
 
 | Source | Rows from | `pages` / `views` from | Not carried over |
 |---|---|---|---|
@@ -381,14 +382,14 @@ bucket. That is 12 bytes per page, ~300 MB for 25M pages.
 
 ### Conversion log: `<gzb root>/conversion.log`
 
-Appended by `gzb_convert` for each switched row; tab-separated:
+Written by `gzb_convert` for each switched row; tab-separated:
 
 ```
 time  group_status.id  group_id  YYYYMM  old storage  source
 ```
 
-`UPDATE group_status SET storage='<old storage>' WHERE id=<id>` switches a
-row back; the legacy source is never modified.
+A record of where every converted group-month came from. It was the
+rollback path while the sources existed; they are deleted now.
 
 ## 11. Versioning
 

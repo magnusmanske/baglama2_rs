@@ -3,7 +3,6 @@
 #
 #   ./run_gzb.sh check 2026 9            preflight only: dump, replicas, DB, dirs
 #   ./run_gzb.sh month 2026 9 [FLAGS]    check, then generate a month (resumable: just re-run)
-#   ./run_gzb.sh convert [FLAGS]         convert legacy data, e.g. --storage=file
 #   ./run_gzb.sh tsv 979 2026 9 [WIKI]   export to ~/gzb-tsv/979-2026-9[-WIKI].tsv
 #   ./run_gzb.sh schedule                monthly cron: last month, on the 3rd
 #
@@ -51,10 +50,6 @@ check | month)
 		run_job "gzb-$year-$month" 3Gi gzb_month "$year" "$month" "$@"
 	fi
 	;;
-convert)
-	shift
-	run_job gzb-convert 5Gi gzb_convert "$@"
-	;;
 tsv)
 	group=${2:?group ID expected}
 	year=${3:?year expected}
@@ -72,7 +67,7 @@ schedule)
 		--filelog -o "$HOME/gzb-monthly.out" -e "$HOME/gzb-monthly.err" gzb-monthly
 	;;
 *)
-	sed -n '2,11p' "$0"
+	sed -n '2,10p' "$0"
 	exit 1
 	;;
 esac

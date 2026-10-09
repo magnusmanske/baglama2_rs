@@ -59,22 +59,32 @@ When `SELECT storage,COUNT(*) FROM group_status GROUP BY storage` shows no
       chunk row counts are consistent. Once the sources are gone, a bad file
       cannot be regenerated.
 - [x] Set up an off-NFS backup of `viewdata/gzb/` (see 3) before deleting.
-- [ ] Delete the legacy sources: `viewdata/<YYYYMM>/*.sqlite3`, the flat files
+- [x] Delete the legacy sources: `viewdata/<YYYYMM>/*.sqlite3`, the flat files
       named in `group_status.file`, and the tool DB tables `group2view`,
       `views`, `gs2site` (34.6 GB), `pages`, `files` and `viewdata_*`.
+      Done 2026-10-09, after checking that all 63,007 complete rows have a
+      gzb file. Also dropped `tmp_files` (empty) and the views `vw_pages`
+      and `vw_group2view`; kept the `overview` view (reads only
+      `group_status`).
 - [ ] Drop the `group_status.file` and `group_status.sqlite3` columns, and
       narrow the `storage` enum. That leaves the tool DB with roughly
-      `groups`, `group_status` and `sites`.
-- [ ] Remove `src/gzb/convert.rs`, the `gzb_convert` command, the
+      `groups`, `group_status` and `sites`. **Wait until the PHP change below
+      is deployed:** the old `Baglama2Api.php` reads `$o->file` and
+      `$o->sqlite3` from `SELECT *`. Then:
+      `ALTER TABLE group_status DROP COLUMN file, DROP COLUMN sqlite3,
+      MODIFY storage enum('gzb') NOT NULL DEFAULT 'gzb';`
+- [x] Remove `src/gzb/convert.rs`, the `gzb_convert` command, the
       `run_gzb.sh convert` case, the `rusqlite` dependency (its bundled SQLite
       build is a large share of compile time), `baglama.sqlite3_schema`, and
-      `sqlite_data_root_path` in `Baglama2`. Careful: without a
-      `gzb_data_root_path` key in `config.json`, the gzb root is
-      `<sqlite_data_root_path>/gzb`, so set that key first.
-- [ ] PHP (`glamtools`): remove the `file`, `sqlite3`, `mysql` and `mysql2`
+      `sqlite_data_root_path` in `Baglama2`. `gzb_data_root_path` is now
+      required and set in both configs (Toolforge backup:
+      `config.json.bak-20261008`). Also removed `ensure_storage_enum` and the
+      legacy-storage cases in `plan_group`.
+- [x] PHP (`glamtools`): remove the `file`, `sqlite3`, `mysql` and `mysql2`
       branches from `Baglama2Api.php`, so gzb is the only storage and the
-      "Unknown storage type" failure mode goes away.
-- [ ] Update `GZB.md` (the conversion section) and the memory notes.
+      "Unknown storage type" failure mode goes away. Committed in glamtools
+      (f8c7169); **not yet pushed or deployed.**
+- [x] Update `GZB.md` (the conversion section) and the memory notes.
 
 ## 3. gzb files are the only copy
 

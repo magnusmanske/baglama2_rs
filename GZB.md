@@ -51,9 +51,8 @@ the same command:
 
 The work dir is removed after a fully successful run over all groups.
 `--groups=1,2` limits a run (and keeps the work dir); `--force` regenerates
-groups that are already complete — including legacy ones, so careful.
-Groups with complete legacy data are skipped by default; `mysql2` rows are
-not (they never got view counts).
+groups that are already complete, so careful: for months converted from
+legacy data, it replaces them with data from today's category contents.
 
 Matching is by `(dump wiki code, namespace-prefixed title)`, using
 `gil_page_namespace` — same form as the dump, no API calls for namespace
@@ -65,32 +64,15 @@ the closed `strategy.wikimedia` and `usability.wikimedia` (tool DB has them
 as `.wikipedia.org`; ~90k views/month combined). Private and deleted wikis
 have no dump entries anyway. Main_Page views are ignored, as before.
 
-## Converting legacy data (`gzb_convert`)
+## Legacy data
 
-```bash
-./run_gzb.sh convert --dry-run                       # counts, missing sources, sizes
-./run_gzb.sh convert --storage=file                  # 2010–2014 flat files
-./run_gzb.sh convert --storage=mysql --from=201402 --to=201412
-./run_gzb.sh convert --storage=sqlite3 --limit=100 --no-switch   # trial, no DB change
-```
-
-Each converted file is read back before `group_status.storage` is switched to
-`gzb`; per-wiki totals are taken from the legacy `gs2site` so the overview
-does not change. **Sources are never modified or deleted.** Every switch is
-logged to `viewdata/gzb/conversion.log` (time, group_status id, group,
-YYYYMM, old storage, source); switching back is
-`UPDATE group_status SET storage='<old>' WHERE id=<id>`.
-
-Freeing the space is a separate, manual step once you are happy:
-`viewdata/<YYYYMM>/*.sqlite3` per converted month, and for the `mysql` era
-the tool DB tables `group2view`, `views`, `gs2site` (34.6 GB) once
-`SELECT COUNT(*) FROM group_status WHERE storage='mysql'` is 0. `pages`,
-`files` and the `viewdata_*` tables were only used by the `mysql2` pipeline,
-which has been removed; nothing reads them now.
-
-`mysql2` months (2026-01, 2026-05; 2025-12 was dropped) are not convertible
-— no views. Regenerate them with `gzb_month 2026 1` etc.; page lists then
-reflect current category contents.
+All older view data (2010–2014 flat files, the `mysql` era tables and the
+per-group SQLite files) was converted to gzb in October 2026; the `mysql2`
+months (2026-01, 2026-05), which never got view counts, were regenerated
+with `gzb_month`. The sources, the legacy tool DB tables and `gzb_convert`
+are gone; the tool DB holds `groups`, `group_status` and `sites`. Converted
+files keep their `source` in the header; see GZB_TECHNICAL.md 9.2 for what
+they contain. The conversion code is in git history (`src/gzb/convert.rs`).
 
 ## Exporting as TSV (`gzb_tsv`)
 
@@ -108,17 +90,14 @@ converted legacy data the stored totals can differ from the row count
 
 ## Deploying
 
-1. PHP first (`glamtools`): `GzbReader`, the `gzb` branches in
-   `Baglama2Api.php`, `Baglama::constructGzbFilename`. Without it, a `gzb`
-   group-month shows "Unknown storage type".
-2. Push this repo, then on Toolforge as `tools.glamtools`:
+1. Push this repo, then on Toolforge as `tools.glamtools`:
    `cd ~/baglama2_rs && git pull && ./build.sh` (builds the image from
    GitHub; `toolforge build show` for progress).
-3. `./run_gzb.sh check 2026 9`, then `./run_gzb.sh month 2026 9`.
-4. Monthly: `./run_gzb.sh schedule` (3rd of the month, last month).
+2. `./run_gzb.sh check 2026 9`, then `./run_gzb.sh month 2026 9`.
+3. Monthly: `./run_gzb.sh schedule` (3rd of the month, last month).
 
-The first run adds `'gzb'` to the `group_status.storage` enum (metadata-only
-ALTER).
+`config.json` needs `gzb_data_root_path` (`/data/project/glamtools/viewdata/gzb`
+on Toolforge), which must match `Baglama::constructGzbFilename` in PHP.
 
 Job limits: 6 GiB / 3 CPU per job, 8 GiB for the tool, of which the
 webservice holds ~1.5 GiB. `month` jobs ask for 3 GiB, so two would fit in
@@ -127,8 +106,7 @@ while another month job (including `gzb-monthly`) is running. The replicas
 allow the tool 10 connections per cluster across all its jobs, and each
 month job uses up to 6 at once in phase 1. When 2026-06 and 2026-07 ran
 together, about 30 groups each failed with `max_user_connections` and
-600 s timeouts. `convert` asks for 5 GiB (giant legacy SQLite files), so it
-runs alone. A job that does not fit is not queued: `kubectl get events`
+600 s timeouts. A job that does not fit is not queued: `kubectl get events`
 shows "exceeded quota".
 
 Replica failures in phase 1 are handled in three places:
@@ -152,10 +130,5 @@ already complete when it died, and the old code reached 2.3 GiB building
 group 979 alone; next to other groups, a 3× larger view table and what
 phase 1 left behind, that exceeds the old 5 GiB limit.
 
-`gzb_convert` uses the same compact rows (one SQLite scan each for `views`
-and `group2view` instead of a join, which made SQLite build a transient index
-on the unindexed `group2view.view_id`). On a synthetic 2.5M-page, 573 MB
-SQLite file: 0.38 GB peak, down from 1.42 GB; output identical. Flat-file
-sources are streamed and count towards `--jobs` by size, like SQLite files.
 Writers move compressed data beyond 64 MiB to `<gid>.gzb.data.tmp` next to
 the output instead of keeping it in memory.

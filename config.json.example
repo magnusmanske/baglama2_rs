@@ -18,5 +18,5 @@
 		"max_connections": 20,
 		"keep_sec": 60
 	},
-	"sqlite_data_root_path": "viewdata"
+	"gzb_data_root_path": "viewdata/gzb"
 }

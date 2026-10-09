@@ -80,23 +80,14 @@ pub enum Plan {
     BuildFile,
 }
 
-/// What to do with one group, given its `group_status` row for the month.
-pub fn plan_group(
-    status: Option<&str>,
-    storage: Option<&str>,
-    work_file_exists: bool,
-    force: bool,
-) -> Plan {
+/// What to do with one group, given its `group_status` status for the month.
+pub fn plan_group(status: Option<&str>, work_file_exists: bool, force: bool) -> Plan {
     if force {
         return Plan::ListPages;
     }
-    match (status, storage) {
-        (None, _) => Plan::ListPages,
-        (Some(STATUS_COMPLETE), Some(STORAGE)) => Plan::Skip("already complete"),
-        // mysql2 rows never got view counts; replace them.
-        (Some(STATUS_COMPLETE), Some("mysql2")) => Plan::ListPages,
-        (Some(STATUS_COMPLETE), _) => Plan::Skip("complete legacy data; --force replaces it"),
-        (Some(STATUS_SCANNED), Some(STORAGE)) if work_file_exists => Plan::BuildFile,
+    match status {
+        Some(STATUS_COMPLETE) => Plan::Skip("already complete"),
+        Some(STATUS_SCANNED) if work_file_exists => Plan::BuildFile,
         _ => Plan::ListPages,
     }
 }
@@ -259,23 +250,14 @@ impl GzbMonth {
             .query_first("SELECT COUNT(*) FROM `groups` WHERE is_active=1")
             .await?;
         println!("tool DB: OK, {} active groups", active.unwrap_or(0));
-        let rows: Vec<(String, String, u64)> = conn
+        let rows: Vec<(String, u64)> = conn
             .exec(
-                "SELECT storage,status,COUNT(*) FROM group_status WHERE year=? AND month=? GROUP BY storage,status",
+                "SELECT status,COUNT(*) FROM group_status WHERE year=? AND month=? GROUP BY status",
                 (self.ym.year(), self.ym.month()),
             )
             .await?;
-        for (storage, status, n) in rows {
-            println!("  existing for {}: {n} × {storage}/{status}", self.ym);
-        }
-        let column_type: Option<String> = conn
-            .query_first(
-                "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() \
-                 AND TABLE_NAME='group_status' AND COLUMN_NAME='storage'",
-            )
-            .await?;
-        if !column_type.unwrap_or_default().contains("'gzb'") {
-            println!("  group_status.storage lacks 'gzb'; it will be added on the first run");
+        for (status, n) in rows {
+            println!("  existing for {}: {n} × {status}", self.ym);
         }
         Ok(())
     }
@@ -298,7 +280,6 @@ impl GzbMonth {
                 .dump
                 .ok_or_else(|| anyhow!("no dump despite a clean check"))?
         };
-        ensure_storage_enum(&self.baglama).await?;
         self.baglama.update_sites().await?;
 
         let plans = self.select_groups().await?;
@@ -370,12 +351,12 @@ impl GzbMonth {
     }
 
     async fn select_groups(&self) -> Result<Vec<(usize, Plan)>> {
-        let rows: Vec<(usize, u8, Option<String>, Option<String>)> = self
+        let rows: Vec<(usize, u8, Option<String>)> = self
             .baglama
             .get_tooldb_conn()
             .await?
             .exec(
-                "SELECT g.id,g.is_active,gs.status,gs.storage FROM `groups` g
+                "SELECT g.id,g.is_active,gs.status FROM `groups` g
                  LEFT JOIN group_status gs ON gs.group_id=g.id AND gs.year=? AND gs.month=?",
                 (self.ym.year(), self.ym.month()),
             )
@@ -386,7 +367,7 @@ impl GzbMonth {
             .as_ref()
             .map(|ids| ids.iter().copied().collect());
         let mut ret = vec![];
-        for (id, is_active, status, storage) in rows {
+        for (id, is_active, status) in rows {
             let selected = match &wanted {
                 Some(ids) => ids.contains(&id),
                 None => is_active == 1,
@@ -396,7 +377,6 @@ impl GzbMonth {
             }
             let plan = plan_group(
                 status.as_deref(),
-                storage.as_deref(),
                 self.work_file(id).is_file(),
                 self.opts.force,
             );
@@ -948,35 +928,26 @@ mod tests {
 
     #[test]
     fn test_plan_group() {
-        assert_eq!(plan_group(None, None, false, false), Plan::ListPages);
+        assert_eq!(plan_group(None, false, false), Plan::ListPages);
         assert_eq!(
-            plan_group(Some(STATUS_COMPLETE), Some("gzb"), false, false),
+            plan_group(Some(STATUS_COMPLETE), false, false),
             Plan::Skip("already complete")
         );
-        assert!(matches!(
-            plan_group(Some(STATUS_COMPLETE), Some("sqlite3"), false, false),
-            Plan::Skip(_)
-        ));
         assert_eq!(
-            plan_group(Some(STATUS_COMPLETE), Some("mysql2"), false, false),
-            Plan::ListPages
-        );
-        assert_eq!(
-            plan_group(Some(STATUS_SCANNED), Some("gzb"), true, false),
+            plan_group(Some(STATUS_SCANNED), true, false),
             Plan::BuildFile
         );
         // A SCANNED row without its page list (deleted work dir) is redone.
         assert_eq!(
-            plan_group(Some(STATUS_SCANNED), Some("gzb"), false, false),
-            Plan::ListPages
-        );
-        // mysql2 SCANNED rows have no gzb page list.
-        assert_eq!(
-            plan_group(Some(STATUS_SCANNED), Some("mysql2"), true, false),
+            plan_group(Some(STATUS_SCANNED), false, false),
             Plan::ListPages
         );
         assert_eq!(
-            plan_group(Some(STATUS_COMPLETE), Some("gzb"), true, true),
+            plan_group(Some(STATUS_FAILED), true, false),
+            Plan::ListPages
+        );
+        assert_eq!(
+            plan_group(Some(STATUS_COMPLETE), true, true),
             Plan::ListPages
         );
     }

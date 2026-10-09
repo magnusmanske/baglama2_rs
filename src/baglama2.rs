@@ -113,26 +113,14 @@ impl Baglama2 {
         Ok(ret)
     }
 
-    pub fn sqlite_data_root_path(&self) -> String {
-        self.config
-            .get("sqlite_data_root_path")
-            .expect("sqlite_data_root_path not found")
-            .as_str()
-            .expect("sqlite_data_root_path not found")
-            .to_string()
-    }
-
-    /// Root directory of the gzb view-data files. Defaults to `gzb` inside
-    /// the SQLite data root, which is where the PHP API looks.
+    /// Root directory of the gzb view-data files, where the PHP API reads
+    /// them (`viewdata/gzb` on Toolforge).
     pub fn gzb_data_root_path(&self) -> std::path::PathBuf {
-        match self
-            .config
+        self.config
             .get("gzb_data_root_path")
             .and_then(|v| v.as_str())
-        {
-            Some(path) => path.into(),
-            None => std::path::Path::new(&self.sqlite_data_root_path()).join("gzb"),
-        }
+            .expect("gzb_data_root_path missing from config.json")
+            .into()
     }
 
     /// The code a wiki has in the pageview dumps: its host name without
@@ -361,7 +349,7 @@ impl Baglama2 {
     }
 
     async fn populate_sites(&mut self) -> Result<()> {
-        let sql = "SELECT id,server,giu_code FROM `sites`";
+        let sql = "SELECT server,giu_code FROM `sites`";
         self.sites_cache = self
             .get_tooldb_conn()
             .await?
