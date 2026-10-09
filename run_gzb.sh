@@ -6,7 +6,7 @@
 #   ./run_gzb.sh tsv 979 2026 9 [WIKI]   export to ~/gzb-tsv/979-2026-9[-WIKI].tsv
 #   ./run_gzb.sh schedule                monthly cron: last month, on the 3rd
 #
-# FLAGS are passed through; see `target/release/baglama2 help`.
+# FLAGS are passed through; see `target/release/baglama2 <command> --help`.
 # Logs go to ~/gzb-<job>.out and ~/gzb-<job>.err.
 set -euo pipefail
 

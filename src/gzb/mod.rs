@@ -41,9 +41,6 @@ pub const MAGIC: &str = "BAGLAMA-GZB";
 pub const VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "gzb";
 
-/// Value of `group_status.storage` for group-months stored in this format.
-pub const STORAGE: &str = "gzb";
-
 /// Rows per gzip member. Small enough that the API's usual "top 100" request
 /// inflates a few hundred KB, large enough to compress well.
 pub const CHUNK_ROWS: usize = 5000;

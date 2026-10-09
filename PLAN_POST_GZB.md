@@ -7,8 +7,8 @@ State at writing: all `file` group-months have been converted to `gzb`.
 with `gzb_month`. See [GZB.md](GZB.md) for running the pipeline and
 [GZB_TECHNICAL.md](GZB_TECHNICAL.md) for the format.
 
-Order of work: 1 is done (2026-10-08). 2 waits until conversion is complete
-and verified. The rest can go in whenever convenient.
+Order of work: 1 and 2 are done (2026-10-08/09), 4 and 5 on 2026-10-09.
+3 is deferred.
 
 ## 1. Retire the legacy generation pipelines
 
@@ -102,23 +102,30 @@ After step 2, `viewdata/gzb/` on NFS holds all view data, at about
 tool DB (Trove), loads sites and calls the Wikidata API. When Trove was down
 (2026-09-15), even reading a local gzb file failed.
 
-- [ ] Dispatch `gzb_show`/`gzb_tsv` before `Baglama2::new()`. They need only
+- [x] Dispatch `gzb_show`/`gzb_tsv` before `Baglama2::new()`. They need only
       the gzb root (from `config.json`) and the file. Make the group label in
       the TSV comments best-effort: try the DB with a short timeout and leave
-      the label out if that fails.
+      the label out if that fails. Done 2026-10-09: 10 s label timeout; tested
+      with the tool DB refusing connections and with it not answering.
 
 ## 5. Smaller cleanups, once 1 is done
 
-- [ ] Replace the hand-rolled argument parsing in `main.rs` (`positional`,
+- [x] Replace the hand-rolled argument parsing in `main.rs` (`positional`,
       `VALUE_FLAGS`, `flag_value`, `parsed_flag`, `has_flag`,
       `group_ids_flag`) with `clap`. That is a quick change with only the
       `gzb_*` commands left, and gives correct per-command `--help`.
-- [ ] Split `Baglama2` (config, DB pools, sites cache, category queries,
+      `gzb_check` now accepts only `--dump` (the only option it used).
+- [x] Split `Baglama2` (config, DB pools, sites cache, category queries,
       group status) into config/connections plus a small `group_status`
-      module.
-- [ ] Benchmark `gzb_month` and `gzb_convert` without mimalloc's `secure`
+      module. Now `config.rs` (typed `Config`, no I/O beyond the file),
+      `db.rs` (`Db`: pools, retries, `query_commons`), `group_status.rs`, and
+      `RowGroup::load`. `Baglama2` keeps the site matrix, the sites cache and
+      the category queries.
+- [x] Benchmark `gzb_month` and `gzb_convert` without mimalloc's `secure`
       feature. It costs speed and memory for hardening this batch tool does
-      not need.
+      not need. Result (2026-10-09, `bench_large_group`, see GZB.md): no
+      speed difference, and *more* peak memory without `secure` (about +15%).
+      Kept `secure`. `gzb_convert` no longer exists.
 
 ## Not changing
 

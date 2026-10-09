@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Result};
 use baglama2::*;
 use chrono::{DateTime, Datelike, Months, Utc};
-use log::{error, info};
+use clap::{Args, Parser, Subcommand};
+use config::Config;
+use log::{error, info, warn};
+use row_group::RowGroup;
 use site::Site;
-use std::env;
 use std::future::Future;
 use std::num::NonZero;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use year_month::YearMonth;
@@ -17,7 +19,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub type DbId = usize;
 
 mod baglama2;
+mod config;
+mod db;
 mod global_image_links;
+mod group_status;
 mod gzb;
 mod pageviews;
 mod row_group;
@@ -26,18 +31,133 @@ mod year_month;
 
 pub type GroupId = NonZero<DbId>;
 
-fn month(month: Option<&String>) -> u32 {
-    match month.map(|s| s.as_str()) {
-        Some("lm") => {
-            let last: DateTime<Utc> = Utc::now()
-                .checked_sub_months(Months::new(1))
-                .unwrap_or_else(|| panic!("Bad month: could not subtract 1 month from current date (input: {month:?})"));
-            last.month()
-        }
-        Some(s) => s
-            .parse::<u32>()
-            .unwrap_or_else(|_| panic!("Month: number expected, not '{s}'")),
-        None => panic!("Month expected but missing"),
+/// How long `gzb_tsv` waits for the tool DB for its group label.
+const LABEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// BaGLAMa 2 view data: one compressed gzb file per group and month.
+#[derive(Debug, Parser)]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Check dump, replicas, tool DB and output dirs for a month; changes nothing.
+    #[command(name = "gzb_check")]
+    GzbCheck {
+        #[command(flatten)]
+        month: MonthArg,
+        /// Pageview dump to use instead of the one on Toolforge's dumps mount.
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
+    /// Generate a month for all active groups (or --groups).
+    ///
+    /// Runs gzb_check first and stops on any problem. Resumable: re-run the
+    /// same command after a failure.
+    #[command(name = "gzb_month")]
+    GzbMonth {
+        #[command(flatten)]
+        month: MonthArg,
+        #[command(flatten)]
+        flags: MonthFlags,
+    },
+    /// Print a gzb file's per-wiki totals, or one wiki's top pages.
+    #[command(name = "gzb_show")]
+    GzbShow {
+        group: usize,
+        #[command(flatten)]
+        month: MonthArg,
+        /// Show this wiki's pages, e.g. enwiki.
+        wiki: Option<String>,
+        /// Pages to show for WIKI.
+        #[arg(long, default_value_t = 20)]
+        max: usize,
+    },
+    /// Export a gzb file (or one wiki of it) as tab-separated text, with '#'
+    /// metadata lines above the header.
+    #[command(name = "gzb_tsv")]
+    GzbTsv {
+        group: usize,
+        #[command(flatten)]
+        month: MonthArg,
+        /// Export only this wiki, e.g. enwiki.
+        wiki: Option<String>,
+        /// Write here instead of to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Add new wikis to the sites table and fill in missing language names.
+    /// gzb_month does this too.
+    #[command(name = "update_sites")]
+    UpdateSites,
+}
+
+#[derive(Debug, Args)]
+struct MonthArg {
+    /// Year, or "lm" for last month's.
+    #[arg(value_parser = parse_year)]
+    year: i32,
+    /// Month (1-12), or "lm" for last month.
+    #[arg(value_parser = parse_month)]
+    month: u32,
+}
+
+impl MonthArg {
+    fn year_month(&self) -> Result<YearMonth> {
+        YearMonth::new(self.year, self.month)
+    }
+}
+
+#[derive(Debug, Args)]
+struct MonthFlags {
+    /// Pageview dump to use instead of the one on Toolforge's dumps mount.
+    #[arg(long)]
+    dump: Option<PathBuf>,
+    /// Only these groups (active or not), e.g. --groups=1,2.
+    #[arg(long, value_delimiter = ',')]
+    groups: Option<Vec<usize>>,
+    /// Regenerate groups that are already complete.
+    #[arg(long)]
+    force: bool,
+    /// Groups listed at once in phase 1 (replica-bound).
+    #[arg(long, default_value_t = 6)]
+    list_jobs: usize,
+    /// Group files built at once in phase 3 (CPU-bound).
+    #[arg(long, default_value_t = 3)]
+    build_jobs: usize,
+    /// Keep page lists and views.bin after a fully successful run.
+    #[arg(long)]
+    keep_work: bool,
+    /// Skip the gzb_check preflight.
+    #[arg(long)]
+    no_check: bool,
+}
+
+fn last_month() -> DateTime<Utc> {
+    Utc::now()
+        .checked_sub_months(Months::new(1))
+        .expect("current date minus one month")
+}
+
+fn parse_year(s: &str) -> Result<i32, String> {
+    match s {
+        "lm" => Ok(last_month().year()),
+        _ => s
+            .parse()
+            .map_err(|_| format!("year or 'lm' expected, not '{s}'")),
+    }
+}
+
+fn parse_month(s: &str) -> Result<u32, String> {
+    match s {
+        "lm" => Ok(last_month().month()),
+        _ => match s.parse() {
+            Ok(month @ 1..=12) => Ok(month),
+            _ => Err(format!("month 1-12 or 'lm' expected, not '{s}'")),
+        },
     }
 }
 
@@ -62,146 +182,20 @@ where
     }
 }
 
-/// Value of `--name=VALUE` or `--name VALUE`, anywhere on the command line.
-fn flag_value(argv: &[String], name: &str) -> Option<String> {
-    let prefix = format!("--{name}=");
-    let bare = format!("--{name}");
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(v) = arg.strip_prefix(&prefix) {
-            return Some(v.to_string());
-        }
-        if *arg == bare {
-            return iter.next().cloned();
-        }
-    }
-    None
-}
-
-fn has_flag(argv: &[String], name: &str) -> bool {
-    let bare = format!("--{name}");
-    argv.contains(&bare)
-}
-
-fn parsed_flag<T: std::str::FromStr>(argv: &[String], name: &str) -> Option<T> {
-    flag_value(argv, name).map(|v| {
-        v.parse()
-            .unwrap_or_else(|_| panic!("--{name}: cannot parse '{v}'"))
-    })
-}
-
-/// `--groups=1,2,3`
-fn group_ids_flag(argv: &[String]) -> Option<Vec<usize>> {
-    flag_value(argv, "groups").map(|v| {
-        v.split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.parse()
-                    .unwrap_or_else(|_| panic!("--groups: bad id '{s}'"))
-            })
-            .collect()
-    })
-}
-
-/// Arguments that are not `--flags` (nor a flag's separate value).
-fn positional(argv: &[String]) -> Vec<String> {
-    const VALUE_FLAGS: &[&str] = &[
-        "--dump",
-        "--groups",
-        "--list-jobs",
-        "--build-jobs",
-        "--max",
-        "--out",
-    ];
-    let mut ret = vec![];
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if VALUE_FLAGS.contains(&arg.as_str()) {
-            iter.next();
-        } else if !arg.starts_with("--") {
-            ret.push(arg.clone());
-        }
-    }
-    ret
-}
-
-const USAGE: &str = "\
-Commands (gzb: view data as one compressed file per group-month):
-  gzb_check YEAR MONTH [--dump=PATH]
-      Check dump, replicas, tool DB and output dirs for a month; changes nothing.
-  gzb_month YEAR MONTH [--dump=PATH] [--groups=1,2] [--force] [--list-jobs=6]
-                       [--build-jobs=3] [--keep-work] [--no-check]
-      Generate a month for all active groups (or --groups). Runs gzb_check
-      first and stops on any problem; --no-check skips that. Resumable: re-run
-      the same command after a failure. --force replaces complete data.
-  gzb_show GROUP YEAR MONTH [WIKI] [--max=20]
-      Print a gzb file's per-wiki totals, or one wiki's top pages.
-  gzb_tsv GROUP YEAR MONTH [WIKI] [--out=FILE]
-      Export a gzb file (or one wiki of it) as tab-separated text, with
-      '#' metadata lines above the header. Writes to stdout without --out.
-  update_sites
-      Add new wikis to the sites table and fill in missing language names.
-      gzb_month does this too.
-YEAR and MONTH may be 'lm' for last month.";
-
-const COMMANDS: &[&str] = &[
-    "gzb_check",
-    "gzb_month",
-    "gzb_show",
-    "gzb_tsv",
-    "update_sites",
-];
-
-/// Extract an optional dump-file override from the command line.
-/// Accepts both `--dump=PATH` and `--dump PATH` (space-separated). The flag
-/// may appear at any position; positional args are unaffected.
-fn dump_override(argv: &[String]) -> Option<PathBuf> {
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(path) = arg.strip_prefix("--dump=") {
-            return Some(PathBuf::from(path));
-        }
-        if arg == "--dump" {
-            return iter.next().map(PathBuf::from);
-        }
-    }
-    None
-}
-
-fn year(year: Option<&String>) -> i32 {
-    match year.map(|s| s.as_str()) {
-        Some("lm") => {
-            let last: DateTime<Utc> = Utc::now()
-                .checked_sub_months(Months::new(1))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Bad year: could not subtract 1 month from current date (input: {year:?})"
-                    )
-                });
-            last.year()
-        }
-        Some(s) => s
-            .parse::<i32>()
-            .unwrap_or_else(|_| panic!("Year: number expected, not '{s}'")),
-        None => panic!("Year expected but missing"),
-    }
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    // Unconditional startup banner to STDOUT (line-buffered, flushes on
-    // newline). If this line does not appear in the captured output, the
-    // running binary is not this build, or output is not being captured —
-    // before debugging logic, fix that. Includes the build version so a
-    // stale deploy is obvious. To stderr when stdout carries data (gzb_tsv
-    // without --out).
-    let args: Vec<String> = env::args().skip(1).collect();
+    let cli = Cli::parse();
+    // Unconditional startup banner. If this line does not appear in the
+    // captured output, the running binary is not this build, or output is
+    // not being captured — before debugging logic, fix that. Includes the
+    // build version so a stale deploy is obvious. To stderr when stdout
+    // carries data (gzb_tsv without --out).
     let banner = format!(
-        "baglama2 v{} starting — args: {args:?}",
-        env!("CARGO_PKG_VERSION")
+        "baglama2 v{} starting — {:?}",
+        env!("CARGO_PKG_VERSION"),
+        cli.command
     );
-    if args.first().is_some_and(|c| c == "gzb_tsv") && !args.iter().any(|a| a.starts_with("--out"))
-    {
+    if matches!(cli.command, Command::GzbTsv { out: None, .. }) {
         eprintln!("{banner}");
     } else {
         println!("{banner}");
@@ -211,48 +205,53 @@ async fn main() -> Result<()> {
     // macros are silently discarded. Defaults to `info`; override per-module
     // via the RUST_LOG env var (e.g. `RUST_LOG=baglama2=trace`).
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let argv: Vec<String> = env::args_os()
-        .map(|s| s.into_string().expect("Bad argv"))
-        .collect();
-    let command = argv.get(1).map(|s| s.as_str()).unwrap_or_default();
-    if command.is_empty() || command == "help" || command == "--help" {
-        println!("{USAGE}");
-        return Ok(());
-    }
-    if !COMMANDS.contains(&command) {
-        return Err(anyhow!("Unknown command '{command}'\n{USAGE}"));
-    }
-    info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
-    let baglama = Arc::new(with_timeout("Baglama2::new", 600, Baglama2::new()).await?);
-    run_command(command, &argv, baglama).await
-}
 
-async fn run_command(command: &str, argv: &[String], baglama: Arc<Baglama2>) -> Result<()> {
-    let pos = positional(argv);
-    let ym_at = |i: usize| {
-        YearMonth::new(year(pos.get(i)), month(pos.get(i + 1)))
-            .unwrap_or_else(|e| panic!("bad year/month: {e}"))
-    };
-    match command {
-        "gzb_check" | "gzb_month" => {
-            let ym = ym_at(2);
+    let config = Config::load()?;
+    // Reading a gzb file needs only the config: these work while the tool
+    // DB is down.
+    match cli.command {
+        Command::GzbShow {
+            group,
+            month,
+            wiki,
+            max,
+        } => return show(&config, group, &month.year_month()?, wiki.as_deref(), max),
+        Command::GzbTsv {
+            group,
+            month,
+            wiki,
+            out,
+        } => return tsv(&config, group, &month.year_month()?, wiki, out.as_deref()).await,
+        _ => {}
+    }
+
+    info!("Starting up; initializing Baglama2 (config + DB pool + Wikidata API)");
+    let baglama = Arc::new(with_timeout("Baglama2::new", 600, Baglama2::new(config)).await?);
+    match cli.command {
+        Command::GzbCheck { month, dump } => {
             let opts = gzb::month::MonthOptions {
-                dump_override: dump_override(argv),
-                group_ids: group_ids_flag(argv),
-                force: has_flag(argv, "force"),
-                list_jobs: parsed_flag(argv, "list-jobs").unwrap_or(6),
-                build_jobs: parsed_flag(argv, "build-jobs").unwrap_or(3),
-                keep_work: has_flag(argv, "keep-work"),
-                no_check: has_flag(argv, "no-check"),
+                dump_override: dump,
+                ..Default::default()
             };
-            let job = gzb::month::GzbMonth::new(baglama.clone(), ym, opts);
-            if command == "gzb_check" {
-                let report = job.check().await?;
-                if !report.problems.is_empty() {
-                    return Err(anyhow!("{} problem(s)", report.problems.len()));
-                }
-                return Ok(());
+            let report = gzb::month::GzbMonth::new(baglama, month.year_month()?, opts)
+                .check()
+                .await?;
+            if !report.problems.is_empty() {
+                return Err(anyhow!("{} problem(s)", report.problems.len()));
             }
+            Ok(())
+        }
+        Command::GzbMonth { month, flags } => {
+            let opts = gzb::month::MonthOptions {
+                dump_override: flags.dump,
+                group_ids: flags.groups,
+                force: flags.force,
+                list_jobs: flags.list_jobs,
+                build_jobs: flags.build_jobs,
+                keep_work: flags.keep_work,
+                no_check: flags.no_check,
+            };
+            let job = gzb::month::GzbMonth::new(baglama.clone(), month.year_month()?, opts);
             // As before every monthly run.
             with_timeout(
                 "deactivate_nonexistent_categories",
@@ -262,101 +261,128 @@ async fn run_command(command: &str, argv: &[String], baglama: Arc<Baglama2>) -> 
             .await?;
             job.run().await
         }
-        "update_sites" => with_timeout("update_sites", 600, baglama.update_sites()).await,
-        "gzb_tsv" => {
-            let group_id: usize = pos
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .expect("group ID expected");
-            let ym = ym_at(3);
-            let path = gzb::gzb_path(&baglama.gzb_data_root_path(), group_id, &ym);
-            let mut reader = gzb::GzbReader::open(&path)?;
-            let group_label = baglama
-                .get_group(&GroupId::try_from(group_id)?)
-                .await
-                .ok()
-                .flatten()
-                .map(|g| {
-                    if g.is_user_name() {
-                        format!("files uploaded by User:{}", g.category())
-                    } else {
-                        format!("Category:{} (depth {})", g.category(), g.depth())
-                    }
-                });
-            let meta = gzb::tsv::TsvMeta {
-                group_label,
-                wiki: pos.get(5).cloned(),
-            };
-            let rows = match flag_value(argv, "out") {
-                Some(out) => {
-                    let file = std::fs::File::create(&out)?;
-                    let rows =
-                        gzb::tsv::export(&mut reader, &meta, &mut std::io::BufWriter::new(file))?;
-                    println!("{rows} rows written to {out}");
-                    rows
-                }
-                None => {
-                    let stdout = std::io::stdout();
-                    gzb::tsv::export(&mut reader, &meta, &mut stdout.lock())?
-                }
-            };
-            info!("gzb_tsv: {rows} rows");
-            Ok(())
-        }
-        "gzb_show" => {
-            let group_id: usize = pos
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .expect("group ID expected");
-            let ym = ym_at(3);
-            let path = gzb::gzb_path(&baglama.gzb_data_root_path(), group_id, &ym);
-            let mut reader = gzb::GzbReader::open(&path)?;
-            let h = reader.header().clone();
-            match pos.get(5) {
-                None => {
-                    println!(
-                        "{}: group {} {}-{:02}, source {}, created {}\n{} pages, {} views, {} wikis",
-                        path.display(),
-                        h.group_id,
-                        h.year,
-                        h.month,
-                        h.source,
-                        h.created,
-                        h.total_pages,
-                        h.total_views,
-                        h.sites.len()
-                    );
-                    for site in &h.sites {
-                        println!("{}\t{}\t{}", site.giu, site.pages, site.views);
-                    }
-                }
-                Some(giu) => {
-                    let max = parsed_flag(argv, "max").unwrap_or(20);
-                    for row in reader.rows(giu, max)? {
-                        println!(
-                            "{}\t{}\t{}\t{}",
-                            row.views,
-                            row.namespace_id,
-                            row.title,
-                            row.files.join("|")
-                        );
-                    }
-                }
-            }
-            Ok(())
-        }
-        other => Err(anyhow!("Unknown command '{other}'\n{USAGE}")),
+        Command::UpdateSites => with_timeout("update_sites", 600, baglama.update_sites()).await,
+        Command::GzbShow { .. } | Command::GzbTsv { .. } => unreachable!("handled above"),
     }
+}
+
+fn show(
+    config: &Config,
+    group: usize,
+    ym: &YearMonth,
+    wiki: Option<&str>,
+    max: usize,
+) -> Result<()> {
+    let path = gzb::gzb_path(&config.gzb_data_root_path, group, ym);
+    let mut reader = gzb::GzbReader::open(&path)?;
+    let h = reader.header().clone();
+    match wiki {
+        None => {
+            println!(
+                "{}: group {} {}-{:02}, source {}, created {}\n{} pages, {} views, {} wikis",
+                path.display(),
+                h.group_id,
+                h.year,
+                h.month,
+                h.source,
+                h.created,
+                h.total_pages,
+                h.total_views,
+                h.sites.len()
+            );
+            for site in &h.sites {
+                println!("{}\t{}\t{}", site.giu, site.pages, site.views);
+            }
+        }
+        Some(giu) => {
+            for row in reader.rows(giu, max)? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    row.views,
+                    row.namespace_id,
+                    row.title,
+                    row.files.join("|")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn tsv(
+    config: &Config,
+    group: usize,
+    ym: &YearMonth,
+    wiki: Option<String>,
+    out: Option<&Path>,
+) -> Result<()> {
+    let path = gzb::gzb_path(&config.gzb_data_root_path, group, ym);
+    let mut reader = gzb::GzbReader::open(&path)?;
+    let meta = gzb::tsv::TsvMeta {
+        group_label: group_label(config, group).await,
+        wiki,
+    };
+    let rows = match out {
+        Some(out) => {
+            let file = std::fs::File::create(out)?;
+            let rows = gzb::tsv::export(&mut reader, &meta, &mut std::io::BufWriter::new(file))?;
+            println!("{rows} rows written to {}", out.display());
+            rows
+        }
+        None => gzb::tsv::export(&mut reader, &meta, &mut std::io::stdout().lock())?,
+    };
+    info!("gzb_tsv: {rows} rows");
+    Ok(())
+}
+
+/// What the group tracks, for the TSV comments. Best-effort: without the
+/// tool DB, the export goes ahead without it.
+async fn group_label(config: &Config, group: usize) -> Option<String> {
+    let load = async {
+        let db = db::Db::new(config)?;
+        RowGroup::load(&db, GroupId::try_from(group)?).await
+    };
+    let group = match tokio::time::timeout(LABEL_TIMEOUT, load).await {
+        Ok(Ok(Some(group))) => group,
+        Ok(Ok(None)) => return None,
+        Ok(Err(e)) => {
+            warn!("no group label, tool DB failed: {e:#}");
+            return None;
+        }
+        Err(_) => {
+            warn!(
+                "no group label, tool DB did not answer within {}s",
+                LABEL_TIMEOUT.as_secs()
+            );
+            return None;
+        }
+    };
+    Some(if group.is_user_name() {
+        format!("files uploaded by User:{}", group.category())
+    } else {
+        format!("Category:{} (depth {})", group.category(), group.depth())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("baglama2").chain(args.iter().copied()))
+            .unwrap()
+            .command
+    }
 
     #[test]
-    fn test_flags_and_positional() {
-        let a = argv(&[
-            "bin",
+    fn test_cli_definition() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_gzb_month_flags() {
+        let Command::GzbMonth { month, flags } = parse(&[
             "gzb_month",
             "2026",
             "9",
@@ -366,73 +392,68 @@ mod tests {
             "/x.bz2",
             "--build-jobs=2",
             "--no-check",
-        ]);
-        assert_eq!(positional(&a), vec!["bin", "gzb_month", "2026", "9"]);
-        assert_eq!(group_ids_flag(&a), Some(vec![1, 2]));
-        assert!(has_flag(&a, "force"));
-        assert!(!has_flag(&a, "keep-work"));
-        assert!(has_flag(&a, "no-check"));
-        assert_eq!(dump_override(&a), Some(PathBuf::from("/x.bz2")));
-        assert_eq!(parsed_flag::<usize>(&a, "build-jobs"), Some(2));
-        assert_eq!(parsed_flag::<usize>(&a, "list-jobs"), None);
+        ]) else {
+            panic!("not gzb_month");
+        };
+        assert_eq!((month.year, month.month), (2026, 9));
+        assert_eq!(flags.groups, Some(vec![1, 2]));
+        assert!(flags.force && flags.no_check && !flags.keep_work);
+        assert_eq!(flags.dump, Some(PathBuf::from("/x.bz2")));
+        assert_eq!((flags.list_jobs, flags.build_jobs), (6, 2));
     }
 
     #[test]
-    fn test_month_numeric() {
-        assert_eq!(month(Some(&"3".to_string())), 3);
-        assert_eq!(month(Some(&"12".to_string())), 12);
-        assert_eq!(month(Some(&"1".to_string())), 1);
-    }
-
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn test_dump_override_equals_form() {
-        let a = argv(&["bin", "gzb_month", "2026", "5", "--dump=/tmp/d.bz2"]);
-        assert_eq!(dump_override(&a), Some(PathBuf::from("/tmp/d.bz2")));
+    fn test_dump_equals_form() {
+        let Command::GzbCheck { dump, .. } = parse(&["gzb_check", "2026", "5", "--dump=/d.bz2"])
+        else {
+            panic!("not gzb_check");
+        };
+        assert_eq!(dump, Some(PathBuf::from("/d.bz2")));
     }
 
     #[test]
-    fn test_dump_override_space_form() {
-        let a = argv(&["bin", "gzb_month", "2026", "5", "--dump", "/tmp/d.bz2"]);
-        assert_eq!(dump_override(&a), Some(PathBuf::from("/tmp/d.bz2")));
+    fn test_show_positionals() {
+        let Command::GzbShow {
+            group,
+            month,
+            wiki,
+            max,
+        } = parse(&["gzb_show", "979", "2026", "9", "enwiki", "--max=5"])
+        else {
+            panic!("not gzb_show");
+        };
+        assert_eq!((group, month.year, month.month), (979, 2026, 9));
+        assert_eq!(wiki.as_deref(), Some("enwiki"));
+        assert_eq!(max, 5);
     }
 
     #[test]
-    fn test_dump_override_absent() {
-        let a = argv(&["bin", "gzb_month", "2026", "5"]);
-        assert_eq!(dump_override(&a), None);
+    fn test_tsv_without_wiki() {
+        let Command::GzbTsv { wiki, out, .. } =
+            parse(&["gzb_tsv", "979", "2026", "9", "--out", "/tmp/x.tsv"])
+        else {
+            panic!("not gzb_tsv");
+        };
+        assert_eq!(wiki, None);
+        assert_eq!(out, Some(PathBuf::from("/tmp/x.tsv")));
     }
 
     #[test]
-    #[should_panic(expected = "Month: number expected, not 'foo'")]
-    fn test_month_bad_string_panics_with_value() {
-        month(Some(&"foo".to_string()));
+    fn test_parse_year_month() {
+        assert_eq!(parse_year("2023"), Ok(2023));
+        assert_eq!(parse_year("lm"), Ok(last_month().year()));
+        assert!(parse_year("bar").is_err());
+        assert_eq!(parse_month("3"), Ok(3));
+        assert_eq!(parse_month("12"), Ok(12));
+        assert_eq!(parse_month("lm"), Ok(last_month().month()));
+        assert!(parse_month("13").is_err());
+        assert!(parse_month("0").is_err());
+        assert!(parse_month("foo").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "Month expected but missing")]
-    fn test_month_none_panics() {
-        month(None);
-    }
-
-    #[test]
-    fn test_year_numeric() {
-        assert_eq!(year(Some(&"2023".to_string())), 2023);
-        assert_eq!(year(Some(&"2000".to_string())), 2000);
-    }
-
-    #[test]
-    #[should_panic(expected = "Year: number expected, not 'bar'")]
-    fn test_year_bad_string_panics_with_value() {
-        year(Some(&"bar".to_string()));
-    }
-
-    #[test]
-    #[should_panic(expected = "Year expected but missing")]
-    fn test_year_none_panics() {
-        year(None);
+    fn test_unknown_command_and_missing_month() {
+        assert!(Cli::try_parse_from(["baglama2", "mysql2_views", "2026", "5"]).is_err());
+        assert!(Cli::try_parse_from(["baglama2", "gzb_month", "2026"]).is_err());
     }
 }

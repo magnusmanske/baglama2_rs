@@ -88,6 +88,11 @@ Wikis in order of views, pages by views; streamed chunk by chunk. For
 converted legacy data the stored totals can differ from the row count
 (the old pipelines counted pages differently); the comments then say so.
 
+`gzb_tsv` and `gzb_show` need only `config.json` and the file, not the
+tool DB or any API, so they work during a Trove outage. `gzb_tsv` takes
+the group label from the tool DB if it answers within 10 s, and leaves it
+out otherwise.
+
 ## Deploying
 
 1. Push this repo, then on Toolforge as `tools.glamtools`:
@@ -129,6 +134,15 @@ failures were in phase 3, not the scan: 1047 of 2026-08's groups were
 already complete when it died, and the old code reached 2.3 GiB building
 group 979 alone; next to other groups, a 3× larger view table and what
 phase 1 left behind, that exceeds the old 5 GiB limit.
+
+To measure: `bench_large_group` in `src/gzb/month.rs`, an ignored test that
+runs page-key collection and the phase 3 build on a synthetic 7.3M-page
+group (`BENCH_PAGES` sets the size):
+`/usr/bin/time -l cargo test --release bench_large_group -- --ignored --nocapture`.
+On 2026-10-09 (Apple M-series, 3 runs each) it took 29–30 s with mimalloc's
+`secure` feature and 29–32 s without, but peak RSS was 1.23–1.32 GB with
+`secure` and 1.45–1.52 GB without. Memory is what limits these jobs, so
+`secure` stays.
 
 Writers move compressed data beyond 64 MiB to `<gid>.gzb.data.tmp` next to
 the output instead of keeping it in memory.

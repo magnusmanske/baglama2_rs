@@ -16,7 +16,9 @@
 
 use super::*;
 use crate::global_image_links::GlobalImageLinks;
+use crate::group_status::{self, STATUS_COMPLETE, STATUS_FAILED, STATUS_LISTING, STATUS_SCANNED};
 use crate::pageviews::dump_reader;
+use crate::row_group::RowGroup;
 use crate::{Baglama2, GroupId};
 use log::{error, info, warn};
 use mysql_async::prelude::*;
@@ -24,11 +26,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Semaphore;
-
-pub const STATUS_LISTING: &str = "GENERATING PAGE LIST";
-pub const STATUS_SCANNED: &str = "SCANNED";
-pub const STATUS_COMPLETE: &str = "VIEW DATA COMPLETE";
-pub const STATUS_FAILED: &str = "FAILED";
 
 /// Files per `globalimagelinks` query, as in the older pipelines.
 const GIL_CHUNK: usize = 3000;
@@ -108,7 +105,7 @@ pub struct GzbMonth {
 
 impl GzbMonth {
     pub fn new(baglama: Arc<Baglama2>, ym: YearMonth, opts: MonthOptions) -> Self {
-        let root = baglama.gzb_data_root_path();
+        let root = baglama.config().gzb_data_root_path.clone();
         let work = root.join("work").join(year_month_dir(&ym));
         Self {
             baglama,
@@ -195,7 +192,11 @@ impl GzbMonth {
             &["image", "actor", "user"][..],
         ] {
             let res = async {
-                let mut conn = self.baglama.get_commons_conn_for_tables(tables).await?;
+                let mut conn = self
+                    .baglama
+                    .db()
+                    .get_commons_conn_for_tables(tables)
+                    .await?;
                 // Long queries rely on the server ending them; see `query_commons`.
                 conn.query_drop("SET SESSION max_statement_time=600")
                     .await?;
@@ -245,18 +246,15 @@ impl GzbMonth {
     }
 
     async fn check_tooldb(&self) -> Result<()> {
-        let mut conn = self.baglama.get_tooldb_conn().await?;
-        let active: Option<u64> = conn
+        let active: Option<u64> = self
+            .baglama
+            .db()
+            .get_tooldb_conn()
+            .await?
             .query_first("SELECT COUNT(*) FROM `groups` WHERE is_active=1")
             .await?;
         println!("tool DB: OK, {} active groups", active.unwrap_or(0));
-        let rows: Vec<(String, u64)> = conn
-            .exec(
-                "SELECT status,COUNT(*) FROM group_status WHERE year=? AND month=? GROUP BY status",
-                (self.ym.year(), self.ym.month()),
-            )
-            .await?;
-        for (status, n) in rows {
+        for (status, n) in group_status::counts(self.baglama.db(), &self.ym).await? {
             println!("  existing for {}: {n} × {status}", self.ym);
         }
         Ok(())
@@ -351,16 +349,7 @@ impl GzbMonth {
     }
 
     async fn select_groups(&self) -> Result<Vec<(usize, Plan)>> {
-        let rows: Vec<(usize, u8, Option<String>)> = self
-            .baglama
-            .get_tooldb_conn()
-            .await?
-            .exec(
-                "SELECT g.id,g.is_active,gs.status FROM `groups` g
-                 LEFT JOIN group_status gs ON gs.group_id=g.id AND gs.year=? AND gs.month=?",
-                (self.ym.year(), self.ym.month()),
-            )
-            .await?;
+        let rows = group_status::groups_for_month(self.baglama.db(), &self.ym).await?;
         let wanted: Option<HashSet<usize>> = self
             .opts
             .group_ids
@@ -370,7 +359,7 @@ impl GzbMonth {
         for (id, is_active, status) in rows {
             let selected = match &wanted {
                 Some(ids) => ids.contains(&id),
-                None => is_active == 1,
+                None => is_active,
             };
             if !selected {
                 continue;
@@ -429,7 +418,8 @@ impl GzbMonth {
                     Err(e) => {
                         error!("Phase 1: group {group_id} failed: {e:#}");
                         let _ = std::fs::remove_file(&tmp);
-                        let _ = set_status(&baglama, group_id, &ym, STATUS_FAILED, None).await;
+                        let _ = group_status::set(baglama.db(), group_id, &ym, STATUS_FAILED, None)
+                            .await;
                         None
                     }
                 }
@@ -529,7 +519,9 @@ impl GzbMonth {
                             header.total_views
                         );
                         let total = Some(db_views(header.total_views));
-                        match set_status(&baglama, group_id, &ym, STATUS_COMPLETE, total).await {
+                        match group_status::set(baglama.db(), group_id, &ym, STATUS_COMPLETE, total)
+                            .await
+                        {
                             Ok(()) => true,
                             Err(e) => {
                                 error!("Phase 3: group {group_id}: status update failed: {e}");
@@ -539,7 +531,8 @@ impl GzbMonth {
                     }
                     Err(e) => {
                         error!("Phase 3: group {group_id} failed: {e:#}");
-                        let _ = set_status(&baglama, group_id, &ym, STATUS_FAILED, None).await;
+                        let _ = group_status::set(baglama.db(), group_id, &ym, STATUS_FAILED, None)
+                            .await;
                         false
                     }
                 }
@@ -562,10 +555,9 @@ async fn list_pages(
     tmp: &Path,
     out: &Path,
 ) -> Result<u64> {
-    set_status(baglama, group_id, ym, STATUS_LISTING, None).await?;
+    group_status::set(baglama.db(), group_id, ym, STATUS_LISTING, None).await?;
     let gid = GroupId::try_from(group_id)?;
-    let group = baglama
-        .get_group(&gid)
+    let group = RowGroup::load(baglama.db(), gid)
         .await?
         .ok_or_else(|| anyhow!("group {group_id} not found"))?;
     let files = if group.is_user_name() {
@@ -587,7 +579,7 @@ async fn list_pages(
     );
     let mut rows = 0;
     for chunk in files.chunks(GIL_CHUNK) {
-        for gil in GlobalImageLinks::load(chunk, baglama).await? {
+        for gil in GlobalImageLinks::load(chunk, baglama.db()).await? {
             writeln!(
                 enc,
                 "{}\t{}\t{}\t{}",
@@ -604,37 +596,8 @@ async fn list_pages(
         .map_err(|e| e.into_error())?
         .sync_all()?;
     std::fs::rename(tmp, out)?;
-    set_status(baglama, group_id, ym, STATUS_SCANNED, None).await?;
+    group_status::set(baglama.db(), group_id, ym, STATUS_SCANNED, None).await?;
     Ok(rows)
-}
-
-/// Upsert this month's `group_status` row for a group, as storage `gzb`.
-pub async fn set_status(
-    baglama: &Baglama2,
-    group_id: usize,
-    ym: &YearMonth,
-    status: &str,
-    total_views: Option<u64>,
-) -> Result<()> {
-    let sql = "INSERT INTO `group_status` (group_id,year,month,status,total_views,storage)
-        VALUES (?,?,?,?,?,?)
-        ON DUPLICATE KEY UPDATE status=VALUES(status),total_views=VALUES(total_views),storage=VALUES(storage)";
-    baglama
-        .get_tooldb_conn()
-        .await?
-        .exec_drop(
-            sql,
-            (
-                group_id,
-                ym.year(),
-                ym.month(),
-                status,
-                total_views,
-                STORAGE,
-            ),
-        )
-        .await?;
-    Ok(())
 }
 
 /// Wiki database name (`enwiki`) → pageview dump code (`en.wikipedia`),
@@ -977,6 +940,89 @@ mod tests {
         assert_eq!(back.get(b), 0);
         assert_eq!(back.get(u64::MAX), u32::MAX);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Page keys (phase 2, without the dump scan) and the file build (phase 3)
+    /// for a synthetic group the size of group 979, the largest: 7.3M pages.
+    /// For allocator and memory comparisons; measure peak RSS from outside:
+    /// `/usr/bin/time -l cargo test --release bench_large_group -- --ignored --nocapture`
+    /// `BENCH_PAGES` sets the size.
+    #[test]
+    #[ignore]
+    fn bench_large_group() {
+        use std::time::Instant;
+        let pages: usize = std::env::var("BENCH_PAGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7_300_000);
+        let dir = std::env::temp_dir().join(format!("gzb_bench_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Skewed like real usage: half the pages on one wiki, a quarter on
+        // the next, and so on.
+        let wikis: Vec<(String, String)> = (0..50)
+            .map(|w| (format!("w{w}wiki"), format!("w{w}.wikipedia")))
+            .collect();
+        let page = |i: usize| -> (&(String, String), String) {
+            let w = ((i + 1).trailing_zeros() as usize).min(wikis.len() - 1);
+            (&wikis[w], format!("Page_{i:x}_Zürich_{}", i % 997))
+        };
+
+        let t = Instant::now();
+        let work = dir.join("979.tsv.gz");
+        {
+            let mut enc = GzEncoder::new(
+                std::io::BufWriter::new(File::create(&work).unwrap()),
+                Compression::fast(),
+            );
+            for i in 0..pages {
+                let ((giu, _), title) = page(i);
+                // One or two files per page, shared between pages.
+                for f in 0..1 + i % 2 {
+                    let file = (i + f * 7919) % (pages * 2 / 3);
+                    writeln!(enc, "{giu}\t0\t{title}\tFile_{file}.jpg").unwrap();
+                }
+            }
+            enc.finish().unwrap();
+        }
+        eprintln!("bench: input written in {:.1?}", t.elapsed());
+
+        let mut codes = DumpCodes {
+            baglama: None,
+            known: wikis
+                .iter()
+                .map(|(giu, code)| (giu.clone(), Some(code.clone())))
+                .collect(),
+        };
+        let t = Instant::now();
+        let (mut views, needed) =
+            collect_page_keys(std::slice::from_ref(&work), &mut codes).unwrap();
+        eprintln!(
+            "bench: page keys in {:.1?}: {} pages on {} wikis",
+            t.elapsed(),
+            views.len(),
+            needed.len()
+        );
+        for i in (0..pages).step_by(3) {
+            let ((_, code), title) = page(i);
+            views.add(
+                page_key(code.as_bytes(), title.as_bytes()),
+                (i % 1000) as u64,
+            );
+        }
+
+        let t = Instant::now();
+        let ym = YearMonth::new(2026, 9).unwrap();
+        let out = gzb_path(&dir, 979, &ym);
+        let header = build_group_file(979, &ym, &work, &out, &views, &mut codes).unwrap();
+        eprintln!(
+            "bench: file built in {:.1?}: {} pages, {} views, {} bytes",
+            t.elapsed(),
+            header.total_pages,
+            header.total_views,
+            std::fs::metadata(&out).unwrap().len()
+        );
+        assert_eq!(header.total_pages as usize, pages);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

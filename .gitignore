@@ -2,3 +2,4 @@ target/**
 config.json
 *.bz2
 replica.*
+viewdata/
