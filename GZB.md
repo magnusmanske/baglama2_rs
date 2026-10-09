@@ -51,6 +51,15 @@ the same command:
    "Armenia" at depth 20 made the 2026-01 run run out of memory: Commons
    categories link widely, so deep trees reach much of Commons. The legacy
    pipelines did walk them fully (that group's 2021-08 file is 304 MB).
+   Even at depth 5 a group can be huge ("Pronunciation": 4.2M files), so
+   files stream from the category queries into the `globalimagelinks`
+   queries in batches of 3,000; only the set of file names seen is held.
+   Category titles go into `IN (…)` lists of 1,000 (`IN_CHUNK`): MySQL
+   allows 65,535 placeholders per statement, and a tree level can exceed
+   that (group 903 did in 2026-01). While phases 1–3 run, a `memory: N MB
+   resident` line is logged every minute; a job that dies without any
+   error line was killed for exceeding its memory limit, and that line
+   shows the climb.
 2. **Views**: every page becomes a 64-bit hash key in one in-memory table
    (sorted keys + bucket index, 12 bytes per page: ~25M pages ≈ 300 MB);
    one pass over
@@ -108,7 +117,10 @@ out otherwise.
 
 1. Push this repo, then on Toolforge as `tools.glamtools`:
    `cd ~/baglama2_rs && git pull && ./build.sh` (builds the image from
-   GitHub; `toolforge build show` for progress).
+   GitHub; `toolforge build show` for progress). The `git pull` matters
+   on its own: `run_gzb.sh` (job memory, the launch guard) runs from that
+   checkout, while the binary comes from the image. In 2026-10 a month job
+   ran with the old script's 3 GiB after only the image had been rebuilt.
 2. `./run_gzb.sh check 2026 9`, then `./run_gzb.sh month 2026 9`.
 3. Monthly: `./run_gzb.sh schedule` (3rd of the month, last month).
 

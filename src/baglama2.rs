@@ -82,6 +82,11 @@ fn site_names_to_fill(
     ret
 }
 
+/// Titles per `IN (…)` list. MySQL allows 65,535 placeholders per statement,
+/// and a tree level at depth 5 can have more categories than that (group 903
+/// failed on one in 2026-01).
+pub const IN_CHUNK: usize = 1000;
+
 /// Tables a category-membership query reads.
 const CATEGORY_TABLES: [&str; 3] = ["page", "categorylinks", "linktarget"];
 
@@ -375,51 +380,57 @@ impl Baglama2 {
     }
 
     // TESTED
-    /// Pages in namespace `namespace` (6 for files) in a category tree, as
-    /// DB keys. Namespace 14 returns the tree's categories themselves.
-    pub async fn get_pages_in_category(
+    /// The DB keys of a group's category tree (see [`category_tree`]).
+    pub async fn category_tree_of(
         &self,
         category: &CategoryTitle,
         depth: isize,
-        namespace: isize,
     ) -> Result<Vec<String>> {
-        let categories = category_tree(category, depth, |cats| async move {
-            let sql = format!(
-                "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
-                FROM page,categorylinks,linktarget
-                WHERE page_id=cl_from
-                AND cl_target_id=lt_id AND lt_namespace=14
-                AND lt_title IN ({})
-                AND cl_type='subcat'",
-                sql_placeholders(cats.len())
-            );
-            self.db.query_commons(&CATEGORY_TABLES, &sql, cats).await
+        category_tree(category, depth, |cats| async move {
+            let mut children = vec![];
+            for chunk in cats.chunks(IN_CHUNK) {
+                let sql = format!(
+                    "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
+                    FROM page,categorylinks,linktarget
+                    WHERE page_id=cl_from
+                    AND cl_target_id=lt_id AND lt_namespace=14
+                    AND lt_title IN ({})
+                    AND cl_type='subcat'",
+                    sql_placeholders(chunk.len())
+                );
+                let mut found: Vec<String> = self
+                    .db
+                    .query_commons(&CATEGORY_TABLES, &sql, chunk.to_vec())
+                    .await?;
+                children.append(&mut found);
+            }
+            Ok(children)
         })
-        .await?;
-        if namespace == 14 {
-            return Ok(categories);
+        .await
+    }
+
+    /// The files (DB keys, no redirects) directly in `categories`, which
+    /// must be at most [`IN_CHUNK`] keys. A file in several of them is
+    /// returned once; the caller de-duplicates across calls.
+    pub async fn files_in_categories(&self, categories: &[String]) -> Result<Vec<String>> {
+        if categories.len() > IN_CHUNK {
+            return Err(anyhow!(
+                "files_in_categories: {} categories, at most {IN_CHUNK} per query",
+                categories.len()
+            ));
         }
-        let mut ret = vec![];
-        for cats in categories.chunks(1000) {
-            let placeholders = sql_placeholders(cats.len());
-            let sql = format!(
-                "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
-                FROM page,categorylinks,linktarget
-                WHERE cl_from=page_id AND page_namespace={namespace}
-                AND cl_target_id=lt_id AND lt_namespace=14
-                AND lt_title IN ({})
-                AND page_is_redirect=0",
-                placeholders
-            );
-            let mut result = self
-                .db
-                .query_commons(&CATEGORY_TABLES, &sql, cats.to_vec())
-                .await?;
-            ret.append(&mut result);
-        }
-        ret.sort();
-        ret.dedup();
-        Ok(ret)
+        let sql = format!(
+            "SELECT DISTINCT FROM_BASE64(TO_BASE64(page_title))
+            FROM page,categorylinks,linktarget
+            WHERE cl_from=page_id AND page_namespace=6
+            AND cl_target_id=lt_id AND lt_namespace=14
+            AND lt_title IN ({})
+            AND page_is_redirect=0",
+            sql_placeholders(categories.len())
+        );
+        self.db
+            .query_commons(&CATEGORY_TABLES, &sql, categories.to_vec())
+            .await
     }
 
     /// Gets all images uploaded by a user
@@ -588,22 +599,21 @@ mod tests {
     async fn test_get_pages_in_category() {
         let baglama = Baglama2::new(Config::load().unwrap()).await.unwrap();
         let blue_sky = CategoryTitle::parse("Blue sky in Berlin").unwrap();
-        let images = baglama
-            .get_pages_in_category(&blue_sky, 3, 6)
-            .await
-            .unwrap();
-        assert!(images.contains(&"2013-06-07_Kindergartenfest_Berlin-Karow_03.jpg".to_string()));
         // Depth 0 is the category alone, and each level adds subcategories.
         let mut last = 0;
+        let mut cats = vec![];
         for depth in 0..3 {
-            let cats = baglama
-                .get_pages_in_category(&blue_sky, depth, 14)
-                .await
-                .unwrap();
+            cats = baglama.category_tree_of(&blue_sky, depth).await.unwrap();
             assert!(cats.contains(&"Blue_sky_in_Berlin".to_string()));
             assert!(cats.len() > last, "depth {depth}: {cats:?}");
             last = cats.len();
         }
+        let files = baglama.files_in_categories(&cats).await.unwrap();
+        assert!(files.contains(&"2013-06-07_Kindergartenfest_Berlin-Karow_03.jpg".to_string()));
+        assert!(baglama
+            .files_in_categories(&vec![String::new(); IN_CHUNK + 1])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

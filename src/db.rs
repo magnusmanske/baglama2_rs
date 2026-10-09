@@ -4,7 +4,7 @@
 use crate::config::Config;
 use anyhow::{anyhow, Result};
 use log::warn;
-use mysql_async::{from_row_opt, prelude::*, Conn};
+use mysql_async::{from_row_opt, prelude::*, Conn, FromRowError, Row};
 use std::time::Duration;
 use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
 
@@ -253,9 +253,20 @@ impl Db {
                 // timeout still applies.
                 warn!("query_commons: cannot set max_statement_time: {e}");
             }
+            // Rows are converted as they stream in, so a big result is held
+            // once, not as raw rows and again as `T`.
             let query = async {
                 let result = conn.exec_iter(sql, params.clone()).await?;
-                result.map_and_drop(from_row_opt::<T>).await
+                result
+                    .reduce_and_drop(
+                        Ok(Vec::new()),
+                        |acc: Result<Vec<T>, FromRowError>, row: Row| {
+                            let mut rows = acc?;
+                            rows.push(from_row_opt::<T>(row)?);
+                            Ok(rows)
+                        },
+                    )
+                    .await
             };
             let client_limit = Duration::from_secs(limit) + Self::DB_QUERY_CLIENT_GRACE;
             match tokio::time::timeout(client_limit, query).await {
@@ -263,8 +274,6 @@ impl Db {
                     // A row that does not fit `T` will not fit on a retry
                     // either. An error, not a panic: only this group fails.
                     return rows
-                        .into_iter()
-                        .collect::<Result<Vec<T>, _>>()
                         .map_err(|e| anyhow!("Commons query returned an unexpected row: {e}"));
                 }
                 Ok(Err(e)) if is_server_error(&e, ER_STATEMENT_TIMEOUT) => {

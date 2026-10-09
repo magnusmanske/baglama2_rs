@@ -15,6 +15,7 @@
 //! Group progress is logged in `group_status` as the other pipelines do.
 
 use super::*;
+use crate::baglama2::IN_CHUNK;
 use crate::global_image_links::GlobalImageLinks;
 use crate::group_status::{self, GroupStatus};
 use crate::pageviews::dump_reader;
@@ -25,7 +26,7 @@ use log::{error, info, warn};
 use mysql_async::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 
 /// Files per `globalimagelinks` query, as in the older pipelines.
@@ -280,6 +281,12 @@ impl GzbMonth {
                 .dump
                 .ok_or_else(|| anyhow!("no dump despite a clean check"))?
         };
+        // The check creates these too, but --no-check must not leave every
+        // group failing on a missing directory.
+        for dir in [self.root.join(year_month_dir(&self.ym)), self.work.clone()] {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| anyhow!("cannot create {}: {e}", dir.display()))?;
+        }
         self.baglama.update_sites().await?;
 
         let plans = self.select_groups().await?;
@@ -300,6 +307,7 @@ impl GzbMonth {
             plans.len() - to_list.len() - listed_before.len()
         );
 
+        let memory_log = log_memory_periodically();
         let mut listed = self.phase_list_pages(&to_list, self.opts.list_jobs).await;
         // Failures here are mostly the replicas being overloaded, often by the
         // concurrency itself. One more pass, a group at a time, costs little
@@ -329,6 +337,7 @@ impl GzbMonth {
 
         let views = Arc::new(self.phase_views(&build, &dump).await?);
         let build_failed = self.phase_build(&build, views).await;
+        memory_log.abort();
 
         info!(
             "{}: {} group files written; {list_failed} failed listing pages, {build_failed} failed writing",
@@ -575,36 +584,46 @@ async fn list_pages(
     let group = RowGroup::load(baglama.db(), group_id)
         .await?
         .ok_or_else(|| anyhow!("group {group_id} not found"))?;
-    let files = match group.source() {
-        GroupSource::Uploader(name) => baglama.get_files_from_user_name(name).await?,
-        GroupSource::Category { title, depth } => {
-            baglama.get_pages_in_category(title, *depth, 6).await?
-        }
-    };
-    info!(
-        "group {group_id} ({}): {} files",
-        group.label(),
-        files.len()
-    );
-
     let mut enc = GzEncoder::new(
         std::io::BufWriter::new(File::create(tmp)?),
         Compression::fast(),
     );
-    let mut rows = 0;
-    for chunk in files.chunks(GIL_CHUNK) {
-        for gil in GlobalImageLinks::load(chunk, baglama.db()).await? {
-            writeln!(
-                enc,
-                "{}\t{}\t{}\t{}",
-                gil.wiki,
-                gil.page_namespace_id,
-                gil.dump_title(),
-                gil.to
-            )?;
-            rows += 1;
+    let mut rows = 0u64;
+    let mut batches = FileBatches::default();
+    // Files flow from the category queries into the usage queries a batch at
+    // a time; what stays in memory is the set of file names seen, not the
+    // lists of the largest groups (4.2M files for "Pronunciation").
+    match group.source() {
+        GroupSource::Uploader(name) => {
+            for file in baglama.get_files_from_user_name(name).await? {
+                if let Some(batch) = batches.push(file) {
+                    rows += write_usages(&mut enc, &batch, baglama).await?;
+                }
+            }
+        }
+        GroupSource::Category { title, depth } => {
+            let categories = baglama.category_tree_of(title, *depth).await?;
+            info!(
+                "group {group_id} ({}): {} categories",
+                group.label(),
+                categories.len()
+            );
+            for chunk in categories.chunks(IN_CHUNK) {
+                for file in baglama.files_in_categories(chunk).await? {
+                    if let Some(batch) = batches.push(file) {
+                        rows += write_usages(&mut enc, &batch, baglama).await?;
+                    }
+                }
+            }
         }
     }
+    let last = batches.finish();
+    rows += write_usages(&mut enc, &last, baglama).await?;
+    info!(
+        "group {group_id} ({}): {} files, {rows} usages",
+        group.label(),
+        batches.seen()
+    );
     enc.finish()?
         .into_inner()
         .map_err(|e| e.into_error())?
@@ -612,6 +631,84 @@ async fn list_pages(
     std::fs::rename(tmp, out)?;
     group_status::set(baglama.db(), group_id, ym, GroupStatus::Scanned, None).await?;
     Ok(rows)
+}
+
+/// Collects distinct file names into batches of [`GIL_CHUNK`] for the
+/// `globalimagelinks` query. A file in several categories is seen more than
+/// once and must be queried once.
+#[derive(Default)]
+struct FileBatches {
+    seen: HashSet<String>,
+    pending: Vec<String>,
+}
+
+impl FileBatches {
+    /// Returns a full batch when `file` completes one.
+    fn push(&mut self, file: String) -> Option<Vec<String>> {
+        if !self.seen.insert(file.clone()) {
+            return None;
+        }
+        self.pending.push(file);
+        if self.pending.len() >= GIL_CHUNK {
+            Some(std::mem::take(&mut self.pending))
+        } else {
+            None
+        }
+    }
+
+    /// The last, partial batch.
+    fn finish(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn seen(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// Appends the usages of `files` to the page list; returns the rows written.
+async fn write_usages<W: Write>(enc: &mut W, files: &[String], baglama: &Baglama2) -> Result<u64> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let mut rows = 0;
+    for gil in GlobalImageLinks::load(files, baglama.db()).await? {
+        writeln!(
+            enc,
+            "{}\t{}\t{}\t{}",
+            gil.wiki,
+            gil.page_namespace_id,
+            gil.dump_title(),
+            gil.to
+        )?;
+        rows += 1;
+    }
+    Ok(rows)
+}
+
+/// Resident memory of this process in MB, where `/proc` has it (Linux).
+fn resident_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+/// Logs resident memory every minute until aborted, so a run that is
+/// killed for exceeding its memory limit (no log line, no exit code on
+/// Toolforge) at least shows the climb before it.
+fn log_memory_periodically() -> tokio::task::AbortHandle {
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Some(mb) = resident_mb() {
+                info!("memory: {mb} MB resident");
+            }
+        }
+    })
+    .abort_handle()
 }
 
 /// Wiki database name (`enwiki`) → pageview dump code (`en.wikipedia`),
@@ -930,6 +1027,26 @@ mod tests {
             plan_group(Some(GroupStatus::Complete), true, true),
             Plan::ListPages
         );
+    }
+
+    #[test]
+    fn test_file_batches() {
+        let mut batches = FileBatches::default();
+        let mut full = vec![];
+        for i in 0..(GIL_CHUNK * 2 + 5) {
+            // Every file twice: the repeat must not count.
+            for _ in 0..2 {
+                if let Some(batch) = batches.push(format!("F{i}.jpg")) {
+                    full.push(batch);
+                }
+            }
+        }
+        assert_eq!(full.len(), 2);
+        assert!(full.iter().all(|b| b.len() == GIL_CHUNK));
+        assert_eq!(full[0][0], "F0.jpg");
+        assert_eq!(batches.finish().len(), 5);
+        assert!(batches.finish().is_empty());
+        assert_eq!(batches.seen(), GIL_CHUNK * 2 + 5);
     }
 
     #[test]
