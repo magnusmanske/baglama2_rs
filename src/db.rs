@@ -5,9 +5,7 @@ use crate::config::Config;
 use anyhow::{anyhow, Result};
 use log::warn;
 use mysql_async::{from_row_opt, prelude::*, Conn};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use wikimisc::toolforge_db::{DatabaseError, DbCluster, ToolforgeDB};
 
 /// The wiki whose replica databases this tool reads. Baglama only queries
@@ -342,64 +340,6 @@ impl Db {
             }
         }
         Err(last_err.context(format!("Commons query failed after {attempts} attempts")))
-    }
-
-    /// Server-side time limit for a streamed query ([`Self::stream_commons`]).
-    /// The statement stays open while the caller works through the rows,
-    /// which for the largest groups takes hours; the connection is in use
-    /// the whole time, not abandoned, so the limit is only a backstop.
-    const DB_STREAM_TIME_LIMIT_SECS: u64 = 6 * 60 * 60;
-
-    /// Runs a read query in a background task and hands the rows over a
-    /// channel holding at most `buffer` of them, so the caller can run its
-    /// own queries between rows while the result is never held in memory
-    /// (a single Commons category can have millions of files).
-    ///
-    /// No retry: a failure arrives as an `Err` and ends the stream; the
-    /// caller's unit of work (a group) is what gets retried.
-    pub fn stream_commons<T, P>(
-        self: &Arc<Self>,
-        tables: &[&str],
-        sql: &str,
-        params: P,
-        buffer: usize,
-    ) -> Result<mpsc::Receiver<Result<T>>>
-    where
-        T: FromRow + Send + 'static,
-        P: Into<mysql_async::Params> + Send + 'static,
-    {
-        let pool_key = Self::commons_pool_key_for_tables(tables)?;
-        let (tx, rx) = mpsc::channel(buffer);
-        let db = Arc::clone(self);
-        let sql = sql.to_string();
-        tokio::spawn(async move {
-            let outcome: Result<()> = async {
-                let mut conn = db.get_conn_with_timeout(pool_key).await?;
-                conn.query_drop(format!(
-                    "SET SESSION max_statement_time={}",
-                    Self::DB_STREAM_TIME_LIMIT_SECS
-                ))
-                .await?;
-                let mut result = conn.exec_iter(sql, params).await?;
-                while let Some(row) = result.next().await? {
-                    let row = from_row_opt::<T>(row)
-                        .map_err(|e| anyhow!("Commons query returned an unexpected row: {e}"))?;
-                    if tx.send(Ok(row)).await.is_err() {
-                        // The receiver is gone; abandon the statement rather
-                        // than read the rest of it.
-                        drop(result);
-                        tokio::spawn(conn.disconnect());
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(e) = outcome {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-        Ok(rx)
     }
 
     /// Pause between retries, `hold_on` seconds from the config.

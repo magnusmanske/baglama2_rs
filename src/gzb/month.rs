@@ -425,6 +425,7 @@ impl GzbMonth {
                     Err(e) => {
                         error!("Phase 1: group {group_id} failed: {e:#}");
                         let _ = std::fs::remove_file(&tmp);
+                        let _ = std::fs::remove_file(names_file(&tmp));
                         let _ = group_status::set(
                             baglama.db(),
                             group_id,
@@ -590,7 +591,7 @@ async fn list_pages(
     );
     let mut rows = 0u64;
     let mut batches = FileBatches::default();
-    // Files stream from the category queries into the usage queries a batch
+    // File names stream to a temp file, then into the usage queries a batch
     // at a time, and usages stream into the page list row by row; what stays
     // in memory is the set of file names seen, not the lists of the largest
     // groups (4.8M files for "Uploaded with OpenRefine").
@@ -609,14 +610,29 @@ async fn list_pages(
                 group.label(),
                 categories.len()
             );
-            for chunk in categories.chunks(IN_CHUNK) {
-                let mut files = baglama.stream_files_in_categories(chunk)?;
-                while let Some(file) = files.recv().await {
-                    if let Some(batch) = batches.push(file?) {
-                        rows += write_usages(&mut enc, &batch, baglama).await?;
-                    }
+            // The names go to disk first, as fast as the server sends them.
+            // Running the usage queries between rows would stall the file
+            // query, and the server drops a client that stops reading for
+            // 60 s (`net_write_timeout`).
+            let names = names_file(tmp);
+            {
+                let mut w = std::io::BufWriter::new(File::create(&names)?);
+                for chunk in categories.chunks(IN_CHUNK) {
+                    baglama
+                        .for_each_file_in_categories(chunk, |file| {
+                            writeln!(w, "{file}")?;
+                            Ok(())
+                        })
+                        .await?;
+                }
+                w.flush()?;
+            }
+            for line in BufReader::new(File::open(&names)?).lines() {
+                if let Some(batch) = batches.push(line?) {
+                    rows += write_usages(&mut enc, &batch, baglama).await?;
                 }
             }
+            let _ = std::fs::remove_file(&names);
         }
     }
     let last = batches.finish();
@@ -633,6 +649,11 @@ async fn list_pages(
     std::fs::rename(tmp, out)?;
     group_status::set(baglama.db(), group_id, ym, GroupStatus::Scanned, None).await?;
     Ok(rows)
+}
+
+/// Where a group's file names wait between the category and usage queries.
+fn names_file(tmp: &Path) -> PathBuf {
+    tmp.with_extension("files.tmp")
 }
 
 /// Collects distinct file names into batches of [`GIL_CHUNK`] for the

@@ -10,8 +10,6 @@ use log::{error, info, warn};
 use mysql_async::{from_row, from_row_opt, prelude::*};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::mpsc;
 use wikimisc::mediawiki::action_api::{ActionApi, ActionApiRunnable};
 use wikimisc::mediawiki::Api;
 use wikimisc::site_matrix::SiteMatrix;
@@ -89,10 +87,6 @@ fn site_names_to_fill(
 /// failed on one in 2026-01).
 pub const IN_CHUNK: usize = 1000;
 
-/// Rows in flight between a file query and the usage queries that consume
-/// them; a few of the 3,000-file batches those run on.
-const FILE_STREAM_BUFFER: usize = 10_000;
-
 /// Tables a category-membership query reads.
 const CATEGORY_TABLES: [&str; 3] = ["page", "categorylinks", "linktarget"];
 
@@ -127,7 +121,7 @@ fn groups_to_deactivate(
 #[derive(Debug)]
 pub struct Baglama2 {
     config: Config,
-    db: Arc<Db>,
+    db: Db,
     sites_cache: Vec<Site>,
     site_matrix: SiteMatrix,
 }
@@ -135,7 +129,7 @@ pub struct Baglama2 {
 impl Baglama2 {
     /// Opens the DB pools, fetches the site matrix and loads the sites table.
     pub async fn new(config: Config) -> Result<Self> {
-        let db = Arc::new(Db::new(&config)?);
+        let db = Db::new(&config)?;
         info!("Baglama2::new: connecting to Wikidata API");
         let wikidata_api = Api::new("https://www.wikidata.org/w/api.php").await?;
         info!("Baglama2::new: building site matrix from Wikidata");
@@ -155,7 +149,7 @@ impl Baglama2 {
         &self.config
     }
 
-    pub fn db(&self) -> &Arc<Db> {
+    pub fn db(&self) -> &Db {
         &self.db
     }
 
@@ -417,18 +411,20 @@ impl Baglama2 {
         .await
     }
 
-    /// The files (DB keys, no redirects) directly in `categories`, at most
-    /// [`IN_CHUNK`] of them, streamed as they arrive. A file in several
-    /// categories comes more than once; the receiver de-duplicates. The
-    /// server sorts nothing, so even a category with millions of files
-    /// (4.8M in "Uploaded with OpenRefine") streams at once.
-    pub fn stream_files_in_categories(
-        &self,
-        categories: &[String],
-    ) -> Result<mpsc::Receiver<Result<String>>> {
+    /// Calls `f` with each file (DB key, no redirects) directly in
+    /// `categories`, at most [`IN_CHUNK`] of them, as the rows arrive. A
+    /// file in several of the categories comes more than once: there is no
+    /// `DISTINCT`, which would make the server sort millions of rows before
+    /// sending any; callers de-duplicate. `f` must be quick (write the name
+    /// somewhere): a client that stops reading for `net_write_timeout`
+    /// (60 s) is cut off by the server mid-result.
+    pub async fn for_each_file_in_categories<F>(&self, categories: &[String], f: F) -> Result<()>
+    where
+        F: FnMut(String) -> Result<()>,
+    {
         if categories.len() > IN_CHUNK {
             return Err(anyhow!(
-                "stream_files_in_categories: {} categories, at most {IN_CHUNK} per query",
+                "for_each_file_in_categories: {} categories, at most {IN_CHUNK} per query",
                 categories.len()
             ));
         }
@@ -441,12 +437,9 @@ impl Baglama2 {
             AND page_is_redirect=0",
             sql_placeholders(categories.len())
         );
-        self.db.stream_commons(
-            &CATEGORY_TABLES,
-            &sql,
-            categories.to_vec(),
-            FILE_STREAM_BUFFER,
-        )
+        self.db
+            .query_commons_each(&CATEGORY_TABLES, &sql, categories.to_vec(), f)
+            .await
     }
 
     /// Gets all images uploaded by a user
@@ -624,14 +617,18 @@ mod tests {
             assert!(cats.len() > last, "depth {depth}: {cats:?}");
             last = cats.len();
         }
-        let mut rx = baglama.stream_files_in_categories(&cats).unwrap();
         let mut files = vec![];
-        while let Some(file) = rx.recv().await {
-            files.push(file.unwrap());
-        }
+        baglama
+            .for_each_file_in_categories(&cats, |file| {
+                files.push(file);
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert!(files.contains(&"2013-06-07_Kindergartenfest_Berlin-Karow_03.jpg".to_string()));
         assert!(baglama
-            .stream_files_in_categories(&vec![String::new(); IN_CHUNK + 1])
+            .for_each_file_in_categories(&vec![String::new(); IN_CHUNK + 1], |_| Ok(()))
+            .await
             .is_err());
     }
 
