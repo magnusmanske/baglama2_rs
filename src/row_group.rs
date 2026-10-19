@@ -2,7 +2,7 @@ use crate::category::{effective_depth, CategoryTitle};
 use crate::db::{value2opt_string, Db};
 use crate::GroupId;
 use anyhow::{anyhow, Result};
-use mysql_async::{from_row_opt, prelude::*, FromRowError, Row};
+use wikimisc::mysql_async::{from_row_opt, prelude::*, FromRowError, Row};
 
 /// What a group tracks.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,11 +7,11 @@ use crate::wiki::{Dbname, DumpCode};
 use crate::Site;
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
-use mysql_async::{from_row, from_row_opt, prelude::*};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use wikimisc::mediawiki::action_api::{ActionApi, ActionApiRunnable};
 use wikimisc::mediawiki::Api;
+use wikimisc::mysql_async::{from_row, from_row_opt, prelude::*};
 use wikimisc::site_matrix::SiteMatrix;
 
 /// Language wikis in a `sitematrix` API response: dbname → (language code,
@@ -449,7 +449,7 @@ impl Baglama2 {
             .query_commons(
                 &["image", "actor", "user"],
                 sql,
-                mysql_async::params! {user_name},
+                wikimisc::mysql_async::params! {user_name},
             )
             .await
     }

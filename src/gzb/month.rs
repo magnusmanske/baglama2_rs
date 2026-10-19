@@ -23,11 +23,11 @@ use crate::row_group::{GroupSource, RowGroup};
 use crate::wiki::{Dbname, DumpCode};
 use crate::{Baglama2, GroupId};
 use log::{error, info, warn};
-use mysql_async::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
+use wikimisc::mysql_async::prelude::*;
 
 /// Files per `globalimagelinks` query, as in the older pipelines.
 const GIL_CHUNK: usize = 3000;

@@ -8,8 +8,8 @@ use crate::group_id::GroupId;
 use crate::YearMonth;
 use anyhow::{anyhow, Result};
 use log::warn;
-use mysql_async::prelude::*;
 use std::str::FromStr;
+use wikimisc::mysql_async::prelude::*;
 
 /// Where a group-month is in `gzb_month`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

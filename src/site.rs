@@ -1,7 +1,7 @@
 use crate::wiki::Dbname;
 use anyhow::Result;
 use log::warn;
-use mysql_async::prelude::*;
+use wikimisc::mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct Site {
@@ -21,7 +21,9 @@ impl Site {
 }
 
 impl FromRow for Site {
-    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    fn from_row_opt(
+        row: wikimisc::mysql_async::Row,
+    ) -> Result<Self, wikimisc::mysql_async::FromRowError>
     where
         Self: Sized,
     {
@@ -29,11 +31,11 @@ impl FromRow for Site {
             server: row
                 .get_opt(0)
                 .and_then(Result::ok)
-                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+                .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
             giu_code: row
                 .get_opt::<Option<String>, _>(1)
                 .and_then(Result::ok)
-                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?
+                .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?
                 .and_then(|giu| match Dbname::parse(&giu) {
                     Ok(giu) => Some(giu),
                     Err(e) => {

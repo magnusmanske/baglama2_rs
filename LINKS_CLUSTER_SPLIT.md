@@ -49,7 +49,8 @@ Fixed in `32824c5`, pushed to `origin` (`efb54dd` is HEAD as of writing).
   `commons_links` (`POOL_COMMONS_LINKS`), both registered in `Baglama2::new()`.
 - `Baglama2::get_commons_conn_for_tables(&["…"])` replaces "the Commons
   connection". It resolves the cluster from the table list via
-  `DbCluster::for_tables` in the shared `wikimisc` crate, so the mapping lives
+  `DbCluster::for_tables` in the shared `wikimisc` crate (since replaced by
+  `ExtensionDb::for_tables` in the `toolforge` crate), so the mapping lives
   in one place and survives another move.
 - Every Commons call site passes its tables:
   `global_image_links.rs:33` (`globalimagelinks`), `baglama2.rs:555` and
@@ -163,9 +164,11 @@ core (frozen)   969,561 → 969,561, unchanged
   reads frozen data.
 - `page` and `redirect` resolve to core when queried alone, because core is the
   first cluster that holds them. That is fine — they are identical on both.
-- If Commons gets split again, add a pool key + a `DbCluster` arm in
-  `Baglama2::commons_pool_key`, and update `DbCluster::for_tables` in
-  [`wikimisc`](https://github.com/magnusmanske/wikimisc). Nothing else.
+- If Commons gets split again, add a pool key + an `ExtensionDb` arm in
+  `Db::commons_pool_key` (`src/db.rs`); the table mapping is
+  `ExtensionDb::for_tables` in the
+  [`toolforge`](https://gitlab.wikimedia.org/repos/mwbot-rs/toolforge) crate
+  (re-exported by `wikimisc`). Nothing else.
 
 ## The other half of this bug
 
@@ -174,6 +177,6 @@ had the same fault and were fixed separately (GLAMorous 2's `globalusage.php`
 + `lib/GlobalUsage.php`, GLAMorous classic's `glamorous.php`, and the legacy
 `baglama2/baglama.php`). They route through
 `ToolforgeCommon::openDBwikiForTables()` / `dbForTables()` in the shared
-`magnustools` lib, which is the PHP equivalent of `DbCluster::for_tables`.
+`magnustools` lib, which is the PHP equivalent of `ExtensionDb::for_tables`.
 Those changes are committed but **not yet pushed or deployed** as of
 2026-09-15.

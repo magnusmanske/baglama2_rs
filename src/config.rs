@@ -15,8 +15,8 @@ const CONFIG_PATHS: &[&str] = &[
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Pool settings for the tool DB (`url`, `max_connections`, …), passed to
-    /// `ToolforgeDB::add_mysql_pool`.
+    /// Pool settings for the tool DB (`url`, `max_connections`, …); see
+    /// `Db::pool_from_config` for the keys.
     #[serde(default)]
     pub tooldb: Value,
     /// Pool settings for the Commons core replica.

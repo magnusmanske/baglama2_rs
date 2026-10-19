@@ -1,7 +1,7 @@
 use crate::db::{sql_placeholders, value2opt_string, Db};
 use crate::wiki::Dbname;
 use anyhow::Result;
-use mysql_async::prelude::*;
+use wikimisc::mysql_async::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct GlobalImageLinks {
@@ -58,7 +58,9 @@ impl GlobalImageLinks {
 }
 
 impl FromRow for GlobalImageLinks {
-    fn from_row_opt(row: mysql_async::Row) -> Result<Self, mysql_async::FromRowError>
+    fn from_row_opt(
+        row: wikimisc::mysql_async::Row,
+    ) -> Result<Self, wikimisc::mysql_async::FromRowError>
     where
         Self: Sized,
     {
@@ -66,21 +68,21 @@ impl FromRow for GlobalImageLinks {
             wiki: row
                 .get::<String, _>(0)
                 .and_then(|wiki| Dbname::parse(&wiki).ok())
-                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+                .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
             page_namespace_id: row
                 .get(1)
-                .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+                .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
             page_namespace: row.as_ref(2).and_then(value2opt_string).unwrap_or_default(),
             page_title: value2opt_string(
                 row.as_ref(3)
-                    .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+                    .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
             )
-            .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
             to: value2opt_string(
                 row.as_ref(4)
-                    .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+                    .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
             )
-            .ok_or_else(|| mysql_async::FromRowError(row.clone()))?,
+            .ok_or_else(|| wikimisc::mysql_async::FromRowError(row.clone()))?,
         };
         Ok(ret)
     }
