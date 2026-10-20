@@ -1,0 +1,5 @@
+# Locally, `cargo run` and `cargo test` take the database credentials and
+# tunnel ports from replica.my.cnf in the repo root (gitignored; see
+# connect_db.sh). An existing TOOL_DATA_DIR, as on Toolforge, is kept.
+[env]
+TOOL_DATA_DIR = { value = ".", relative = true }

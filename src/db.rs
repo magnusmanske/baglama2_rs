@@ -4,29 +4,23 @@
 use crate::config::Config;
 use anyhow::{anyhow, Result};
 use log::warn;
-use serde_json::Value;
-use std::collections::HashMap;
+use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 use wikimisc::mysql_async::{self, from_row_opt, prelude::*, Conn};
+use wikimisc::toolforge::db::Cluster;
+#[cfg(test)]
 use wikimisc::toolforge::db::ExtensionDb;
-use wikimisc::toolforge::pool::CustomPool;
+use wikimisc::toolforge::pool::{ToolsDbPool, WikiPool};
 use wikimisc::toolforge::Error;
 
 /// The wiki whose replica databases this tool reads. Baglama only queries
-/// Commons; the links split below applies to no other wiki.
+/// Commons.
 const COMMONS_WIKI: &str = "commonswiki";
 
-/// Pool key of the Commons core replica (`commonswiki…`), holding every table
-/// that was not split off.
-const POOL_COMMONS_CORE: &str = "commons";
-
-/// Pool key of the Commons links extension cluster (`links.commonswiki…`, the
-/// `x4` section), which took over the links tables in September 2026.
-///
-/// A future split needs a new pool under its own key, registered in
-/// [`Db::new`] from config, plus an [`ExtensionDb`] arm in
-/// [`Db::commons_pool_key`].
-const POOL_COMMONS_LINKS: &str = "commons_links";
+/// The tool DB on ToolsDB, after the tool's database user:
+/// `<user>__baglama2_p`.
+const TOOLDB_SUFFIX: &str = "__baglama2_p";
 
 /// MySQL/MariaDB error: the user has used up `max_user_connections`.
 const ER_USER_LIMIT_REACHED: u16 = 1226;
@@ -52,11 +46,17 @@ pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
     }
 }
 
+/// The database connections. Hosts and credentials come from the `toolforge`
+/// crate: on Toolforge from the tool's environment or `replica.my.cnf`;
+/// locally from a `replica.my.cnf` with `local='true'`, whose `[tunnels]`
+/// section gives the ports `connect_db.sh` opens.
 #[derive(Debug)]
 pub struct Db {
-    /// The pools by key: `tooldb`, [`POOL_COMMONS_CORE`] and
-    /// [`POOL_COMMONS_LINKS`].
-    pools: HashMap<&'static str, CustomPool>,
+    /// The Wiki Replicas (web cluster), of which only Commons is read.
+    replicas: WikiPool,
+    tooldb: ToolsDbPool,
+    /// The tool DB's name, see [`TOOLDB_SUFFIX`].
+    tooldb_name: String,
     hold_on: Duration,
 }
 
@@ -75,6 +75,13 @@ impl Db {
     /// better than failing a group.
     const DB_CONN_LIMIT_WAIT: Duration = Duration::from_secs(60 * 60);
 
+    /// Connections per replica server (the Commons core section, and the
+    /// links cluster): the replicas allow a tool 10 per server.
+    const REPLICA_POOL_MAX: usize = 10;
+
+    /// Connections to the tool DB.
+    const TOOLDB_POOL_MAX: usize = 20;
+
     /// Server-side time limit for each attempt of a Commons query, in seconds;
     /// one entry per attempt. Grows because a query that just missed the limit
     /// on a loaded replica usually succeeds with a bit more time.
@@ -84,55 +91,41 @@ impl Db {
     /// up itself. Only a backstop: normally the server ends the query first.
     const DB_QUERY_CLIENT_GRACE: Duration = Duration::from_secs(60);
 
-    /// Registers the pools from `config`. Connects to nothing: connections
-    /// are opened on first use.
+    /// Sets up the pools, looking up the credentials as the `toolforge`
+    /// crate does (`TOOL_*` variables, then `replica.my.cnf` in
+    /// `$TOOL_DATA_DIR` or the home directory). Connects to nothing:
+    /// connections are opened on first use.
     pub fn new(config: &Config) -> Result<Self> {
-        // A missing `commons_links` entry must fail startup, not the first
-        // links query, so say what to add.
-        let commons_links = Self::pool_from_config(&config.commons_links).map_err(|e| {
-            anyhow!(
-                "config needs a '{POOL_COMMONS_LINKS}' pool for the Commons links \
-                 cluster (links.commonswiki…, the x4 split), e.g. \
-                 `\"{POOL_COMMONS_LINKS}\": {{ \"url\": \"mysql://USER:PASS@links.commonswiki.web.db.svc.wikimedia.cloud:3306/commonswiki_p\" }}`: {e}"
-            )
-        })?;
-        let pools = HashMap::from([
-            ("tooldb", Self::pool_from_config(&config.tooldb)?),
-            (POOL_COMMONS_CORE, Self::pool_from_config(&config.commons)?),
-            (POOL_COMMONS_LINKS, commons_links),
-        ]);
+        Self::with_my_cnf(config, None)
+    }
+
+    /// [`Self::new`], but with the credentials from `my_cnf` if given.
+    fn with_my_cnf(config: &Config, my_cnf: Option<&Path>) -> Result<Self> {
+        let mut replicas = WikiPool::builder(Cluster::Web);
+        let mut tooldb = ToolsDbPool::builder();
+        if let Some(path) = my_cnf {
+            replicas = replicas.my_cnf_path(path);
+            tooldb = tooldb.my_cnf_path(path);
+        }
+        let replicas = replicas
+            .pool_max(Self::REPLICA_POOL_MAX)
+            .connect_timeout(Self::DB_CONN_TIMEOUT)
+            .build()?;
+        let tooldb = tooldb
+            .pool_max(Self::TOOLDB_POOL_MAX)
+            .connect_timeout(Self::DB_CONN_TIMEOUT)
+            .build()?;
+        let tooldb_name = format!("{}{TOOLDB_SUFFIX}", tooldb.user());
         Ok(Self {
-            pools,
+            replicas,
+            tooldb,
+            tooldb_name,
             hold_on: config.hold_on(),
         })
     }
 
-    /// A pool for the server in a config entry: `url` (required, e.g.
-    /// `mysql://USER:PASS@HOST:PORT/DB`) plus the optional pool sizes
-    /// `min_connections` and `max_connections`, and `keep_sec`, how long an
-    /// idle connection is kept. These override the URL's `pool_min`,
-    /// `pool_max` and `inactive_connection_ttl`; missing ones get
-    /// [`CustomPool`]'s defaults, which follow the Toolforge connection
-    /// handling policy.
-    fn pool_from_config(config: &Value) -> Result<CustomPool> {
-        let url = config["url"]
-            .as_str()
-            .ok_or_else(|| anyhow!("pool config has no 'url'"))?;
-        let mut builder = CustomPool::builder_from_url(url)?.connect_timeout(Self::DB_CONN_TIMEOUT);
-        if let Some(min) = config["min_connections"].as_u64() {
-            builder = builder.pool_min(usize::try_from(min)?);
-        }
-        if let Some(max) = config["max_connections"].as_u64() {
-            builder = builder.pool_max(usize::try_from(max)?);
-        }
-        if let Some(keep_sec) = config["keep_sec"].as_u64() {
-            builder = builder.inactive_connection_ttl(Duration::from_secs(keep_sec));
-        }
-        Ok(builder.build()?)
-    }
-
-    /// Acquire a pooled connection, retrying transient failures with backoff
-    /// and capping each attempt so it can't block forever (the prod-on-
+    /// Acquire a connection with `connect`, retrying transient failures with
+    /// backoff and capping each attempt so it can't block forever (the prod-on-
     /// Toolforge failure mode). Toolforge replicas occasionally refuse or are
     /// slow to hand out a connection; a single 30s cap with no retry was too
     /// brittle for a long-running batch job. Total budget is bounded:
@@ -141,17 +134,19 @@ impl Db {
     ///
     /// Refusals for `max_user_connections` don't count as attempts: they mean
     /// the tool's connections are all busy (possibly in another job), so this
-    /// waits for one to free up, for up to `DB_CONN_LIMIT_WAIT`.
-    async fn get_conn_with_timeout(&self, name: &'static str) -> Result<Conn> {
-        let pool = self
-            .pools
-            .get(name)
-            .ok_or_else(|| anyhow!("no '{name}' database pool"))?;
+    /// waits for one to free up, for up to `DB_CONN_LIMIT_WAIT`. Errors that
+    /// a retry can't fix, e.g. tables no single Commons database holds, are
+    /// returned at once.
+    async fn get_conn_with_retry<F, Fut>(&self, name: &str, connect: F) -> Result<Conn>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Conn, Error>>,
+    {
         let started = std::time::Instant::now();
         let mut failures = 0;
         let mut limit_waits = 0;
         loop {
-            let err = match pool.connect().await {
+            let err = match connect().await {
                 Ok(conn) => return Ok(conn),
                 Err(Error::MysqlError(e)) if is_server_error(&e, ER_USER_LIMIT_REACHED) => {
                     if started.elapsed() >= Self::DB_CONN_LIMIT_WAIT {
@@ -171,8 +166,9 @@ impl Db {
                     tokio::time::sleep(wait).await;
                     continue;
                 }
-                // Includes `Error::ConnectTimeout`, after `DB_CONN_TIMEOUT`.
-                Err(e) => e.to_string(),
+                // `ConnectTimeout` comes after `DB_CONN_TIMEOUT`.
+                Err(e @ (Error::MysqlError(_) | Error::ConnectTimeout(_))) => e.to_string(),
+                Err(e) => return Err(anyhow!("'{name}' database: {e}")),
             };
             failures += 1;
             warn!(
@@ -199,47 +195,29 @@ impl Db {
     /// utf8mb4, but this does not depend on that. (Older queries sidestep it
     /// with `FROM_BASE64(TO_BASE64(...))`.)
     pub async fn get_tooldb_conn(&self) -> Result<Conn> {
-        let mut conn = self.get_conn_with_timeout("tooldb").await?;
+        let mut conn = self
+            .get_conn_with_retry("tooldb", || self.tooldb.connect(&self.tooldb_name))
+            .await?;
         conn.query_drop("SET NAMES utf8mb4").await?;
         Ok(conn)
     }
 
-    /// A connection to the Commons replica cluster that can serve a query
+    /// A connection to the Commons replica database that can serve a query
     /// reading all of `tables`.
     ///
     /// Commons had its links tables moved to a separate cluster (`x4`) in
     /// September 2026, so "the Commons connection" is no longer a single
-    /// thing. The cluster is chosen with [`ExtensionDb::for_tables`] instead of
-    /// being hard-coded, so a query keeps working when tables move again.
+    /// thing. [`WikiPool::connect_for_tables`] picks the database holding the
+    /// tables, so a query keeps working when tables move again; the core
+    /// database's copies of split-off tables are frozen.
     ///
-    /// Tables that no single cluster holds — a join across the split — are an
-    /// error; such joins must be done in code.
+    /// Tables that no single database holds — a join across the split — are
+    /// an error; such joins must be done in code.
     pub async fn get_commons_conn_for_tables(&self, tables: &[&str]) -> Result<Conn> {
-        self.get_conn_with_timeout(Self::commons_pool_key_for_tables(tables)?)
-            .await
-    }
-
-    /// The pool key serving a query over `tables` on Commons, resolved through
-    /// [`ExtensionDb::for_tables`].
-    ///
-    /// Kept pure so the table-to-cluster mapping can be unit-tested without a
-    /// database; the `&'static str` is what `get_conn_with_timeout` needs.
-    fn commons_pool_key_for_tables(tables: &[&str]) -> Result<&'static str> {
-        Self::commons_pool_key(ExtensionDb::for_tables(COMMONS_WIKI, tables)?)
-    }
-
-    /// Maps a Commons database (`None` for the core one) to the pool key
-    /// registered for it. Core and `Links` are the two Commons has; a future
-    /// split adds a pool key and an arm here, and is an error until then
-    /// rather than a silently outdated read from the core database.
-    fn commons_pool_key(extension: Option<ExtensionDb>) -> Result<&'static str> {
-        match extension {
-            None => Ok(POOL_COMMONS_CORE),
-            Some(ExtensionDb::Links) => Ok(POOL_COMMONS_LINKS),
-            Some(other) => Err(anyhow!(
-                "no pool for the Commons extension database '{other}'"
-            )),
-        }
+        self.get_conn_with_retry("commons", || {
+            self.replicas.connect_for_tables(COMMONS_WIKI, tables)
+        })
+        .await
     }
 
     /// Runs a read query on the Commons cluster that holds `tables`, retrying
@@ -419,80 +397,50 @@ mod tests {
     }
 
     /// The Commons links tables moved to their own cluster in September 2026;
-    /// queries must be routed by the tables they read, not by a single
-    /// hard-coded Commons pool.
+    /// `WikiPool::connect_for_tables` routes queries by the tables they read.
+    /// Pins down where the table sets this tool queries go.
     #[test]
-    fn test_commons_pool_key_for_tables() {
+    fn test_commons_tables_routing() {
+        let route = |tables: &[&str]| ExtensionDb::for_tables(COMMONS_WIKI, tables);
         // `page` exists on both clusters; every other links table only on the
         // links cluster, so a join over them belongs there.
-        assert_eq!(
-            Db::commons_pool_key_for_tables(&["page", "categorylinks", "linktarget"]).unwrap(),
-            POOL_COMMONS_LINKS
-        );
-        assert_eq!(
-            Db::commons_pool_key_for_tables(&["globalimagelinks"]).unwrap(),
-            POOL_COMMONS_LINKS
-        );
-
-        // Tables that stayed on the core cluster keep using the core pool.
-        assert_eq!(
-            Db::commons_pool_key_for_tables(&["image", "actor", "user"]).unwrap(),
-            POOL_COMMONS_CORE
-        );
-        assert_eq!(
-            Db::commons_pool_key_for_tables(&["sites"]).unwrap(),
-            POOL_COMMONS_CORE
-        );
-        // `page` alone still resolves to core, the first cluster that holds it.
-        assert_eq!(
-            Db::commons_pool_key_for_tables(&["page"]).unwrap(),
-            POOL_COMMONS_CORE
-        );
-
+        for tables in [
+            &["page", "categorylinks", "linktarget"][..],
+            &["globalimagelinks"],
+        ] {
+            assert_eq!(
+                route(tables).unwrap(),
+                Some(ExtensionDb::Links),
+                "{tables:?}"
+            );
+        }
+        // Tables that stayed on the core cluster; `page` alone resolves to
+        // core, the first that holds it.
+        for tables in [&["image", "actor", "user"][..], &["sites"], &["page"]] {
+            assert_eq!(route(tables).unwrap(), None, "{tables:?}");
+        }
         // A query spanning the split cannot be served by one connection, so
         // it is an error rather than a silently wrong result.
-        assert!(Db::commons_pool_key_for_tables(&["actor", "pagelinks"]).is_err());
+        assert!(route(&["actor", "pagelinks"]).is_err());
     }
 
-    /// An extension database without a pool of its own must not fall back to
-    /// the core one, whose copies of split-off tables are frozen.
+    /// The tool DB is named after the tool's database user, and setting up
+    /// the pools reads the credentials but connects to nothing.
     #[test]
-    fn test_commons_pool_key_unknown_extension() {
-        assert!(Db::commons_pool_key(Some(ExtensionDb::TermStore)).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_pool_from_config() {
-        let pool = Db::pool_from_config(&serde_json::json!({
-            "url": "mysql://s51203:s3cr3t@127.0.0.1:3377/commonswiki_p",
-            "min_connections": 0,
-            "max_connections": 10,
-            "keep_sec": 10
+    fn test_with_my_cnf() {
+        let dir = std::env::temp_dir().join(format!("baglama2-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let my_cnf = dir.join("replica.my.cnf");
+        std::fs::write(&my_cnf, "[client]\nuser='s12345'\npassword='s3cr3t'\n").unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "gzb_data_root_path": "/x/gzb"
         }))
         .unwrap();
-        let debug = format!("{pool:?}");
-        assert!(
-            debug.contains("s51203@127.0.0.1:3377/commonswiki_p"),
-            "{debug}"
-        );
+        let db = Db::with_my_cnf(&config, Some(&my_cnf)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(db.tooldb_name, "s12345__baglama2_p");
+        let debug = format!("{db:?}");
         assert!(!debug.contains("s3cr3t"), "{debug}");
-
-        assert!(Db::pool_from_config(&serde_json::json!({})).is_err());
-        assert!(Db::pool_from_config(&serde_json::json!({
-            "url": "mysql://u:p@h/db",
-            "min_connections": 5,
-            "max_connections": 2
-        }))
-        .is_err());
-
-        // The URL's pool parameters apply, and the config keys override them.
-        let url = "mysql://u:p@h/db?pool_min=5&pool_max=2";
-        assert!(Db::pool_from_config(&serde_json::json!({ "url": url })).is_err());
-        assert!(Db::pool_from_config(&serde_json::json!({
-            "url": url,
-            "max_connections": 10
-        }))
-        .is_ok());
     }
 
     // Pooled connections come back in the server default charset; see

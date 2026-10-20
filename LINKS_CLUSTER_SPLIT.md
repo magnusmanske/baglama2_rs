@@ -141,11 +141,11 @@ mysql --defaults-file=~/replica.my.cnf \
   -e "SELECT gil_wiki,gil_page_title FROM globalimagelinks WHERE gil_to='Карпински_манастир_10.jpg'"
 ```
 
-`cargo test commons_pool_key_for_tables` checks the routing table without a DB.
+`cargo test commons_tables_routing` checks the routing table without a DB.
 
 Measured 2026-09-15 after the fix, `globalimagelinks` rows for `mkwiki`, same
 query on both hosts, from Toolforge and again through the local tunnels in
-`connect_db.sh` (3378 = links, 3377 = core):
+`connect_db.sh` (3378 = links, 3377 = core; core is now tunneled as `s4`):
 
 ```
 links (live)    971,546 → 971,548 a few minutes later
@@ -164,11 +164,13 @@ core (frozen)   969,561 → 969,561, unchanged
   reads frozen data.
 - `page` and `redirect` resolve to core when queried alone, because core is the
   first cluster that holds them. That is fine — they are identical on both.
-- If Commons gets split again, add a pool key + an `ExtensionDb` arm in
-  `Db::commons_pool_key` (`src/db.rs`); the table mapping is
-  `ExtensionDb::for_tables` in the
+- Since 2026-10-20 `Db` uses `WikiPool::connect_for_tables` from the
   [`toolforge`](https://gitlab.wikimedia.org/repos/mwbot-rs/toolforge) crate
-  (re-exported by `wikimisc`). Nothing else.
+  (re-exported by `wikimisc`), which routes by `ExtensionDb::for_tables` and
+  takes hosts and credentials from `replica.my.cnf`. The per-cluster pools
+  and the `commons`/`commons_links` config entries are gone. If Commons gets
+  split again, nothing changes here once the crate knows the new mapping;
+  locally, add the new cluster to `[tunnels]` (see `connect_db.sh`).
 
 ## The other half of this bug
 

@@ -3,7 +3,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,18 +12,10 @@ const CONFIG_PATHS: &[&str] = &[
     "/data/project/glamtools/baglama2_rs/config.json",
 ];
 
+/// Database hosts and credentials are not in here: `Db` gets them from the
+/// `toolforge` crate (`replica.my.cnf`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Pool settings for the tool DB (`url`, `max_connections`, …); see
-    /// `Db::pool_from_config` for the keys.
-    #[serde(default)]
-    pub tooldb: Value,
-    /// Pool settings for the Commons core replica.
-    #[serde(default)]
-    pub commons: Value,
-    /// Pool settings for the Commons links cluster (`x4`).
-    #[serde(default)]
-    pub commons_links: Value,
     /// Root directory of the gzb view-data files, where the PHP API reads
     /// them (`viewdata/gzb` on Toolforge).
     pub gzb_data_root_path: PathBuf,
@@ -66,19 +57,16 @@ mod tests {
     fn test_from_json() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "_comment": "ignored",
-            "tooldb": {"url": "mysql://u:p@h/db"},
             "gzb_data_root_path": "/x/gzb"
         }))
         .unwrap();
         assert_eq!(config.gzb_data_root_path, PathBuf::from("/x/gzb"));
-        assert_eq!(config.tooldb["url"], "mysql://u:p@h/db");
-        assert!(config.commons.is_null());
         assert_eq!(config.hold_on(), Duration::from_secs(5));
     }
 
     #[test]
     fn test_gzb_root_required() {
-        let err = serde_json::from_value::<Config>(serde_json::json!({"tooldb": {}}))
+        let err = serde_json::from_value::<Config>(serde_json::json!({"hold_on": 5}))
             .unwrap_err()
             .to_string();
         assert!(err.contains("gzb_data_root_path"), "{err}");

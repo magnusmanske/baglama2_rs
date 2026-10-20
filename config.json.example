@@ -1,22 +1,4 @@
 {
-	"_comment": "baglama2 pool configuration. Copy to config.json (gitignored) and fill in real credentials. Locally, start the SSH tunnels in connect_db.sh first: 3377 = commons core, 3378 = Commons links (x4), 3308 = tool DB (ToolsDB). On Toolforge use the real hosts instead: commonswiki.web.db.svc.wikimedia.cloud, links.commonswiki.web.db.svc.wikimedia.cloud, and tools.db.svc.wikimedia.cloud for the tool DB.",
-	"commons": {
-		"url": "mysql://USER:PASSWORD@127.0.0.1:3377/commonswiki_p",
-		"min_connections": 0,
-		"max_connections": 10,
-		"keep_sec": 10
-	},
-	"commons_links": {
-		"url": "mysql://USER:PASSWORD@127.0.0.1:3378/commonswiki_p",
-		"min_connections": 0,
-		"max_connections": 10,
-		"keep_sec": 10
-	},
-	"tooldb": {
-		"url": "mysql://USER:PASSWORD@127.0.0.1:3308/USER__baglama2_p",
-		"min_connections": 0,
-		"max_connections": 20,
-		"keep_sec": 60
-	},
+	"_comment": "Copy to config.json (gitignored). Database hosts and credentials are not configured here: the toolforge crate takes them from the tool's environment or replica.my.cnf on Toolforge. Locally, put a copy of the tool's replica.my.cnf with local='true' and a [tunnels] section in the repo root, and run connect_db.sh; see there.",
 	"gzb_data_root_path": "viewdata/gzb"
 }
