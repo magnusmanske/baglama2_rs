@@ -203,10 +203,11 @@ async fn main() -> Result<()> {
         println!("{banner}");
     }
 
-    // Install a logger backend. Without this, all log::{info,warn,error,trace}
-    // macros are silently discarded. Defaults to `info`; override per-module
-    // via the RUST_LOG env var (e.g. `RUST_LOG=baglama2=trace`).
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Install a logger backend (to stderr). Without this, all
+    // log::{info,warn,error,trace} macros are silently discarded. Defaults to
+    // `info`; override per-module via the RUST_LOG env var (e.g.
+    // `RUST_LOG=baglama2=trace`).
+    wikimisc::logging::init();
 
     let config = Config::load()?;
     // Reading a gzb file needs only the config: these work while the tool

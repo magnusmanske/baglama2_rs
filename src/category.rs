@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
+use wikimisc::title::{self, Case};
 
 /// Characters MediaWiki does not allow in page titles.
 const ILLEGAL: &[char] = &['#', '<', '>', '[', ']', '|', '{', '}'];
@@ -24,22 +25,17 @@ impl CategoryTitle {
         if let Some(c) = s.chars().find(|c| ILLEGAL.contains(c) || c.is_control()) {
             return Err(anyhow!("{c:?} is not allowed in a category title: {s:?}"));
         }
-        let spaced = s.replace('_', " ");
-        let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-        let name = match collapsed.get(..9) {
-            Some(prefix) if prefix.eq_ignore_ascii_case("category:") => collapsed[9..].trim_start(),
-            _ => collapsed.as_str(),
-        };
-        let mut chars = name.chars();
-        let first = chars
-            .next()
-            .ok_or_else(|| anyhow!("empty category title: {s:?}"))?;
-        Ok(Self(first.to_uppercase().chain(chars).collect()))
+        let display = title::normalize(s, Case::Sensitive);
+        let name = title::strip_namespace(&display, &["Category"]).unwrap_or(&display);
+        if name.is_empty() {
+            return Err(anyhow!("empty category title: {s:?}"));
+        }
+        Ok(Self(title::ucfirst(name).into_owned()))
     }
 
     /// With underscores, as in `page_title` and `lt_title`.
     pub fn db_key(&self) -> String {
-        self.0.replace(' ', "_")
+        title::to_db_key(&self.0)
     }
 }
 
@@ -124,6 +120,11 @@ mod tests {
         assert_eq!(title("CATEGORY:foo"), "Foo");
         assert_eq!(title("élan"), "Élan");
         assert_eq!(title("A\u{00A0}b"), "A b");
+        // As MediaWiki: a link-style leading colon and directional marks go,
+        // and a first letter without a one-letter capital stays.
+        assert_eq!(title(":Category:Foo"), "Foo");
+        assert_eq!(title("Foo\u{200E} bar"), "Foo bar");
+        assert_eq!(title("ßa"), "ßa");
         assert_eq!(
             title("Fondazione Torino Musei - Fondo Gabinio"),
             "Fondazione Torino Musei - Fondo Gabinio"

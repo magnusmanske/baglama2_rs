@@ -7,36 +7,30 @@ use crate::wiki::{Dbname, DumpCode};
 use crate::Site;
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use wikimisc::mediawiki::action_api::{ActionApi, ActionApiRunnable};
-use wikimisc::mediawiki::Api;
 use wikimisc::mysql_async::{from_row, from_row_opt, prelude::*};
-use wikimisc::site_matrix::SiteMatrix;
+use wikimisc::site_matrix::{SiteMatrix, SiteMatrixLanguage};
+use wikimisc::wikidata::Wikidata;
 
-/// Language wikis in a `sitematrix` API response: dbname → (language code,
-/// English language name). Special wikis (Commons, Meta, chapters, test
-/// wikis) are not listed under a language, so they are not included.
-fn wiki_languages(matrix: &Value) -> HashMap<String, (String, String)> {
-    let mut ret = HashMap::new();
-    let Some(entries) = matrix["sitematrix"].as_object() else {
-        return ret;
-    };
-    for (key, language) in entries {
-        if key == "count" || key == "specials" {
-            continue;
-        }
-        let (Some(code), Some(name)) = (language["code"].as_str(), language["localname"].as_str())
-        else {
-            continue;
-        };
-        for site in language["site"].as_array().into_iter().flatten() {
-            if let Some(dbname) = site["dbname"].as_str() {
-                ret.insert(dbname.to_string(), (code.to_string(), name.to_string()));
-            }
-        }
-    }
-    ret
+/// Sent with every Wikimedia API request.
+const USER_AGENT: &str = wikimisc::user_agent!();
+
+/// Language wikis of the site matrix, closed ones included: dbname →
+/// (language code, English language name). Special wikis (Commons, Meta,
+/// chapters, test wikis) are not listed under a language, so they are not
+/// included.
+fn wiki_languages(languages: &[SiteMatrixLanguage]) -> HashMap<String, (String, String)> {
+    languages
+        .iter()
+        .flat_map(|language| {
+            language.wikis.iter().map(|dbname| {
+                (
+                    dbname.clone(),
+                    (language.code.clone(), language.localname.clone()),
+                )
+            })
+        })
+        .collect()
 }
 
 /// `(giu_code, name)` for each language wiki in `sites` that has no name yet.
@@ -131,7 +125,7 @@ impl Baglama2 {
     pub async fn new(config: Config) -> Result<Self> {
         let db = Db::new(&config)?;
         info!("Baglama2::new: connecting to Wikidata API");
-        let wikidata_api = Api::new("https://www.wikidata.org/w/api.php").await?;
+        let wikidata_api = Wikidata::new(USER_AGENT).api().await?;
         info!("Baglama2::new: building site matrix from Wikidata");
         let mut ret = Self {
             config,
@@ -302,9 +296,7 @@ impl Baglama2 {
     /// ("Arabic Wiktionary" rather than "ar.Wiktionary"), where it is missing.
     /// Existing names are never changed. See [`site_names_to_fill`].
     async fn update_site_names(&self) -> Result<()> {
-        let api = Api::new("https://meta.wikimedia.org/w/api.php").await?;
-        let matrix = ActionApi::sitematrix().run(&api).await?;
-        let languages = wiki_languages(&matrix);
+        let languages = wiki_languages(&self.site_matrix.languages());
         if languages.is_empty() {
             return Err(anyhow!("site matrix lists no language wikis"));
         }
@@ -530,29 +522,24 @@ mod tests {
         );
     }
 
-    fn test_matrix() -> Value {
-        serde_json::json!({"sitematrix": {
-            "count": 5,
-            "0": {"code": "ar", "localname": "Arabic", "site": [
-                {"dbname": "arwiki"}, {"dbname": "arwiktionary"}, {"dbname": "arwikibooks"}]},
-            "1": {"code": "az", "localname": "Azerbaijani", "site": [
-                {"dbname": "azwiki"}, {"dbname": "azwikiquote"}]},
-            "2": {"code": "xx", "localname": "Ex", "site": [
-                {"dbname": "xxwiki"}, {"dbname": "xxwiktionary"}, {"dbname": "xxwikibooks"}]},
-            "specials": [{"dbname": "arwikimedia"}, {"dbname": "commonswiki"}]
-        }})
-    }
-
-    #[test]
-    fn test_wiki_languages() {
-        let languages = wiki_languages(&test_matrix());
-        assert_eq!(
-            languages.get("arwiktionary"),
-            Some(&("ar".to_string(), "Arabic".to_string()))
-        );
-        assert!(!languages.contains_key("arwikimedia"));
-        assert!(!languages.contains_key("commonswiki"));
-        assert!(wiki_languages(&serde_json::json!({})).is_empty());
+    /// [`wiki_languages`] for a small site matrix; `arwikimedia` and
+    /// `commonswiki` are specials, not language wikis.
+    fn test_languages() -> HashMap<String, (String, String)> {
+        let mut ret = HashMap::new();
+        for (code, name, wikis) in [
+            (
+                "ar",
+                "Arabic",
+                ["arwiki", "arwiktionary", "arwikibooks"].as_slice(),
+            ),
+            ("az", "Azerbaijani", &["azwiki", "azwikiquote"]),
+            ("xx", "Ex", &["xxwiki", "xxwiktionary", "xxwikibooks"]),
+        ] {
+            for wiki in wikis {
+                ret.insert(wiki.to_string(), (code.to_string(), name.to_string()));
+            }
+        }
+        ret
     }
 
     #[test]
@@ -570,7 +557,7 @@ mod tests {
             site("commonswiki", Some("Commons")),
             site("unknownwiki", None),
         ];
-        let mut fill = site_names_to_fill(&sites, &wiki_languages(&test_matrix()));
+        let mut fill = site_names_to_fill(&sites, &test_languages());
         fill.sort();
         let expected = vec![
             ("arwiktionary".to_string(), "Arabic".to_string()),
@@ -581,10 +568,7 @@ mod tests {
         ];
         assert_eq!(fill, expected);
         // Without any existing label, the site matrix name is used.
-        let fill = site_names_to_fill(
-            &[site("arwikibooks", None)],
-            &wiki_languages(&test_matrix()),
-        );
+        let fill = site_names_to_fill(&[site("arwikibooks", None)], &test_languages());
         assert_eq!(
             fill,
             vec![("arwikibooks".to_string(), "Arabic".to_string())]
