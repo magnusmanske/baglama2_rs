@@ -2,17 +2,18 @@
 //! retry and timeout handling a long batch job on Toolforge needs.
 
 use crate::config::Config;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use log::warn;
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
-use wikimisc::mysql_async::{self, from_row_opt, prelude::*, Conn};
+use wikimisc::mysql_async::{self, Conn, from_row_opt, prelude::*};
+use wikimisc::replicas::Replicas;
+use wikimisc::toolforge::Error;
 use wikimisc::toolforge::db::Cluster;
 #[cfg(test)]
 use wikimisc::toolforge::db::ExtensionDb;
-use wikimisc::toolforge::pool::{ToolsDbPool, WikiPool};
-use wikimisc::toolforge::Error;
+use wikimisc::toolforge::pool::ToolsDbPool;
 
 /// The wiki whose replica databases this tool reads. Baglama only queries
 /// Commons.
@@ -53,7 +54,7 @@ pub fn value2opt_string(value: &mysql_async::Value) -> Option<String> {
 #[derive(Debug)]
 pub struct Db {
     /// The Wiki Replicas (web cluster), of which only Commons is read.
-    replicas: WikiPool,
+    replicas: Replicas,
     tooldb: ToolsDbPool,
     /// The tool DB's name, see [`TOOLDB_SUFFIX`].
     tooldb_name: String,
@@ -101,16 +102,15 @@ impl Db {
 
     /// [`Self::new`], but with the credentials from `my_cnf` if given.
     fn with_my_cnf(config: &Config, my_cnf: Option<&Path>) -> Result<Self> {
-        let mut replicas = WikiPool::builder(Cluster::Web);
+        let mut replicas = Replicas::builder(Cluster::Web)
+            .pool_max(Self::REPLICA_POOL_MAX)
+            .connect_timeout(Self::DB_CONN_TIMEOUT);
         let mut tooldb = ToolsDbPool::builder();
         if let Some(path) = my_cnf {
             replicas = replicas.my_cnf_path(path);
             tooldb = tooldb.my_cnf_path(path);
         }
-        let replicas = replicas
-            .pool_max(Self::REPLICA_POOL_MAX)
-            .connect_timeout(Self::DB_CONN_TIMEOUT)
-            .build()?;
+        let replicas = replicas.build()?;
         let tooldb = tooldb
             .pool_max(Self::TOOLDB_POOL_MAX)
             .connect_timeout(Self::DB_CONN_TIMEOUT)
@@ -207,7 +207,7 @@ impl Db {
     ///
     /// Commons had its links tables moved to a separate cluster (`x4`) in
     /// September 2026, so "the Commons connection" is no longer a single
-    /// thing. [`WikiPool::connect_for_tables`] picks the database holding the
+    /// thing. [`Replicas::connect_for_tables`] picks the database holding the
     /// tables, so a query keeps working when tables move again; the core
     /// database's copies of split-off tables are frozen.
     ///
@@ -397,7 +397,7 @@ mod tests {
     }
 
     /// The Commons links tables moved to their own cluster in September 2026;
-    /// `WikiPool::connect_for_tables` routes queries by the tables they read.
+    /// `Replicas::connect_for_tables` routes queries by the tables they read.
     /// Pins down where the table sets this tool queries go.
     #[test]
     fn test_commons_tables_routing() {

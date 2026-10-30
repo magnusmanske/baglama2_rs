@@ -14,7 +14,7 @@ serde_json = "^1"
 chrono = "0.4"
 anyhow = "1"
 bzip2 = "0.5"
-wikimisc = { git = "https://github.com/magnusmanske/wikimisc" , features = ["wikidata","database","site-matrix","http","title","logging"] }
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc" , features = ["wikidata","database","site-matrix","http","title","logging", "replicas"] }
 log = "0.4"
 # zlib backend: the gzb bytes (pinned by test_golden_file) depend on it; it used
 # to be enabled implicitly by mysql_async's default features.
